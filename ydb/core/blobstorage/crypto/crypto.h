@@ -20,7 +20,7 @@
 #endif
 
 // Use ENABLE_ENCRYPTION switch for testing purposes only!
-#define ENABLE_ENCRYPTION 1
+#define ENABLE_ENCRYPTION 0
 
 namespace NKikimr {
 
