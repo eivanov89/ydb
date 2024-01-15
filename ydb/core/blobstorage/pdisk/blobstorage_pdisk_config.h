@@ -106,7 +106,7 @@ struct TPDiskConfig : public TThrRefBase {
 
     ui64 StartOwnerRound = 1ull;  // set only by warden
     TIntrusivePtr<NPDisk::TSectorMap> SectorMap; // set only by warden
-    bool EnableSectorEncryption = true;
+    bool EnableSectorEncryption = false;
 
     ui32 ChunkSize = 128 << 20;
     ui32 SectorSize = 4 << 10;
