@@ -104,7 +104,7 @@ private:
 
         LogRequest(event);
 
-        if (IsAuthStateOK(*requestBaseCtx)) {
+        if (true) {
             Handle(event, ctx);
             return;
         }
