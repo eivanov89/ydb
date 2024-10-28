@@ -594,7 +594,7 @@ public:
         // even if we have successfully compilation result, it doesn't mean anything
         // in terms of current schema version of the table if response of compilation is from the cache.
         // because of that, we are forcing to run schema version check
-        if (QueryState->NeedCheckTableVersions()) {
+        if (false) {
             auto ev = QueryState->BuildNavigateKeySet();
             Send(MakeSchemeCacheID(), ev.release());
             return;
@@ -654,7 +654,7 @@ public:
 
         Become(&TKqpSessionActor::ExecuteState);
 
-        QueryState->TxCtx->OnBeginQuery();
+        QueryState->TxCtx->OnBeginQuery(QueryState->StartedAtInstant);
 
         if (QueryState->NeedPersistentSnapshot()) {
             AcquirePersistentSnapshot();
@@ -1281,7 +1281,7 @@ public:
         LOG_D("Sending to Executer TraceId: " << request.TraceId.GetTraceId() << " " << request.TraceId.GetSpanIdSize());
 
         const bool useEvWrite = ((HasOlapTable && Settings.TableService.GetEnableOlapSink()) || (!HasOlapTable && Settings.TableService.GetEnableOltpSink()))
-            && (request.QueryType == NKikimrKqp::EQueryType::QUERY_TYPE_SQL_GENERIC_QUERY 
+            && (request.QueryType == NKikimrKqp::EQueryType::QUERY_TYPE_SQL_GENERIC_QUERY
                 || request.QueryType == NKikimrKqp::EQueryType::QUERY_TYPE_SQL_GENERIC_CONCURRENT_QUERY);
         auto executerActor = CreateKqpExecuter(std::move(request), Settings.Database,
             QueryState ? QueryState->UserToken : TIntrusiveConstPtr<NACLib::TUserToken>(),

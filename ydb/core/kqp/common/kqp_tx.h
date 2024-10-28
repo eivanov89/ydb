@@ -172,9 +172,9 @@ public:
         LastAccessTime = TInstant::Now();
     }
 
-    void OnBeginQuery() {
+    void OnBeginQuery(TInstant t = TInstant::Now()) {
         ++QueriesCount;
-        BeginQueryTime = TInstant::Now();
+        BeginQueryTime = t;
     }
 
     void OnEndQuery() {
@@ -329,7 +329,7 @@ struct THash<NKikimr::NKqp::TTxId> {
 };
 
 namespace NKikimr::NKqp {
-    
+
 class TTransactionsCache {
     size_t MaxActiveSize;
     THashMap<TTxId, TIntrusivePtr<TKqpTransactionContext>, THash<NKikimr::NKqp::TTxId>> Active;

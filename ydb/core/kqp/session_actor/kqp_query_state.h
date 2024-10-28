@@ -66,6 +66,7 @@ public:
         , UserToken(ev->Get()->GetUserToken())
         , StartedAt(startedAt)
     {
+        StartedAtInstant = TInstant::Now();
         RequestEv.reset(ev->Release().Release());
         bool enableImplicitQueryParameterTypes = tableServiceConfig.GetEnableImplicitQueryParameterTypes() ||
             AppData()->FeatureFlags.GetEnableImplicitQueryParameterTypes();
@@ -123,6 +124,7 @@ public:
     bool KeepSession = false;
     TIntrusiveConstPtr<NACLib::TUserToken> UserToken;
     NActors::TMonotonic StartedAt;
+    TInstant StartedAtInstant;
 
     THashMap<NKikimr::TTableId, ui64> TableVersions;
 
