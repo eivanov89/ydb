@@ -27,240 +27,6 @@ namespace NKqp {
 using namespace NKikimrConfig;
 using namespace NYql;
 
-
-class TKqpQueryCache {
-public:
-    TKqpQueryCache(size_t size, TDuration ttl)
-        : List(size)
-        , Ttl(ttl) {}
-
-    void InsertQuery(const TKqpCompileResult::TConstPtr& compileResult) {
-        Y_ENSURE(compileResult->Query);
-        auto& query = *compileResult->Query;
-
-        YQL_ENSURE(compileResult->PreparedQuery);
-
-        auto queryIt = QueryIndex.emplace(query, compileResult->Uid);
-        if (!queryIt.second) {
-            EraseByUid(compileResult->Uid);
-            QueryIndex.erase(query);
-        }
-        Y_ENSURE(queryIt.second);
-    }
-
-    void InsertAst(const TKqpCompileResult::TConstPtr& compileResult) {
-        Y_ENSURE(compileResult->Query);
-        Y_ENSURE(compileResult->Ast);
-
-        AstIndex.emplace(GetQueryIdWithAst(*compileResult->Query, *compileResult->Ast), compileResult->Uid);
-    }
-
-    bool Insert(const TKqpCompileResult::TConstPtr& compileResult, bool isEnableAstCache, bool isPerStatementExecution) {
-        if (!isPerStatementExecution) {
-            InsertQuery(compileResult);
-        }
-        if (isEnableAstCache && compileResult->Ast) {
-            InsertAst(compileResult);
-        }
-
-        auto it = Index.emplace(compileResult->Uid, TCacheEntry{compileResult, TAppData::TimeProvider->Now() + Ttl});
-        Y_ABORT_UNLESS(it.second);
-
-        TItem* item = &const_cast<TItem&>(*it.first);
-        auto removedItem = List.Insert(item);
-
-        IncBytes(item->Value.CompileResult->PreparedQuery->ByteSize());
-
-        if (removedItem) {
-            DecBytes(removedItem->Value.CompileResult->PreparedQuery->ByteSize());
-
-            auto queryId = *removedItem->Value.CompileResult->Query;
-            QueryIndex.erase(queryId);
-            if (removedItem->Value.CompileResult->Ast) {
-                AstIndex.erase(GetQueryIdWithAst(queryId, *removedItem->Value.CompileResult->Ast));
-            }
-            auto indexIt = Index.find(*removedItem);
-            if (indexIt != Index.end()) {
-                Index.erase(indexIt);
-            }
-        }
-
-        Y_ABORT_UNLESS(List.GetSize() == Index.size());
-
-        return removedItem != nullptr;
-    }
-
-    void AttachReplayMessage(const TString uid, TString replayMessage) {
-        auto it = Index.find(TItem(uid));
-        if (it != Index.end()) {
-            TItem* item = &const_cast<TItem&>(*it);
-            DecBytes(item->Value.ReplayMessage.size());
-            item->Value.ReplayMessage = replayMessage;
-            item->Value.LastReplayTime = TInstant::Now();
-            IncBytes(replayMessage.size());
-        }
-    }
-
-    TString ReplayMessageByUid(const TString uid, TDuration timeout) {
-        auto it = Index.find(TItem(uid));
-        if (it != Index.end()) {
-            TInstant& lastReplayTime = const_cast<TItem&>(*it).Value.LastReplayTime;
-            TInstant now = TInstant::Now();
-            if (lastReplayTime + timeout < now) {
-                lastReplayTime = now;
-                return it->Value.ReplayMessage;
-            }
-        }
-        return "";
-    }
-
-    TKqpCompileResult::TConstPtr FindByUid(const TString& uid, bool promote) {
-        auto it = Index.find(TItem(uid));
-        if (it != Index.end()) {
-            TItem* item = &const_cast<TItem&>(*it);
-            if (promote) {
-                item->Value.ExpiredAt = TAppData::TimeProvider->Now() + Ttl;
-                List.Promote(item);
-            }
-
-            return item->Value.CompileResult;
-        }
-
-        return nullptr;
-    }
-
-    void Replace(const TKqpCompileResult::TConstPtr& compileResult) {
-        auto it = Index.find(TItem(compileResult->Uid));
-        if (it != Index.end()) {
-            TItem& item = const_cast<TItem&>(*it);
-            item.Value.CompileResult = compileResult;
-        }
-    }
-
-    TKqpQueryId GetQueryIdWithAst(const TKqpQueryId& query, const NYql::TAstParseResult& ast) {
-        Y_ABORT_UNLESS(ast.Root);
-        std::shared_ptr<std::map<TString, Ydb::Type>> astPgParams;
-        if (query.QueryParameterTypes || ast.PgAutoParamValues) {
-            astPgParams = std::make_shared<std::map<TString, Ydb::Type>>();
-            if (query.QueryParameterTypes) {
-                for (const auto& [name, param] : *query.QueryParameterTypes) {
-                    astPgParams->insert({name, param});
-                }
-            }
-            if (ast.PgAutoParamValues) {
-                for (const auto& [name, param] : *ast.PgAutoParamValues) {
-                    astPgParams->insert({name, param.Gettype()});
-                }
-            }
-        }
-        return TKqpQueryId{query.Cluster, query.Database, ast.Root->ToString(), query.Settings, astPgParams, query.GUCSettings};
-    }
-
-    TKqpCompileResult::TConstPtr FindByQuery(const TKqpQueryId& query, bool promote) {
-        auto uid = QueryIndex.FindPtr(query);
-        if (!uid) {
-            return nullptr;
-        }
-
-        return FindByUid(*uid, promote);
-    }
-
-    TKqpCompileResult::TConstPtr FindByAst(const TKqpQueryId& query, const NYql::TAstParseResult& ast, bool promote) {
-        auto uid = AstIndex.FindPtr(GetQueryIdWithAst(query, ast));
-        if (!uid) {
-            return nullptr;
-        }
-
-        return FindByUid(*uid, promote);
-    }
-
-    bool EraseByUid(const TString& uid) {
-        auto it = Index.find(TItem(uid));
-        if (it == Index.end()) {
-            return false;
-        }
-
-        TItem* item = &const_cast<TItem&>(*it);
-        List.Erase(item);
-
-        DecBytes(item->Value.CompileResult->PreparedQuery->ByteSize());
-        DecBytes(item->Value.ReplayMessage.size());
-
-        Y_ABORT_UNLESS(item->Value.CompileResult);
-        Y_ABORT_UNLESS(item->Value.CompileResult->Query);
-        auto queryId = *item->Value.CompileResult->Query;
-        QueryIndex.erase(queryId);
-        if (item->Value.CompileResult->Ast) {
-            AstIndex.erase(GetQueryIdWithAst(queryId, *item->Value.CompileResult->Ast));
-        }
-
-        Index.erase(it);
-
-        Y_ABORT_UNLESS(List.GetSize() == Index.size());
-        return true;
-    }
-
-    size_t Size() const {
-        return Index.size();
-    }
-
-    ui64 Bytes() const {
-        return ByteSize;
-    }
-
-    size_t EraseExpiredQueries() {
-        auto prevSize = Size();
-
-        auto now = TAppData::TimeProvider->Now();
-        while (List.GetSize() && List.GetOldest()->Value.ExpiredAt <= now) {
-            EraseByUid(List.GetOldest()->Key);
-        }
-
-        Y_ABORT_UNLESS(List.GetSize() == Index.size());
-        return prevSize - Size();
-    }
-
-    void Clear() {
-        List = TList(List.GetMaxSize());
-        Index.clear();
-        QueryIndex.clear();
-        AstIndex.clear();
-        ByteSize = 0;
-    }
-
-private:
-    void DecBytes(ui64 bytes) {
-        if (bytes > ByteSize) {
-            ByteSize = 0;
-        } else {
-            ByteSize -= bytes;
-        }
-    }
-
-    void IncBytes(ui64 bytes) {
-        ByteSize += bytes;
-    }
-
-private:
-    struct TCacheEntry {
-        TKqpCompileResult::TConstPtr CompileResult;
-        TInstant ExpiredAt;
-        TString ReplayMessage = "";
-        TInstant LastReplayTime = TInstant::Zero();
-    };
-
-    using TList = TLRUList<TString, TCacheEntry>;
-    using TItem = TList::TItem;
-
-private:
-    TList List;
-    THashSet<TItem, TItem::THash> Index;
-    THashMap<TKqpQueryId, TString, THash<TKqpQueryId>> QueryIndex;
-    THashMap<TKqpQueryId, TString, THash<TKqpQueryId>> AstIndex;
-    ui64 ByteSize = 0;
-    TDuration Ttl;
-};
-
 struct TKqpCompileSettings {
     TKqpCompileSettings(bool keepInCache, bool isQueryActionPrepare, bool perStatementResult,
         const TInstant& deadline, ECompileActorAction action = ECompileActorAction::COMPILE)
@@ -444,18 +210,20 @@ public:
         return NKikimrServices::TActivity::KQP_COMPILE_SERVICE;
     }
 
-    TKqpCompileService(const TTableServiceConfig& tableServiceConfig, const TQueryServiceConfig& queryServiceConfig,
+    TKqpCompileService(
+        TKqpQueryCache& queryCache,
+        const TTableServiceConfig& tableServiceConfig, const TQueryServiceConfig& queryServiceConfig,
         const TKqpSettings::TConstPtr& kqpSettings,
         TIntrusivePtr<TModuleResolverState> moduleResolverState, TIntrusivePtr<TKqpCounters> counters,
         std::shared_ptr<IQueryReplayBackendFactory> queryReplayFactory,
         std::optional<TKqpFederatedQuerySetup> federatedQuerySetup
         )
-        : TableServiceConfig(tableServiceConfig)
+        : QueryCache(queryCache)
+        , TableServiceConfig(tableServiceConfig)
         , QueryServiceConfig(queryServiceConfig)
         , KqpSettings(kqpSettings)
         , ModuleResolverState(moduleResolverState)
         , Counters(counters)
-        , QueryCache(TableServiceConfig.GetCompileQueryCacheSize(), TDuration::Seconds(TableServiceConfig.GetCompileQueryCacheTTLSec()))
         , RequestsQueue(TableServiceConfig.GetCompileRequestQueueSize())
         , QueryReplayFactory(std::move(queryReplayFactory))
         , FederatedQuerySetup(federatedQuerySetup)
@@ -1213,6 +981,8 @@ private:
     }
 
 private:
+    TKqpQueryCache& QueryCache;
+
     TTableServiceConfig TableServiceConfig;
     TQueryServiceConfig QueryServiceConfig;
     TKqpSettings::TConstPtr KqpSettings;
@@ -1220,7 +990,6 @@ private:
     TIntrusivePtr<TKqpCounters> Counters;
     THolder<IQueryReplayBackend> QueryReplayBackend;
 
-    TKqpQueryCache QueryCache;
     TKqpRequestsQueue RequestsQueue;
     std::shared_ptr<IQueryReplayBackendFactory> QueryReplayFactory;
     std::optional<TKqpFederatedQuerySetup> FederatedQuerySetup;
@@ -1228,13 +997,17 @@ private:
     bool CollectDiagnostics = false;
 };
 
-IActor* CreateKqpCompileService(const TTableServiceConfig& tableServiceConfig, const TQueryServiceConfig& queryServiceConfig,
+IActor* CreateKqpCompileService(
+    TKqpQueryCache& queryCache,
+    const TTableServiceConfig& tableServiceConfig, const TQueryServiceConfig& queryServiceConfig,
     const TKqpSettings::TConstPtr& kqpSettings, TIntrusivePtr<TModuleResolverState> moduleResolverState, TIntrusivePtr<TKqpCounters> counters,
     std::shared_ptr<IQueryReplayBackendFactory> queryReplayFactory,
     std::optional<TKqpFederatedQuerySetup> federatedQuerySetup
     )
 {
-    return new TKqpCompileService(tableServiceConfig, queryServiceConfig, kqpSettings, moduleResolverState, counters,
+    return new TKqpCompileService(
+        queryCache,
+        tableServiceConfig, queryServiceConfig, kqpSettings, moduleResolverState, counters,
                                   std::move(queryReplayFactory), federatedQuerySetup);
 }
 
