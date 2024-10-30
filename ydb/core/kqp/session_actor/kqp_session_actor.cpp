@@ -160,6 +160,7 @@ public:
     }
 
    TKqpSessionActor(const TActorId& owner,
+            TKqpQueryCache& queryCache,
             std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
             std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory,
             const TString& sessionId, const TKqpSettings::TConstPtr& kqpSettings,
@@ -170,6 +171,7 @@ public:
             const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
             const TActorId& kqpTempTablesAgentActor)
         : Owner(owner)
+        , QueryCache(queryCache)
         , SessionId(sessionId)
         , ResourceManager_(std::move(resourceManager))
         , CaFactory_(std::move(caFactory))
@@ -521,6 +523,13 @@ public:
 
     void CompileQuery() {
         YQL_ENSURE(QueryState);
+
+        // quick path
+        if (QueryState->TryGetFromCache(QueryCache, GUCSettings)) {
+            OnSuccessCompileRequest();
+            return;
+        }
+
         auto ev = QueryState->BuildCompileRequest(CompilationCookie, GUCSettings);
         LOG_D("Sending CompileQuery request");
 
@@ -609,8 +618,14 @@ public:
     }
 
     void CompileStatement() {
+        // quick path
+        if (QueryState->TryGetFromCache(QueryCache, GUCSettings)) {
+            OnSuccessCompileRequest();
+            return;
+        }
+
         auto request = QueryState->BuildCompileRequest(CompilationCookie, GUCSettings);
-        LOG_D("Sending CompileQuery request");
+        LOG_D("Sending CompileQuery request (statement)");
 
         Send(MakeKqpCompileServiceID(SelfId().NodeId()), request.release(), 0, QueryState->QueryId,
             QueryState->KqpSessionSpan.GetTraceId());
@@ -2520,6 +2535,7 @@ private:
 
 private:
     TActorId Owner;
+    TKqpQueryCache& QueryCache;
     TString SessionId;
 
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> ResourceManager_;
@@ -2564,7 +2580,9 @@ private:
 
 } // namespace
 
-IActor* CreateKqpSessionActor(const TActorId& owner, std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
+IActor* CreateKqpSessionActor(const TActorId& owner,
+    TKqpQueryCache& queryCache,
+    std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory, const TString& sessionId,
     const TKqpSettings::TConstPtr& kqpSettings, const TKqpWorkerSettings& workerSettings,
     std::optional<TKqpFederatedQuerySetup> federatedQuerySetup,
@@ -2573,7 +2591,9 @@ IActor* CreateKqpSessionActor(const TActorId& owner, std::shared_ptr<NKikimr::NK
     const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
     const TActorId& kqpTempTablesAgentActor)
 {
-    return new TKqpSessionActor(owner, std::move(resourceManager), std::move(caFactory), sessionId, kqpSettings, workerSettings, federatedQuerySetup,
+    return new TKqpSessionActor(
+        owner, queryCache,
+        std::move(resourceManager), std::move(caFactory), sessionId, kqpSettings, workerSettings, federatedQuerySetup,
                                 std::move(asyncIoFactory),  std::move(moduleResolverState), counters,
                                 queryServiceConfig, kqpTempTablesAgentActor);
 }
