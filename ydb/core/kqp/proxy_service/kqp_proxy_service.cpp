@@ -63,6 +63,14 @@ TString MakeKqpProxyBoardPath(const TString& database) {
     return "kqpprx+" + database;
 }
 
+static ui32 GetKqpThreadPool(const NKikimr::TAppData* appData) {
+    Y_DEBUG_ABORT_UNLESS(appData != nullptr);
+    auto item = appData->ServicePools.find("Kqp");
+    if (item != appData->ServicePools.end())
+        return item->second;
+    else
+        return appData->UserPoolId;
+}
 
 static constexpr TDuration DEFAULT_KEEP_ALIVE_TIMEOUT = TDuration::MilliSeconds(5000);
 static constexpr TDuration DEFAULT_EXTRA_TIMEOUT_WAIT = TDuration::MilliSeconds(50);
@@ -395,14 +403,14 @@ public:
         }
 
         const auto& info = record.GetSystemStateInfo(0);
-        if (AppData()->UserPoolId >= info.PoolStatsSize()) {
+        if (GetKqpThreadPool(AppData()) >= info.PoolStatsSize()) {
             KQP_PROXY_LOG_D("Unexpected whiteboard info: pool size is smaller than user pool id"
                 << ", pool size: " << info.PoolStatsSize()
-                << ", user pool id: " << AppData()->UserPoolId);
+                << ", user pool id: " << GetKqpThreadPool(AppData()));
             return;
         }
 
-        const auto& pool = info.GetPoolStats(AppData()->UserPoolId);
+        const auto& pool = info.GetPoolStats(GetKqpThreadPool(AppData()));
 
         KQP_PROXY_LOG_D("Received node white board pool stats: " << pool.usage());
         NodeResources.SetCpuUsage(pool.usage());
@@ -1488,7 +1496,7 @@ private:
         IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
             FederatedQuerySetup, AsyncIoFactory, ModuleResolverState, Counters,
             QueryServiceConfig, KqpTempTablesAgentActor);
-        auto workerId = TlsActivationContext->ExecutorThread.RegisterActor(sessionActor, TMailboxType::HTSwap, AppData()->UserPoolId);
+        auto workerId = TlsActivationContext->ExecutorThread.RegisterActor(sessionActor, TMailboxType::HTSwap, GetKqpThreadPool(AppData()));
         TKqpSessionInfo* sessionInfo = LocalSessions->Create(
             sessionId, workerId, database, dbCounters, supportsBalancing, GetSessionIdleDuration(), pgWire);
         KqpProxySharedResources->AtomicLocalSessionCount.store(LocalSessions->size());

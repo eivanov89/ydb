@@ -394,6 +394,33 @@ static ui32 GetInterconnectThreadPoolId(const NKikimr::TAppData* appData) {
         return appData->SystemPoolId;
 }
 
+static ui32 GetTabletThreadPool(const NKikimr::TAppData* appData) {
+    Y_DEBUG_ABORT_UNLESS(appData != nullptr);
+    auto item = appData->ServicePools.find("Tablet");
+    if (item != appData->ServicePools.end())
+        return item->second;
+    else
+        return appData->UserPoolId;
+}
+
+static ui32 GetKqpThreadPool(const NKikimr::TAppData* appData) {
+    Y_DEBUG_ABORT_UNLESS(appData != nullptr);
+    auto item = appData->ServicePools.find("Kqp");
+    if (item != appData->ServicePools.end())
+        return item->second;
+    else
+        return appData->UserPoolId;
+}
+
+static ui32 GetGrpcThreadPool(const NKikimr::TAppData* appData) {
+    Y_DEBUG_ABORT_UNLESS(appData != nullptr);
+    auto item = appData->ServicePools.find("Grpc");
+    if (item != appData->ServicePools.end())
+        return item->second;
+    else
+        return appData->UserPoolId;
+}
+
 static TInterconnectSettings GetInterconnectSettings(const NKikimrConfig::TInterconnectConfig& config, ui32 numNodes, ui32 numDataCenters) {
     TInterconnectSettings result;
 
@@ -1089,7 +1116,7 @@ void TLocalServiceInitializer::InitializeServices(
     };
 
     addToLocalConfig(TTabletTypes::SchemeShard, &CreateFlatTxSchemeShard, TMailboxType::ReadAsFilled, appData->UserPoolId);
-    addToLocalConfig(TTabletTypes::DataShard, &CreateDataShard, TMailboxType::ReadAsFilled, appData->UserPoolId);
+    addToLocalConfig(TTabletTypes::DataShard, &CreateDataShard, TMailboxType::ReadAsFilled, GetTabletThreadPool(appData));
     addToLocalConfig(TTabletTypes::KeyValue, &CreateKeyValueFlat, TMailboxType::ReadAsFilled, appData->UserPoolId);
     addToLocalConfig(TTabletTypes::PersQueue, &CreatePersQueue, TMailboxType::ReadAsFilled, appData->UserPoolId);
     addToLocalConfig(TTabletTypes::PersQueueReadBalancer, &CreatePersQueueReadBalancer, TMailboxType::ReadAsFilled, appData->UserPoolId);
@@ -1421,7 +1448,7 @@ TGRpcProxyStatusInitializer::TGRpcProxyStatusInitializer(const TKikimrRunConfig&
 void TGRpcProxyStatusInitializer::InitializeServices(
             NActors::TActorSystemSetup* setup,
             const NKikimr::TAppData* appData) {
-    TActorSetupCmd gRpcProxyStatusSetup(CreateGRpcProxyStatus(), TMailboxType::ReadAsFilled, appData->UserPoolId);
+    TActorSetupCmd gRpcProxyStatusSetup(CreateGRpcProxyStatus(), TMailboxType::ReadAsFilled, GetGrpcThreadPool(appData));
     setup->LocalServices.push_back(std::pair<TActorId, TActorSetupCmd>(MakeGRpcProxyStatusID(NodeId), std::move(gRpcProxyStatusSetup)));
 
 }
@@ -1689,7 +1716,7 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
         Y_ABORT_UNLESS(proxy);
         setup->LocalServices.emplace_back(
             NMsgBusProxy::CreateMsgBusProxyId(),
-            TActorSetupCmd(proxy, TMailboxType::ReadAsFilled, appData->UserPoolId));
+            TActorSetupCmd(proxy, TMailboxType::ReadAsFilled, GetGrpcThreadPool(appData)));
 
         if (appData->PQConfig.GetEnabled()) {
 
@@ -1700,7 +1727,7 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
             Y_ABORT_UNLESS(cache);
             setup->LocalServices.emplace_back(
                 NMsgBusProxy::CreatePersQueueMetaCacheV2Id(),
-                TActorSetupCmd(cache, TMailboxType::ReadAsFilled, appData->UserPoolId));
+                TActorSetupCmd(cache, TMailboxType::ReadAsFilled, GetGrpcThreadPool(appData)));
         }
     }
 
@@ -1714,20 +1741,20 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
             setup->LocalServices.push_back(std::pair<TActorId,
                                            TActorSetupCmd>(NGRpcService::CreateGRpcRequestProxyId(i),
                                                            TActorSetupCmd(grpcReqProxy, TMailboxType::ReadAsFilled,
-                                                                          appData->UserPoolId)));
+                                                                          GetGrpcThreadPool(appData))));
         }
         setup->LocalServices.push_back(std::pair<TActorId, TActorSetupCmd>(
                 TActorId(),
                 TActorSetupCmd(
                     NConsole::CreateJaegerTracingConfigurator(std::move(tracingConfigurator), Config.GetTracingConfig()),
                     TMailboxType::ReadAsFilled,
-                    appData->UserPoolId)));
+                    GetGrpcThreadPool(appData))));
     }
 
     if (!IsServiceInitialized(setup, NKesus::MakeKesusProxyServiceId())) {
         if (IActor* proxy = NKesus::CreateKesusProxyService()) {
             setup->LocalServices.emplace_back(NKesus::MakeKesusProxyServiceId(),
-                                              TActorSetupCmd(proxy, TMailboxType::ReadAsFilled, appData->UserPoolId));
+                                              TActorSetupCmd(proxy, TMailboxType::ReadAsFilled, GetGrpcThreadPool(appData)));
         }
     }
 
@@ -1737,7 +1764,7 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
 
         if (appData->Mon) {
             setup->LocalServices.emplace_back(NGRpcService::GrpcMonServiceId(),
-                TActorSetupCmd(NGRpcService::CreateGrpcMonService(), TMailboxType::ReadAsFilled, appData->UserPoolId)
+                TActorSetupCmd(NGRpcService::CreateGrpcMonService(), TMailboxType::ReadAsFilled, GetGrpcThreadPool(appData))
                 );
         }
 
@@ -1811,7 +1838,7 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
 
         setup->LocalServices.emplace_back(
            NGRpcService::CreateGrpcPublisherServiceActorId(),
-           TActorSetupCmd(CreateGrpcPublisherServiceActor(std::move(endpoints)), TMailboxType::ReadAsFilled, appData->UserPoolId)
+           TActorSetupCmd(CreateGrpcPublisherServiceActor(std::move(endpoints)), TMailboxType::ReadAsFilled, GetGrpcThreadPool(appData))
         );
     }
 }
@@ -2153,7 +2180,7 @@ void TKqpServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setu
             {}, kqpProxySharedResources, NodeId);
         setup->LocalServices.push_back(std::make_pair(
             NKqp::MakeKqpRmServiceID(NodeId),
-            TActorSetupCmd(rm, TMailboxType::HTSwap, appData->UserPoolId)));
+            TActorSetupCmd(rm, TMailboxType::HTSwap, GetKqpThreadPool(appData))));
 
         // We need to keep YqlLoggerScope alive as long as something may be trying to log
         GlobalObjects.AddGlobalObject(std::make_shared<NYql::NLog::YqlLoggerScope>(
@@ -2168,7 +2195,7 @@ void TKqpServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setu
         );
         setup->LocalServices.push_back(std::make_pair(
             NKqp::MakeKqpProxyID(NodeId),
-            TActorSetupCmd(proxy, TMailboxType::HTSwap, appData->UserPoolId)));
+            TActorSetupCmd(proxy, TMailboxType::HTSwap, GetKqpThreadPool(appData))));
 
         // Create finalize script service
         auto finalize = NKqp::CreateKqpFinalizeScriptService(
@@ -2176,7 +2203,7 @@ void TKqpServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setu
         );
         setup->LocalServices.push_back(std::make_pair(
             NKqp::MakeKqpFinalizeScriptServiceId(NodeId),
-            TActorSetupCmd(finalize, TMailboxType::HTSwap, appData->UserPoolId)));
+            TActorSetupCmd(finalize, TMailboxType::HTSwap, GetKqpThreadPool(appData))));
     }
 }
 

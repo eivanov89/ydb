@@ -24,6 +24,17 @@ LWTRACE_USING(KQP_PROVIDER);
 namespace NKikimr {
 namespace NKqp {
 
+namespace {
+static ui32 GetKqpThreadPool(const NKikimr::TAppData* appData) {
+    Y_DEBUG_ABORT_UNLESS(appData != nullptr);
+    auto item = appData->ServicePools.find("Kqp");
+    if (item != appData->ServicePools.end())
+        return item->second;
+    else
+        return appData->UserPoolId;
+}
+}
+
 using namespace NKikimrConfig;
 using namespace NYql;
 
@@ -875,7 +886,7 @@ private:
             request.CompileServiceSpan.GetTraceId(), request.TempTablesState, request.CompileSettings.Action, std::move(request.QueryAst), CollectDiagnostics,
             request.CompileSettings.PerStatementResult, request.SplitCtx, request.SplitExpr);
         auto compileActorId = ctx.ExecutorThread.RegisterActor(compileActor, TMailboxType::HTSwap,
-            AppData(ctx)->UserPoolId);
+            GetKqpThreadPool(AppData(ctx)));
 
         LOG_DEBUG_S(ctx, NKikimrServices::KQP_COMPILE_SERVICE, "Created compile actor"
             << ", sender: " << request.Sender
