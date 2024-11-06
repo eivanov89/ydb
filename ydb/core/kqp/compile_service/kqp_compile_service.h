@@ -278,7 +278,7 @@ private:
     ui64 ByteSize = 0;
     TDuration Ttl;
 
-    TRWSpinLock Lock = {0};
+    TRWSpinLock Lock;
 };
 
 IActor* CreateKqpCompileService(
