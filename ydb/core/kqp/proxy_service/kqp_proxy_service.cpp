@@ -69,6 +69,15 @@ static constexpr TDuration DEFAULT_KEEP_ALIVE_TIMEOUT = TDuration::MilliSeconds(
 static constexpr TDuration DEFAULT_EXTRA_TIMEOUT_WAIT = TDuration::MilliSeconds(50);
 static constexpr TDuration DEFAULT_CREATE_SESSION_TIMEOUT = TDuration::MilliSeconds(5000);
 
+static constexpr TDuration MIN_TIMEOUT = TDuration::MilliSeconds(5);
+static constexpr TDuration MAX_SHORT_TIMEOUT = TDuration::MilliSeconds(100);
+
+// if we have deadline at t1 and existing timer within t1 + MAX_SHORT_OVERRUN, we will use existing timer
+static constexpr TDuration MAX_SHORT_OVERRUN = TDuration::MilliSeconds(50);
+
+// similarly, if we have deadline at t1 and existing timer within t1 + MAX_LONG_OVERRUN, we will use existing timer
+static constexpr TDuration MAX_LONG_OVERRUN = TDuration::Seconds(1);
+
 using VSessions = NKikimr::NSysView::Schema::QuerySessions;
 using namespace NKikimrConfig;
 
@@ -146,24 +155,6 @@ class TKqpProxyService : public TActorBootstrapped<TKqpProxyService> {
         struct TEvCollectPeerProxyData: public TEventLocal<TEvCollectPeerProxyData, EEv::EvCollectPeerProxyData> {};
 
         struct TEvOnRequestTimeout: public TEventLocal<TEvOnRequestTimeout, EEv::EvOnRequestTimeout> {
-            ui64 RequestId;
-            TDuration Timeout;
-            TDuration InitialTimeout;
-            NYql::NDqProto::StatusIds::StatusCode Status;
-            int Round;
-
-            TEvOnRequestTimeout(ui64 requestId, TDuration timeout, NYql::NDqProto::StatusIds::StatusCode status, int round)
-                : RequestId(requestId)
-                , Timeout(timeout)
-                , InitialTimeout(timeout)
-                , Status(status)
-                , Round(round)
-            {}
-
-            void TickNextRound() {
-                ++Round;
-                Timeout = DEFAULT_EXTRA_TIMEOUT_WAIT;
-            }
         };
 
         struct TEvCloseIdleSessions : public TEventLocal<TEvCloseIdleSessions, EEv::EvCloseIdleSessions> {};
@@ -183,6 +174,55 @@ class TKqpProxyService : public TActorBootstrapped<TKqpProxyService> {
         GetScriptExecutionOperation,
         ListScriptExecutionOperations,
         CancelScriptExecutionOperation,
+    };
+
+    struct TTimeoutInfo {
+        TTimeoutInfo(
+                ui64 requestId,
+                TDuration timeout,
+                NYql::NDqProto::StatusIds::StatusCode status = NYql::NDqProto::StatusIds::TIMEOUT,
+                int round = 0)
+            : RequestId(requestId)
+            , Timeout(timeout)
+            , Deadline(AppData()->MonotonicTimeProvider->Now() + timeout)
+            , Status(status)
+            , Round(round)
+        {
+        }
+
+        // ugly, but required for std::priority_queue
+        TTimeoutInfo(const TTimeoutInfo& other)
+            : RequestId(other.RequestId)
+            , Timeout(other.Timeout)
+            , Deadline(other.Deadline)
+            , Status(other.Status)
+            , Round(other.Round)
+        {
+        }
+
+        // ugly, but required for std::priority_queue
+        TTimeoutInfo& operator=(const TTimeoutInfo& other) {
+            RequestId = other.RequestId;
+            Timeout = other.Timeout;
+            Deadline = other.Deadline;
+            Status = other.Status;
+            Round = other.Round;
+            return *this;
+        }
+
+        bool operator< (const TTimeoutInfo& other) const {
+            return Deadline < other.Deadline;
+        }
+
+        bool operator> (const TTimeoutInfo& other) const {
+            return Deadline > other.Deadline;
+        }
+
+        ui64 RequestId;
+        TDuration Timeout;
+        TMonotonic Deadline;
+        NYql::NDqProto::StatusIds::StatusCode Status;
+        int Round;
     };
 
 public:
@@ -1269,60 +1309,151 @@ public:
         Send(ev->Sender, new NMon::TEvHttpInfoRes(str.Str()));
     }
 
-    void StartQueryTimeout(ui64 requestId, TDuration timeout, NYql::NDqProto::StatusIds::StatusCode status = NYql::NDqProto::StatusIds::TIMEOUT) {
-        TActorId timeoutTimer = CreateLongTimer(
-            TlsActivationContext->AsActorContext(), timeout,
-            new IEventHandle(SelfId(), SelfId(), new TEvPrivate::TEvOnRequestTimeout{requestId, timeout, status, 0})
-        );
-
-        KQP_PROXY_LOG_D("Scheduled timeout timer for requestId: " << requestId << " timeout: " << timeout << " actor id: " << timeoutTimer);
-        if (timeoutTimer) {
-            TimeoutTimers.emplace(requestId, timeoutTimer);
+    void StartQueryTimeout(
+        ui64 requestId,
+        TDuration timeout,
+        NYql::NDqProto::StatusIds::StatusCode status = NYql::NDqProto::StatusIds::TIMEOUT,
+        int round = 0)
+    {
+        if (timeout == TDuration::Zero()) {
+            KQP_PROXY_LOG_W("Attempt to start query timeout with zero timeout, request id: " << requestId);
         }
-   }
 
-    void StopQueryTimeout(ui64 requestId) {
-        auto it = TimeoutTimers.find(requestId);
-        if (it != TimeoutTimers.end()) {
-            Send(it->second, new TEvents::TEvPoison);
-            TimeoutTimers.erase(it);
-        }
+        auto useTimeout = Max(timeout, MIN_TIMEOUT);
+
+        TimeoutQueue.emplace(requestId, useTimeout, status, round);
+        StartTimer();
+
+        KQP_PROXY_LOG_D("Scheduled timeout for " << requestId
+            << ", requested timeout " << timeout << ", actual timeout " << useTimeout << ", round " << round
+            << ", earliest timer set on " << TimeoutQueue.top().Deadline);
     }
 
-    void Handle(TEvPrivate::TEvOnRequestTimeout::TPtr& ev) {
-        auto* msg = ev->Get();
-        ui64 requestId = ev->Get()->RequestId;
-        TimeoutTimers.erase(requestId);
-
-        KQP_PROXY_LOG_D("Handle TEvPrivate::TEvOnRequestTimeout(" << requestId << ")");
-        const TKqpProxyRequest* reqInfo = PendingRequests.FindPtr(requestId);
-        if (!reqInfo) {
-            KQP_PROXY_LOG_D("Invalid request info while on request timeout handle. RequestId: " <<  requestId);
+    void StartTimer() {
+        if (TimeoutQueue.empty()) {
             return;
         }
 
+        auto now = AppData()->MonotonicTimeProvider->Now();
+        const auto& earliestTimeoutInfo = TimeoutQueue.top();
+        TDuration timeout = MAX_SHORT_TIMEOUT;
+        if (earliestTimeoutInfo.Deadline > now) {
+            timeout = earliestTimeoutInfo.Deadline - now;
+        }
+
+        if (!SetTimerDeadlines.empty()) {
+            auto earliestDeadlineSet = SetTimerDeadlines.top();
+            if (earliestDeadlineSet <= now) {
+                // assume that timer will be expired
+                KQP_PROXY_LOG_W("Timer deadline is already expired, deadline: " << earliestDeadlineSet
+                    << ", now: " << now);
+                return;
+            }
+
+            if (earliestDeadlineSet <= earliestTimeoutInfo.Deadline) {
+                return;
+            }
+
+            auto earliestTimeoutSet = earliestDeadlineSet - now;
+            if (earliestTimeoutSet <= MAX_SHORT_TIMEOUT) {
+                if (earliestDeadlineSet <= earliestTimeoutInfo.Deadline + MAX_SHORT_OVERRUN) {
+                    return;
+                }
+            } else {
+                if (earliestDeadlineSet <= earliestTimeoutInfo.Deadline + MAX_LONG_OVERRUN) {
+                    return;
+                }
+            }
+        }
+
+        KQP_PROXY_LOG_D("StartTimer, deadline: " << earliestTimeoutInfo.Deadline
+            << ", timeout: " << timeout << ", now: " << now);
+
+        if (timeout <= MAX_SHORT_TIMEOUT) {
+            Schedule(timeout, new TEvPrivate::TEvOnRequestTimeout());
+        } else {
+            auto longTimer = CreateLongTimer(TlsActivationContext->AsActorContext(), timeout,
+                new IEventHandle(SelfId(), SelfId(), new TEvPrivate::TEvOnRequestTimeout()));
+            if (!longTimer) {
+                KQP_PROXY_LOG_E("Failed to create long timer, timeout: " << timeout);
+            }
+        }
+
+        SetTimerDeadlines.push(earliestTimeoutInfo.Deadline);
+    }
+
+    void StopQueryTimeout(ui64 requestId) {
+        CancelledTimeouts.insert(requestId);
+    }
+
+    void Handle(TEvPrivate::TEvOnRequestTimeout::TPtr& /* ev */) {
+        if (TimeoutQueue.empty()) {
+            CancelledTimeouts.clear();
+            return;
+        }
+
+        std::vector<TTimeoutInfo> newTimeouts;
+        auto now = AppData()->MonotonicTimeProvider->Now();
+
+        // clear expired timers
+        while (!SetTimerDeadlines.empty() && SetTimerDeadlines.top() <= now) {
+            SetTimerDeadlines.pop();
+        }
+
+        while (!TimeoutQueue.empty() && TimeoutQueue.top().Deadline <= now) {
+            const auto& timeoutInfo = TimeoutQueue.top();
+            if (auto it = CancelledTimeouts.find(timeoutInfo.RequestId); it == CancelledTimeouts.end()) {
+                auto newTimeoutOpt = HandleTimeout(timeoutInfo);
+                if (newTimeoutOpt) {
+                    newTimeouts.push_back(*newTimeoutOpt);
+                }
+            } else {
+                CancelledTimeouts.erase(it);
+            }
+            TimeoutQueue.pop();
+        }
+
+        for (const auto& timeoutInfo : newTimeouts) {
+            StartQueryTimeout(timeoutInfo.RequestId, timeoutInfo.Timeout, timeoutInfo.Status, timeoutInfo.Round);
+        }
+
+        StartTimer();
+    }
+
+    std::optional<TTimeoutInfo> HandleTimeout(const TTimeoutInfo& timeoutInfo) {
+        const auto requestId = timeoutInfo.RequestId;
+
+        KQP_PROXY_LOG_D("Handle query timeout of request " << requestId
+            << ", timeout " << timeoutInfo.Timeout << ", round " << timeoutInfo.Round);
+
+        const TKqpProxyRequest* reqInfo = PendingRequests.FindPtr(requestId);
+        if (!reqInfo) {
+            KQP_PROXY_LOG_D("Invalid request info while on request timeout handle. RequestId: " <<  requestId);
+            return {};
+        }
+
         KQP_PROXY_LOG_D("Reply timeout: requestId " << requestId << " sessionId: " << reqInfo->SessionId
-            << " status: " << NYql::NDq::DqStatusToYdbStatus(msg->Status) << " round: " << msg->Round);
+            << " status: " << NYql::NDq::DqStatusToYdbStatus(timeoutInfo.Status) << " round: " << timeoutInfo.Round);
 
         const TKqpSessionInfo* info = LocalSessions->FindPtr(reqInfo->SessionId);
-        if (msg->Round == 0 && info) {
-            TString message = msg->Status == NYql::NDqProto::StatusIds::TIMEOUT
-                ? (TStringBuilder() << "Request timeout " << msg->Timeout.MilliSeconds() << "ms exceeded")
-                : (TStringBuilder() << "Request canceled after " << msg->Timeout.MilliSeconds() << "ms");
+        if (timeoutInfo.Round == 0 && info) {
+            TString message = TStringBuilder()
+                << "request's " << (timeoutInfo.Status == NYql::NDqProto::StatusIds::TIMEOUT ? "timeout" : "cancelAfter")
+                << timeoutInfo.Timeout.MilliSeconds() << " ms exceeded";
 
-            Send(info->WorkerId, new TEvKqp::TEvAbortExecution(msg->Status, message));
+            Send(info->WorkerId, new TEvKqp::TEvAbortExecution(timeoutInfo.Status, message));
 
             // We must not reply before session actor in case of CANCEL AFTER settings
-            if (msg->Status != NYql::NDqProto::StatusIds::CANCELLED) {
-                auto newEv = ev->Release().Release();
-                newEv->TickNextRound();
-                Schedule(newEv->Timeout, newEv);
+            if (timeoutInfo.Status != NYql::NDqProto::StatusIds::CANCELLED) {
+                return TTimeoutInfo(requestId, DEFAULT_EXTRA_TIMEOUT_WAIT, timeoutInfo.Status, 1);
             }
         } else {
             TString message = TStringBuilder()
-                << "Query did not complete within specified timeout " << msg->InitialTimeout.MilliSeconds() << "ms, session id " << reqInfo->SessionId;
-            ReplyProcessError(NYql::NDq::DqStatusToYdbStatus(msg->Status), message, requestId);
+                << "Query did not complete within specified timeout " << timeoutInfo.Timeout.MilliSeconds()
+                << " ms, session id " << reqInfo->SessionId;
+            ReplyProcessError(NYql::NDq::DqStatusToYdbStatus(timeoutInfo.Status), message, requestId);
         }
+        return {};
     }
 
     void Handle(TEvKqp::TEvCloseSessionResponse::TPtr& ev) {
@@ -1898,7 +2029,12 @@ private:
     TKqpProxyRequestTracker PendingRequests;
     bool ShutdownRequested = false;
     THashMap<ui64, NKikimrConsole::TConfigItem::EKind> ConfigSubscriptions;
-    THashMap<ui64, TActorId> TimeoutTimers;
+
+    std::priority_queue<TTimeoutInfo, std::vector<TTimeoutInfo>, std::greater<TTimeoutInfo>> TimeoutQueue;
+    THashSet<ui64> CancelledTimeouts;
+
+    // both short and long timers
+    std::priority_queue<TMonotonic, std::vector<TMonotonic>, std::greater<TMonotonic>> SetTimerDeadlines;
 
     std::shared_ptr<NRm::IKqpResourceManager> ResourceManager_;
     std::shared_ptr<NComputeActor::IKqpNodeComputeActorFactory> CaFactory_;
