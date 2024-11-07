@@ -150,6 +150,7 @@ public:
 
    TKqpSessionActor(const TActorId& owner,
             TKqpQueryCachePtr queryCache,
+            IProxyCallback& proxyCallback,
             std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
             std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory,
             const TString& sessionId, const TKqpSettings::TConstPtr& kqpSettings,
@@ -161,6 +162,7 @@ public:
             const TActorId& kqpTempTablesAgentActor)
         : Owner(owner)
         , QueryCache(std::move(queryCache))
+        , ProxyCallback(proxyCallback)
         , SessionId(sessionId)
         , ResourceManager_(std::move(resourceManager))
         , CaFactory_(std::move(caFactory))
@@ -2040,9 +2042,26 @@ public:
             TlsActivationContext->AsActorContext()
         );
 
-        Send<ESendingType::Tail>(QueryState->Sender, QueryResponse.release(), 0, QueryState->ProxyRequestId);
-        LOG_D("Sent query response back to proxy, proxyRequestId: " << QueryState->ProxyRequestId
-            << ", proxyId: " << QueryState->Sender.ToString());
+        if (QueryState->Sender == Owner && QueryState->ReplyTo) {
+            // we are replying to our proxy, use short path instead
+
+            // 1. Send reply directly to the handler
+            Send<ESendingType::Tail>(
+                QueryState->ReplyTo,
+                QueryResponse.release(),
+                0,
+                QueryState->ReplyToCookie);
+
+            // 2. Notify proxy that request is done
+            ProxyCallback.OnRequestDone(QueryState->ProxyRequestId);
+
+            LOG_D("Sent query request: " << QueryState->ProxyRequestId << " response directly to: "
+                << QueryState->ReplyTo.ToString() << ", and notified proxyId: " << QueryState->Sender.ToString());
+        } else {
+            Send<ESendingType::Tail>(QueryState->Sender, QueryResponse.release(), 0, QueryState->ProxyRequestId);
+            LOG_D("Sent query response back to proxy, proxyRequestId: " << QueryState->ProxyRequestId
+                << ", proxyId: " << QueryState->Sender.ToString());
+        }
 
         if (IsFatalError(status)) {
             LOG_N("SessionActor destroyed due to " << status);
@@ -2649,6 +2668,7 @@ private:
 private:
     TActorId Owner;
     TKqpQueryCachePtr QueryCache;
+    IProxyCallback& ProxyCallback;
     TString SessionId;
 
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> ResourceManager_;
@@ -2691,6 +2711,7 @@ private:
 
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TKqpQueryCachePtr queryCache,
+    IProxyCallback& proxyCallback,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory, const TString& sessionId,
     const TKqpSettings::TConstPtr& kqpSettings, const TKqpWorkerSettings& workerSettings,
@@ -2701,7 +2722,7 @@ IActor* CreateKqpSessionActor(const TActorId& owner,
     const TActorId& kqpTempTablesAgentActor)
 {
     return new TKqpSessionActor(
-        owner, std::move(queryCache),
+        owner, std::move(queryCache), proxyCallback,
         std::move(resourceManager), std::move(caFactory), sessionId, kqpSettings, workerSettings, federatedQuerySetup,
                                 std::move(asyncIoFactory),  std::move(moduleResolverState), counters,
                                 queryServiceConfig, kqpTempTablesAgentActor);

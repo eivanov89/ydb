@@ -62,6 +62,8 @@ public:
         , ProxyRequestId(ev->Cookie)
         , ParametersSize(ev->Get()->GetParametersSize())
         , RequestActorId(ev->Get()->GetRequestActorId())
+        , ReplyTo(ev->Get()->GetRequestSender())
+        , ReplyToCookie(ev->Get()->GetSenderCookie())
         , IsDocumentApiRestricted_(IsDocumentApiRestricted(ev->Get()->GetRequestType()))
         , StartTime(TInstant::Now())
         , KeepSession(ev->Get()->GetKeepSession() || longSession)
@@ -120,6 +122,10 @@ public:
     NKikimrKqp::EQueryType QueryType;
 
     TActorId RequestActorId;
+
+    // might be the same as RequestActorId, but for sanity/clarity it's separate
+    TActorId ReplyTo;
+    ui64 ReplyToCookie = 0;
 
     ui64 CurrentTx = 0;
     TIntrusivePtr<TUserRequestContext> UserRequestContext;
