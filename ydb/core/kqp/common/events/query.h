@@ -353,6 +353,22 @@ public:
 
     mutable NKikimrKqp::TEvQueryRequest Record;
 
+    TActorId GetRequestSender() const {
+        return RequestSender;
+    }
+
+    void SetRequestSender(TActorId requestSender) {
+        RequestSender = requestSender;
+    }
+
+    ui64 GetSenderCookie() const {
+        return SenderCookie;
+    }
+
+    void SetSenderCookie(ui64 cookie) {
+        SenderCookie = cookie;
+    }
+
 private:
     void PrepareRemote() const;
 
@@ -380,6 +396,10 @@ private:
     TIntrusivePtr<TUserRequestContext> UserRequestContext;
     TDuration ProgressStatsPeriod;
     std::optional<NResourcePool::TPoolSettings> PoolConfig;
+
+    // set by Kqp proxy
+    TActorId RequestSender;
+    ui64 SenderCookie = 0;
 };
 
 struct TEvDataQueryStreamPart: public TEventPB<TEvDataQueryStreamPart,
