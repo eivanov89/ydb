@@ -161,6 +161,7 @@ public:
 
    TKqpSessionActor(const TActorId& owner,
             TKqpQueryCache& queryCache,
+            IProxyCallback& proxyCallback,
             std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
             std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory,
             const TString& sessionId, const TKqpSettings::TConstPtr& kqpSettings,
@@ -172,6 +173,7 @@ public:
             const TActorId& kqpTempTablesAgentActor)
         : Owner(owner)
         , QueryCache(queryCache)
+        , ProxyCallback(proxyCallback)
         , SessionId(sessionId)
         , ResourceManager_(std::move(resourceManager))
         , CaFactory_(std::move(caFactory))
@@ -1296,7 +1298,7 @@ public:
         LOG_D("Sending to Executer TraceId: " << request.TraceId.GetTraceId() << " " << request.TraceId.GetSpanIdSize());
 
         const bool useEvWrite = ((HasOlapTable && Settings.TableService.GetEnableOlapSink()) || (!HasOlapTable && Settings.TableService.GetEnableOltpSink()))
-            && (request.QueryType == NKikimrKqp::EQueryType::QUERY_TYPE_SQL_GENERIC_QUERY 
+            && (request.QueryType == NKikimrKqp::EQueryType::QUERY_TYPE_SQL_GENERIC_QUERY
                 || request.QueryType == NKikimrKqp::EQueryType::QUERY_TYPE_SQL_GENERIC_CONCURRENT_QUERY);
         auto executerActor = CreateKqpExecuter(std::move(request), Settings.Database,
             QueryState ? QueryState->UserToken : TIntrusiveConstPtr<NACLib::TUserToken>(),
@@ -1933,9 +1935,26 @@ public:
             Counters->ReportIssues(Settings.DbCounters, CachedIssueCounters, issue);
         }
 
-        Send<ESendingType::Tail>(QueryState->Sender, QueryResponse.release(), 0, QueryState->ProxyRequestId);
-        LOG_D("Sent query response back to proxy, proxyRequestId: " << QueryState->ProxyRequestId
-            << ", proxyId: " << QueryState->Sender.ToString());
+        if (QueryState->Sender == Owner && QueryState->ReplyTo) {
+            // we are replying to our proxy, use short path instead
+
+            // 1. Send reply directly to the handler
+            Send<ESendingType::Tail>(
+                QueryState->ReplyTo,
+                QueryResponse.release(),
+                0,
+                QueryState->ReplyToCookie);
+
+            // 2. Notify proxy that request is done
+            ProxyCallback.OnRequestDone(QueryState->ProxyRequestId);
+
+            LOG_D("Sent query request: " << QueryState->ProxyRequestId << " response directly to: "
+                << QueryState->ReplyTo.ToString() << ", and notified proxyId: " << QueryState->Sender.ToString());
+        } else {
+            Send<ESendingType::Tail>(QueryState->Sender, QueryResponse.release(), 0, QueryState->ProxyRequestId);
+            LOG_D("Sent query response back to proxy, proxyRequestId: " << QueryState->ProxyRequestId
+                << ", proxyId: " << QueryState->Sender.ToString());
+        }
 
         if (IsFatalError(status)) {
             LOG_N("SessionActor destroyed due to " << status);
@@ -2536,6 +2555,7 @@ private:
 private:
     TActorId Owner;
     TKqpQueryCache& QueryCache;
+    IProxyCallback& ProxyCallback;
     TString SessionId;
 
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> ResourceManager_;
@@ -2582,6 +2602,7 @@ private:
 
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TKqpQueryCache& queryCache,
+    IProxyCallback& proxyCallback,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory, const TString& sessionId,
     const TKqpSettings::TConstPtr& kqpSettings, const TKqpWorkerSettings& workerSettings,
@@ -2592,7 +2613,7 @@ IActor* CreateKqpSessionActor(const TActorId& owner,
     const TActorId& kqpTempTablesAgentActor)
 {
     return new TKqpSessionActor(
-        owner, queryCache,
+        owner, queryCache, proxyCallback,
         std::move(resourceManager), std::move(caFactory), sessionId, kqpSettings, workerSettings, federatedQuerySetup,
                                 std::move(asyncIoFactory),  std::move(moduleResolverState), counters,
                                 queryServiceConfig, kqpTempTablesAgentActor);

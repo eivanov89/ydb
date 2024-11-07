@@ -56,10 +56,16 @@ struct TKqpWorkerSettings {
     }
 };
 
+class IProxyCallback {
+public:
+    virtual void OnRequestDone(ui64 requestId) = 0;
+};
+
 class TKqpQueryCache;
 
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TKqpQueryCache& queryCache,
+    IProxyCallback& proxyCallback,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager_,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory_,
     const TString& sessionId,
