@@ -43,6 +43,7 @@
 #include <ydb/library/actors/http/http.h>
 #include <ydb/library/actors/interconnect/interconnect.h>
 #include <library/cpp/lwtrace/mon/mon_lwtrace.h>
+#include <library/cpp/lwtrace/rwspinlock.h>
 #include <library/cpp/monlib/service/pages/templates.h>
 #include <library/cpp/resource/resource.h>
 
@@ -143,7 +144,10 @@ private:
     }
 };
 
-class TKqpProxyService : public TActorBootstrapped<TKqpProxyService> {
+class TKqpProxyService :
+        public TActorBootstrapped<TKqpProxyService>,
+        public IProxyCallback
+{
     struct TEvPrivate {
         enum EEv {
             EvReadyToPublishResources = EventSpaceBegin(TEvents::ES_PRIVATE),
@@ -644,6 +648,8 @@ public:
     }
 
     void Handle(TEvKqp::TEvCreateSessionRequest::TPtr& ev) {
+        ProcessAllFinishedRequests();
+
         auto& event = ev->Get()->Record;
         auto& request = event.GetRequest();
         TKqpRequestInfo requestInfo(event.GetTraceId());
@@ -696,6 +702,7 @@ public:
     void Handle(TEvKqp::TEvQueryRequest::TPtr& ev) {
         LWTRACK(KqpProxy, ev->Get()->Orbit);
 
+        ProcessAllFinishedRequests();
         if (!DatabasesCache.SetDatabaseIdOrDefer(ev, static_cast<i32>(EDelayedRequestType::QueryRequest), ActorContext())) {
             return;
         }
@@ -783,6 +790,11 @@ public:
             if (!targetId) {
                 return;
             }
+        }
+
+        if (targetId.NodeId() == 0 || targetId.NodeId() == SelfId().NodeId()) {
+            ev->Get()->SetRequestSender(ev->Sender);
+            ev->Get()->SetSenderCookie(ev->Cookie);
         }
 
         auto cancelAfter = ev->Get()->GetCancelAfter();
@@ -954,15 +966,34 @@ public:
             << ", targetId: " << targetId << ", sessionId: " << sessionId);
     }
 
-    template<typename TEvent>
-    void ForwardEvent(TEvent ev) {
-        ui64 requestId = ev->Cookie;
+    void OnRequestDone(ui64 requestId) override {
+        TWriteSpinLockGuard guard(FinishedRequestsLock);
+        FinishedRequests.push_back(requestId);
+    }
 
+    void ProcessAllFinishedRequests() {
+        std::vector<ui64> requests;
+        {
+            TWriteSpinLockGuard guard(FinishedRequestsLock);
+            if (FinishedRequests.empty()) {
+                return;
+            }
+
+            requests.swap(FinishedRequests);
+            FinishedRequests.reserve(requests.size());
+        }
+
+        for (auto requestId: requests) {
+            ProcessFinishedRequest(requestId);
+        }
+    }
+
+    std::tuple<TActorId, ui64, TString> ProcessFinishedRequest(ui64 requestId) {
         StopQueryTimeout(requestId);
         auto proxyRequest = PendingRequests.FindPtr(requestId);
         if (!proxyRequest) {
             KQP_PROXY_LOG_E("Unknown sender for proxy response, requestId: " << requestId);
-            return;
+            return {};
         }
 
         const TKqpSessionInfo* info = LocalSessions->FindPtr(proxyRequest->SessionId);
@@ -970,17 +1001,32 @@ public:
             LocalSessions->StartIdleCheck(info, GetSessionIdleDuration());
         }
 
-        Send<ESendingType::Tail>(proxyRequest->Sender, ev->Release().Release(), 0, proxyRequest->SenderCookie);
-
         if (info && proxyRequest->EventType == TKqpEvents::EvQueryRequest) {
             LocalSessions->DetachQueryText(info);
         }
 
-        TKqpRequestInfo requestInfo(proxyRequest->TraceId);
-        KQP_PROXY_LOG_D(requestInfo << "Forwarded response to sender actor, requestId: " << requestId
-            << ", sender: " << proxyRequest->Sender << ", selfId: " << SelfId() << ", source: " << ev->Sender);
-
+        std::tuple<TActorId, ui64, TString> result = {
+            proxyRequest->Sender,
+            proxyRequest->SenderCookie,
+            std::move(proxyRequest->TraceId)};
         PendingRequests.Erase(requestId);
+
+        return result;
+    }
+
+    template<typename TEvent>
+    void ForwardEvent(TEvent ev) {
+        ui64 requestId = ev->Cookie;
+        auto [sender, cookie, traceId] = ProcessFinishedRequest(requestId);
+        if (!sender) {
+            return;
+        }
+
+        Send<ESendingType::Tail>(sender, ev->Release().Release(), 0, cookie);
+
+        TKqpRequestInfo requestInfo(traceId);
+        KQP_PROXY_LOG_D(requestInfo << "Forwarded response to sender actor, requestId: " << requestId
+            << ", sender: " << sender << ", selfId: " << SelfId() << ", source: " << ev->Sender);
     }
 
     void ForwardProgress(TEvKqpExecuter::TEvExecuterProgress::TPtr& ev) {
@@ -1391,6 +1437,8 @@ public:
     }
 
     void Handle(TEvPrivate::TEvOnRequestTimeout::TPtr& /* ev */) {
+        ProcessAllFinishedRequests();
+
         if (TimeoutQueue.empty()) {
             CancelledTimeouts.clear();
             return;
@@ -1639,7 +1687,9 @@ private:
 
         auto config = CreateConfig(KqpSettings, workerSettings);
 
-        IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
+        IActor* sessionActor = CreateKqpSessionActor(
+            SelfId(), QueryCache, *this,
+            ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
             FederatedQuerySetup, AsyncIoFactory, ModuleResolverState, Counters,
             QueryServiceConfig, KqpTempTablesAgentActor);
         auto workerId = TlsActivationContext->ExecutorThread.RegisterActor(sessionActor, TMailboxType::HTSwap, AppData()->UserPoolId);
@@ -2039,6 +2089,9 @@ private:
 
     // both short and long timers
     std::priority_queue<TMonotonic, std::vector<TMonotonic>, std::greater<TMonotonic>> SetTimerDeadlines;
+
+    TRWSpinLock FinishedRequestsLock = {0};
+    std::vector<ui64> FinishedRequests;
 
     std::shared_ptr<NRm::IKqpResourceManager> ResourceManager_;
     std::shared_ptr<NComputeActor::IKqpNodeComputeActorFactory> CaFactory_;
