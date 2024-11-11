@@ -38,6 +38,7 @@ RECURSE(
     client/ydb_persqueue_public/ut
     client/ydb_persqueue_public/ut/ut_utils
     client/ydb_persqueue_public/ut/with_offset_ranges_mode_ut
+    client/ydb_ping
     client/ydb_proto
     client/ydb_query
     client/ydb_rate_limiter

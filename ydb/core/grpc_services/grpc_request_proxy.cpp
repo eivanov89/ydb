@@ -156,7 +156,14 @@ private:
 
         MaybeStartTracing(*requestBaseCtx);
 
+        if (requestBaseCtx->GetRequestName() == "GrpcProxyRequest") {
+            LOG_TRACE(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "GrpcProxyRequest");
+            requestBaseCtx->ReplyWithYdbStatus(Ydb::StatusIds::SUCCESS);
+            return;
+        }
+
         if (IsAuthStateOK(*requestBaseCtx)) {
+            LOG_TRACE(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "NoAuth: handling request directly");
             Handle(event, ctx);
             return;
         }

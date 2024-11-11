@@ -164,6 +164,12 @@ struct TEvKqp {
             return issues;
         }
     };
+
+    struct TEvProxyPingRequest : public TEventLocal<TEvProxyPingRequest, TKqpEvents::EvProxyPingRequest> {
+    };
+
+    struct TEvProxyPingResponse : public TEventLocal<TEvProxyPingResponse, TKqpEvents::EvProxyPingResponse> {
+    };
 };
 
 } // namespace NKikimr::NKqp

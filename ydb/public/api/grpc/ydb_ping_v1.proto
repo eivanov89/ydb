@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package Ydb.Ping.V1;
+option java_package = "com.yandex.ydb.ping.v1";
+
+import "ydb/public/api/protos/ydb_ping.proto";
+
+service PingService {
+    rpc PingPlainGrpc(Ping.PlainGrpcRequest) returns (Ping.PlainGrpcResponse);
+    rpc PingGrpcProxy(Ping.GrpcProxyRequest) returns (Ping.GrpcProxyResponse);
+    rpc PingKqpProxy(Ping.KqpProxyRequest) returns (Ping.KqpProxyResponse);
+}

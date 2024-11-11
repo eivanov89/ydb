@@ -61,6 +61,10 @@ enum class ERequestType: size_t {
     DISCOVERY_NODEREGISTRATION,
     DISCOVERY_LISTENDPOINTS,
 
+    PING_GRPC,
+    PING_PROXY,
+    PING_KQP,
+
     REQUEST_TYPES_CNT, // Add new types above this line
 };
 

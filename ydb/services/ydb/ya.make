@@ -7,6 +7,7 @@ SRCS(
     ydb_import.cpp
     ydb_logstore.cpp
     ydb_operation.cpp
+    ydb_ping.cpp
     ydb_query.cpp
     ydb_scheme.cpp
     ydb_scripting.cpp

@@ -680,6 +680,10 @@ public:
         Send(ev->Sender, responseEv.Release(), 0, ev->Cookie);
     }
 
+    void Handle(TEvKqp::TEvProxyPingRequest::TPtr& ev) {
+        Send(ev->Sender, new TEvKqp::TEvProxyPingResponse());
+    }
+
     void Handle(TEvKqp::TEvQueryRequest::TPtr& ev) {
         ProcessAllFinishedRequests();
 
@@ -1511,6 +1515,7 @@ public:
             hFunc(TEvents::TEvUndelivered, Handle);
             hFunc(NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionResponse, Handle);
             hFunc(NConsole::TEvConsole::TEvConfigNotificationRequest, Handle);
+            hFunc(TEvKqp::TEvProxyPingRequest, Handle);
             hFunc(TEvKqp::TEvQueryRequest, Handle);
             hFunc(TEvKqp::TEvScriptRequest, Handle);
             hFunc(TEvKqp::TEvCloseSessionRequest, Handle);
