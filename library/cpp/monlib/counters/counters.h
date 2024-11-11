@@ -57,50 +57,43 @@ namespace NMonitoring {
         }
 
         operator TValueBase() const {
-            return AtomicGet(Value);
+            return 0;
         }
         TValueBase Val() const {
-            return AtomicGet(Value);
+            return 0;
         }
 
-        void Set(TValueBase val) {
-            AtomicSet(Value, val);
+        void Set(TValueBase) {
         }
 
         TValueBase Inc() {
-            return AtomicIncrement(Value);
+            return 0;
         }
         TValueBase Dec() {
-            return AtomicDecrement(Value);
+            return 0;
         }
 
-        TValueBase Add(const TValueBase val) {
-            return AtomicAdd(Value, val);
+        TValueBase Add(const TValueBase) {
+            return 0;
         }
-        TValueBase Sub(const TValueBase val) {
-            return AtomicAdd(Value, -val);
+        TValueBase Sub(const TValueBase) {
+            return 0;
         }
 
         // operator overloads convinient
         void operator++() {
-            Inc();
         }
         void operator++(int) {
-            Inc();
         }
 
         void operator--() {
-            Dec();
         }
         void operator--(int) {
-            Dec();
         }
 
-        void operator+=(TValueBase rhs) {
-            Add(rhs);
+        void operator+=(TValueBase) {
         }
-        void operator-=(TValueBase rhs) {
-            Sub(rhs);
+        void operator-=(TValueBase) {
         }
 
         TValueBase operator=(TValueBase rhs) {

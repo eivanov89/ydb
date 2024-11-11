@@ -137,16 +137,13 @@ namespace NMonitoring {
             Visibility_ = vis;
         }
 
-        void Collect(i64 value) {
-            Collector_->Collect(value);
+        void Collect(i64) {
         }
 
-        void Collect(i64 value, ui64 count) {
-            Collector_->Collect(value, count);
+        void Collect(i64, ui64) {
         }
 
-        void Collect(double value, ui64 count) {
-            Collector_->Collect(value, count);
+        void Collect(double, ui64) {
         }
 
         void Collect(const IHistogramSnapshot& snapshot) {
