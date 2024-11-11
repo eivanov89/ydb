@@ -44,7 +44,9 @@ struct TKqpEvents {
         EvListSessionsRequest,
         EvListSessionsResponse,
         EvListProxyNodesRequest,
-        EvListProxyNodesResponse
+        EvListProxyNodesResponse,
+        EvProxyPingRequest,
+        EvProxyPingResponse,
     };
 
     static_assert (EvCompileInvalidateRequest + 1 == EvAbortExecution);

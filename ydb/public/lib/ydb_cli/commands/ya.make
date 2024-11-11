@@ -13,6 +13,7 @@ SRCS(
     ydb_benchmark.cpp
     ydb_sdk_core_access.cpp
     ydb_dynamic_config.cpp
+    ydb_ping.cpp
     ydb_profile.cpp
     ydb_root_common.cpp
     ydb_service_auth.cpp
@@ -58,6 +59,7 @@ PEERDIR(
     ydb/public/sdk/cpp/client/ydb_monitoring
     ydb/public/sdk/cpp/client/ydb_operation
     ydb/public/sdk/cpp/client/ydb_persqueue_public
+    ydb/public/sdk/cpp/client/ydb_ping
     ydb/public/sdk/cpp/client/ydb_proto
     ydb/public/sdk/cpp/client/ydb_scheme
     ydb/public/sdk/cpp/client/ydb_table
