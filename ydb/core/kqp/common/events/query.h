@@ -126,6 +126,14 @@ public:
         return RequestCtx ? SessionId : Record.GetRequest().GetSessionId();
     }
 
+    void SetNewSessionId(const TString& sessionId) {
+        NewSessionId = sessionId;
+    }
+
+    const TString& GetNewSessionId() const {
+        return NewSessionId;
+    }
+
     NKikimrKqp::EQueryAction GetAction() const {
         return RequestCtx ? QueryAction : Record.GetRequest().GetAction();
     }
@@ -364,6 +372,7 @@ private:
     TActorId RequestActorId;
     TString Database;
     TString SessionId;
+    TString NewSessionId;
     TString YqlText;
     TString QueryId;
     TString PoolId;
