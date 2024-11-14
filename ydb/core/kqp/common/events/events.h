@@ -29,7 +29,10 @@ struct TEvKqp {
         NKikimrKqp::TEvCloseSessionRequest, TKqpEvents::EvCloseSessionRequest> {};
 
     struct TEvCreateSessionRequest : public TEventPB<TEvCreateSessionRequest,
-        NKikimrKqp::TEvCreateSessionRequest, TKqpEvents::EvCreateSessionRequest> {};
+        NKikimrKqp::TEvCreateSessionRequest, TKqpEvents::EvCreateSessionRequest>
+    {
+        TString NewSessionId;
+    };
 
     struct TEvPingSessionRequest : public TEventPB<TEvPingSessionRequest,
         NKikimrKqp::TEvPingSessionRequest, TKqpEvents::EvPingSessionRequest> {};
