@@ -34,12 +34,13 @@ struct TRWSpinLock {
     }
 
     void AcquireRead() noexcept {
+        TSpinWait sw;
         while (true) {
             TAtomic a = AtomicGet(State);
             if ((a & 1) == 0 && AtomicCas(&State, a + 2, a)) {
                 break;
             }
-            SpinLockPause();
+            sw.Sleep();
         }
     }
 
@@ -48,16 +49,17 @@ struct TRWSpinLock {
     }
 
     void AcquireWrite() noexcept {
+        TSpinWait sw;
         while (true) {
             TAtomic a = AtomicGet(State);
             if ((a & 1) == 0 && AtomicCas(&State, a + 1, a)) {
                 break;
             }
-            SpinLockPause();
+            sw.Sleep();
         }
 
         while (!AtomicCas(&State, TAtomicBase(-1), 1)) {
-            SpinLockPause();
+            sw.Sleep();
         }
     }
 
