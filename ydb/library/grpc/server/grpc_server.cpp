@@ -1,5 +1,8 @@
 #include "grpc_server.h"
 
+#include <library/cpp/monlib/dynamic_counters/counters.h>
+#include <library/cpp/time_provider/monotonic.h>
+
 #include <util/string/join.h>
 #include <util/generic/yexception.h>
 #include <util/system/thread.h>
@@ -18,19 +21,31 @@
 
 namespace NYdbGrpc {
 
-using NThreading::TFuture;
-
-static void PullEvents(grpc::ServerCompletionQueue* cq) {
+static void PullEvents(grpc::ServerCompletionQueue* cq, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters) {
     TThread::SetCurrentThreadName("grpc_server");
+    auto okCounter = counters->GetCounter("Ok", true);
+    auto errorCounter = counters->GetCounter("Error", true);
+    auto cpuTime = counters->GetCounter("ThreadCPU", true);
+
+    NMonotonic::TMonotonic lastCpuTimeTs = {};
     while (true) {
         void* tag; // uniquely identifies a request.
         bool ok;
 
+        auto now = NMonotonic::TMonotonic::Now();
+        if (now - lastCpuTimeTs >= TDuration::Seconds(1)) {
+            lastCpuTimeTs = now;
+            *cpuTime = ThreadCPUTime();
+        }
+
         if (cq->Next(&tag, &ok)) {
             IQueueEvent* const ev(static_cast<IQueueEvent*>(tag));
 
-            if (!ev->Execute(ok)) {
+            if (ev->Execute(ok)) {
+                okCounter->Inc();
+            } else {
                 ev->DestroyRequest();
+                errorCounter->Inc();
             }
         } else {
             break;
@@ -103,8 +118,9 @@ void TGrpcServiceProtectiable::DecRequest() {
     }
 }
 
-TGRpcServer::TGRpcServer(const TServerOptions& opts)
+TGRpcServer::TGRpcServer(const TServerOptions& opts, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters)
     : Options_(opts)
+    , Counters_(std::move(counters))
     , Limiter_(Options_.MaxGlobalRequestInFlight)
     {}
 
@@ -237,10 +253,12 @@ void TGRpcServer::Start() {
     }
 
     Ts.reserve(Options_.WorkerThreads);
+    auto grpcCounters = Counters_->GetSubgroup("counters", "grpc");
     for (size_t i = 0; i < Options_.WorkerThreads; ++i) {
         auto* cq = &CQS_[i % CQS_.size()];
-        Ts.push_back(SystemThreadFactory()->Run([cq] {
-            PullEvents(cq->get());
+        auto workerCounters = grpcCounters->GetSubgroup("worker", ToString(i));
+        Ts.push_back(SystemThreadFactory()->Run([cq, workerCounters] {
+            PullEvents(cq->get(), std::move(workerCounters));
         }));
     }
 

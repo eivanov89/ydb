@@ -18,6 +18,10 @@
 
 #include <grpcpp/grpcpp.h>
 
+namespace NMonitoring {
+    struct TDynamicCounters;
+} // NMonitoring
+
 namespace NYdbGrpc {
 
 struct TSslData {
@@ -349,7 +353,7 @@ protected:
 class TGRpcServer {
 public:
     using IGRpcServicePtr = TIntrusivePtr<IGRpcService>;
-    TGRpcServer(const TServerOptions& opts);
+    TGRpcServer(const TServerOptions& opts, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters);
     ~TGRpcServer();
     void AddService(IGRpcServicePtr service);
     void Start();
@@ -365,6 +369,7 @@ private:
     using IThreadRef = TAutoPtr<IThreadFactory::IThread>;
 
     const TServerOptions Options_;
+    TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters_;
     std::unique_ptr<grpc::Server> Server_;
     std::vector<std::unique_ptr<grpc::ServerCompletionQueue>> CQS_;
     TVector<IThreadRef> Ts;

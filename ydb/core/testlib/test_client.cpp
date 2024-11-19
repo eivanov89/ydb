@@ -346,7 +346,10 @@ namespace Tests {
     }
 
     void TServer::EnableGRpc(const NYdbGrpc::TServerOptions& options, ui32 grpcServiceNodeId) {
-        GRpcServer.reset(new NYdbGrpc::TGRpcServer(options));
+        GRpcServerRootCounters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
+        auto& counters = GRpcServerRootCounters;
+
+        GRpcServer.reset(new NYdbGrpc::TGRpcServer(options), counters);
         auto grpcService = new NGRpcProxy::TGRpcService();
 
         auto system(Runtime->GetActorSystem(grpcServiceNodeId));
@@ -377,9 +380,6 @@ namespace Tests {
 
         auto grpcMon = system->Register(NGRpcService::CreateGrpcMonService(), TMailboxType::ReadAsFilled, appData.UserPoolId);
         system->RegisterLocalService(NGRpcService::GrpcMonServiceId(), grpcMon);
-
-        GRpcServerRootCounters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
-        auto& counters = GRpcServerRootCounters;
 
         // Setup discovery for typically used services on the node
         {
