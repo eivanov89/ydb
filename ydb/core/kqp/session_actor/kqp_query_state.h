@@ -15,6 +15,7 @@
 #include <ydb/core/kqp/common/kqp_user_request_context.h>
 #include <ydb/core/kqp/common/kqp.h>
 #include <ydb/core/kqp/common/simple/temp_tables.h>
+#include <ydb/core/tx/scheme_board/cache.h>
 
 #include <ydb/library/actors/core/monotonic_provider.h>
 
@@ -303,9 +304,13 @@ public:
 
     void FillViews(const google::protobuf::RepeatedPtrField< ::NKqpProto::TKqpTableInfo>& views);
 
-    bool NeedCheckTableVersions() const {
-        return CompileStats.FromCache;
-    }
+    enum class ETableCheckResult {
+        SCHEME_CACHE_NEEDED = 0,
+        COMPILATION_NEEDED = 1,
+        MATCHED = 2
+    };
+
+    ETableCheckResult NeedCheckTableVersions() /* const */;
 
     TString ExtractQueryText() const {
         if (CompileResult) {

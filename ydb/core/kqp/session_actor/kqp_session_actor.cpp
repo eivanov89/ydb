@@ -527,14 +527,24 @@ public:
             // even if we have successfully compilation result, it doesn't mean anything
             // in terms of current schema version of the table if response of compilation is from the cache.
             // because of that, we are forcing to run schema version check
-            if (QueryState->NeedCheckTableVersions()) {
+            auto checkResult = QueryState->NeedCheckTableVersions();
+            switch (checkResult) {
+            case TKqpQueryState::ETableCheckResult::SCHEME_CACHE_NEEDED: {
                 auto ev = QueryState->BuildNavigateKeySet();
                 Send(MakeSchemeCacheID(), ev.release());
                 return;
             }
-
-            OnSuccessCompileRequest();
-            return;
+            case TKqpQueryState::ETableCheckResult::MATCHED: {
+                OnSuccessCompileRequest();
+                return;
+            }
+            case TKqpQueryState::ETableCheckResult::COMPILATION_NEEDED: {
+                auto ev = QueryState->BuildReCompileRequest(CompilationCookie, GUCSettings);
+                Send(MakeKqpCompileServiceID(SelfId().NodeId()), ev.release(), 0, QueryState->QueryId,
+                    QueryState->KqpSessionSpan.GetTraceId());
+                return;
+            }
+            }
         }
 
         // TODO: in some cases we could reply right here (e.g. there is uid and query is missing), but
@@ -620,13 +630,15 @@ public:
         // even if we have successfully compilation result, it doesn't mean anything
         // in terms of current schema version of the table if response of compilation is from the cache.
         // because of that, we are forcing to run schema version check
-        if (QueryState->NeedCheckTableVersions()) {
+        auto checkResult = QueryState->NeedCheckTableVersions();
+        if (checkResult == TKqpQueryState::ETableCheckResult::SCHEME_CACHE_NEEDED) {
             auto ev = QueryState->BuildNavigateKeySet();
             Send(MakeSchemeCacheID(), ev.release());
             return;
+        } else {
+            OnSuccessCompileRequest();
+            return;
         }
-
-        OnSuccessCompileRequest();
     }
 
     void Handle(TEvKqp::TEvParseResponse::TPtr& ev) {
@@ -642,14 +654,24 @@ public:
             // even if we have successfully compilation result, it doesn't mean anything
             // in terms of current schema version of the table if response of compilation is from the cache.
             // because of that, we are forcing to run schema version check
-            if (QueryState->NeedCheckTableVersions()) {
+            auto checkResult = QueryState->NeedCheckTableVersions();
+            switch (checkResult) {
+            case TKqpQueryState::ETableCheckResult::SCHEME_CACHE_NEEDED: {
                 auto ev = QueryState->BuildNavigateKeySet();
                 Send(MakeSchemeCacheID(), ev.release());
                 return;
             }
-
-            OnSuccessCompileRequest();
-            return;
+            case TKqpQueryState::ETableCheckResult::MATCHED: {
+                OnSuccessCompileRequest();
+                return;
+            }
+            case TKqpQueryState::ETableCheckResult::COMPILATION_NEEDED: {
+                auto ev = QueryState->BuildReCompileRequest(CompilationCookie, GUCSettings);
+                Send(MakeKqpCompileServiceID(SelfId().NodeId()), ev.release(), 0, QueryState->QueryId,
+                    QueryState->KqpSessionSpan.GetTraceId());
+                return;
+            }
+            }
         }
 
         // TODO: in some cases we could reply right here (e.g. there is uid and query is missing), but

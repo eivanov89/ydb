@@ -2545,6 +2545,7 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
 
     template <typename TEvent>
     void HandleNotify(TEvent& ev) {
+        TGuard<TAdaptiveLock> guard(Lock);
         const TResponseProps response = TResponseProps::FromEvent(ev);
         auto& notify = *ev->Get();
 
@@ -2590,10 +2591,8 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
         }
     }
 
-    template <typename TEvent>
-    bool MaybeRunDbResolver(TEvent& ev) {
-        auto& request = ev->Get()->Request;
-
+    template <typename TRequest>
+    bool NeedRunDbResolver(TRequest& request, TVector<TString>& db) {
         if (request->DomainOwnerId) {
             return false;
         }
@@ -2602,7 +2601,7 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
             return false;
         }
 
-        const auto db = SplitPath(request->DatabaseName);
+        db = SplitPath(request->DatabaseName);
         if (db.empty()) {
             return false;
         }
@@ -2621,6 +2620,21 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
         if (it == Roots.end()) {
             return false;
         }
+
+        return true;
+    }
+
+    template <typename TEvent>
+    bool MaybeRunDbResolver(TEvent& ev) {
+        auto& request = ev->Get()->Request;
+
+        TVector<TString> db;
+        if (!NeedRunDbResolver(request, db)) {
+            return false;
+        }
+
+        // TODO: duplicated lookup
+        auto it = Roots.find(db.front());
 
         Register(CreateDbResolver(SelfId(), ev->Sender, THolder(request.Release()), it->second));
         return true;
@@ -2660,10 +2674,25 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
         return context;
     }
 
+    template <typename TContext, typename TRequest>
+    TIntrusivePtr<TContext> MakeContext2(TRequest& request) const {
+        TIntrusivePtr<TContext> context(new TContext({}, {}, request, Now()));
+
+        if (context->Request->DatabaseName) {
+            if (auto* db = Cache.FindPtr(CanonizePath(context->Request->DatabaseName))) {
+                context->ResolvedDomainInfo = db->GetDomainInfo();
+            }
+        }
+
+        return context;
+    }
+
     void Handle(TEvTxProxySchemeCache::TEvNavigateKeySet::TPtr& ev) {
         SBC_LOG_D("Handle TEvTxProxySchemeCache::TEvNavigateKeySet"
             << ": self# " << SelfId()
             << ", request# " << ev->Get()->Request->ToString(*AppData()->TypeRegistry));
+
+        TGuard<TAdaptiveLock> guard(Lock);
 
         if (MaybeRunDbResolver(ev)) {
             return;
@@ -2723,6 +2752,8 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
             << ": self# " << SelfId()
             << ", request# " << ev->Get()->Request->ToString(*AppData()->TypeRegistry));
 
+        TGuard<TAdaptiveLock> guard(Lock);
+
         if (MaybeRunDbResolver(ev)) {
             return;
         }
@@ -2761,18 +2792,21 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
     }
 
     void Handle(TEvTxProxySchemeCache::TEvWatchPathId::TPtr& ev) {
+        TGuard<TAdaptiveLock> guard(Lock);
         auto watchCache = EnsureWatchCache();
         ev->Rewrite(ev->GetTypeRewrite(), watchCache);
         TActivationContext::Send(ev.Release());
     }
 
     void Handle(TEvTxProxySchemeCache::TEvWatchRemove::TPtr& ev) {
+        TGuard<TAdaptiveLock> guard(Lock);
         auto watchCache = EnsureWatchCache();
         ev->Rewrite(ev->GetTypeRewrite(), watchCache);
         TActivationContext::Send(ev.Release());
     }
 
     void Handle(TSchemeBoardMonEvents::TEvInfoRequest::TPtr& ev) {
+        TGuard<TAdaptiveLock> guard(Lock);
         auto response = MakeHolder<TSchemeBoardMonEvents::TEvInfoResponse>(SelfId(), ActorActivityType());
         auto& record = *response->Record.MutableCacheResponse();
 
@@ -2784,6 +2818,7 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
     }
 
     void Handle(TSchemeBoardMonEvents::TEvDescribeRequest::TPtr& ev) {
+        TGuard<TAdaptiveLock> guard(Lock);
         const auto& record = ev->Get()->Record;
 
         TCacheItem* desc = nullptr;
@@ -2797,6 +2832,11 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
     }
 
     void ShrinkCache() {
+        TGuard<TAdaptiveLock> guard(Lock);
+        ShrinkCacheImpl();
+    }
+
+    void ShrinkCacheImpl() {
         if (Cache.Shrink()) {
             Send(SelfId(), new TEvents::TEvWakeup());
         } else {
@@ -2805,6 +2845,7 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
     }
 
     void PassAway() override {
+        TGuard<TAdaptiveLock> guard(Lock);
         auto evicter = [](const auto& index) {
             for (auto it = index.begin(); it != index.end(); ++it) {
                 it->second->Value.OnEvict();
@@ -2838,10 +2879,13 @@ public:
     }
 
     void Bootstrap() {
+        TGuard<TAdaptiveLock> guard(Lock);
+        ReadyForShared = true;
+
         TMonitorableActor::Bootstrap();
 
         Become(&TThis::StateWork);
-        ShrinkCache();
+        ShrinkCacheImpl();
     }
 
     STATEFN(StateWork) {
@@ -2865,7 +2909,122 @@ public:
         }
     }
 
+    std::unique_ptr<TEvTxProxySchemeCache::TEvResolveKeySetResult> ResolveKeySet(
+        std::unique_ptr<TEvTxProxySchemeCache::TEvResolveKeySet> request)
+    {
+        TGuard<TAdaptiveLock> guard(Lock);
+
+        if (!ReadyForShared) {
+            return nullptr;
+        }
+
+        TVector<TString> db;
+        if (NeedRunDbResolver(request->Request, db)) {
+            return nullptr;
+        }
+
+        // TODO: copy-paste
+        auto context = MakeContext2<TResolveContext>(request->Request);
+
+        auto pathExtractor = [](const TResolve::TEntry& entry) {
+            const TKeyDesc* keyDesc = entry.KeyDescription.Get();
+            Y_ABORT_UNLESS(keyDesc != nullptr);
+            return TPathId(keyDesc->TableId.PathId);
+        };
+
+        auto tabletIdExtractor = [](const TResolve::TEntry& entry) {
+            return entry.KeyDescription->TableId.PathId.OwnerId;
+        };
+
+        for (size_t i = 0; i < context->Request->ResultSet.size(); ++i) {
+            auto& entry = context->Request->ResultSet[i];
+            HandleEntry(context, entry, i, pathExtractor, tabletIdExtractor);
+        }
+
+        if (context->WaitCounter) {
+            return nullptr;
+        }
+
+        return std::unique_ptr<TEvTxProxySchemeCache::TEvResolveKeySetResult>(
+            new TEvTxProxySchemeCache::TEvResolveKeySetResult(context->Request.Release())
+        );
+    }
+
+    std::unique_ptr<TEvTxProxySchemeCache::TEvNavigateKeySetResult> NavigateKeySet(
+        std::unique_ptr<TEvTxProxySchemeCache::TEvNavigateKeySet> request)
+    {
+        TGuard<TAdaptiveLock> guard(Lock);
+
+        if (!ReadyForShared) {
+            return nullptr;
+        }
+
+        TVector<TString> db;
+        if (NeedRunDbResolver(request->Request, db)) {
+            return nullptr;
+        }
+
+        // TODO: copy-paste
+        auto context = MakeContext2<TNavigateContext>(request->Request);
+
+        for (size_t i = 0; i < context->Request->ResultSet.size(); ++i) {
+            auto& entry = context->Request->ResultSet[i];
+
+            if (entry.RequestType == TNavigate::TEntry::ERequestType::ByPath) {
+                auto pathExtractor = [this](TNavigate::TEntry& entry) {
+                    NSysView::ISystemViewResolver::TSystemViewPath sysViewPath;
+                    if (AppData()->FeatureFlags.GetEnableSystemViews()
+                        && SystemViewResolver->IsSystemViewPath(entry.Path, sysViewPath))
+                    {
+                        entry.TableId.SysViewInfo = sysViewPath.ViewName;
+                        return CanonizePath(sysViewPath.Parent);
+                    }
+
+                    TString path = CanonizePath(entry.Path);
+                    return path ? path : TString("/");
+                };
+
+                auto tabletIdExtractor = [this](const TNavigate::TEntry& entry) {
+                    if (entry.Path.empty()) {
+                        return ui64(NSchemeShard::InvalidTabletId);
+                    }
+
+                    auto it = Roots.find(entry.Path.front());
+                    if (it == Roots.end()) {
+                        return ui64(NSchemeShard::InvalidTabletId);
+                    }
+
+                    return it->second;
+                };
+
+                HandleEntry(context, entry, i, pathExtractor, tabletIdExtractor);
+            } else {
+                auto pathExtractor = [](const TNavigate::TEntry& entry) {
+                    return entry.TableId.PathId;
+                };
+
+                auto tabletIdExtractor = [](const TNavigate::TEntry& entry) {
+                    return entry.TableId.PathId.OwnerId;
+                };
+
+                HandleEntry(context, entry, i, pathExtractor, tabletIdExtractor);
+            }
+        }
+
+        if (context->WaitCounter) {
+            return nullptr;
+        }
+
+        return std::unique_ptr<TEvTxProxySchemeCache::TEvNavigateKeySetResult>(
+            new TEvTxProxySchemeCache::TEvNavigateKeySetResult(context->Request.Release())
+        );
+    }
+
 private:
+    // must be RW, but to simplify promotion and proto the code we use a single lock
+    TAdaptiveLock Lock;
+    bool ReadyForShared = false;
+
     THashMap<TString, ui64> Roots;
     TCounters Counters;
 
@@ -2875,6 +3034,35 @@ private:
     TActorId WatchCache;
 
 }; // TSchemeCache
+
+// just a quick and dirty proto, nothing real
+
+TSchemeCache* SchemeCache;
+
+void SetSchemeBoardLocalServiceCache(IActor* actor) {
+    SchemeCache = static_cast<TSchemeCache*>(actor);
+}
+
+std::unique_ptr<TEvTxProxySchemeCache::TEvNavigateKeySetResult> NavigateKeySet(
+        std::unique_ptr<TEvTxProxySchemeCache::TEvNavigateKeySet> request)
+{
+    if (SchemeCache) {
+        return SchemeCache->NavigateKeySet(std::move(request));
+    }
+
+    return nullptr;
+}
+
+std::unique_ptr<TEvTxProxySchemeCache::TEvResolveKeySetResult> ResolveKeySet(
+        std::unique_ptr<TEvTxProxySchemeCache::TEvResolveKeySet> request)
+{
+    if (SchemeCache) {
+        return SchemeCache->ResolveKeySet(std::move(request));
+    }
+
+    return nullptr;
+
+}
 
 } // NSchemeBoard
 

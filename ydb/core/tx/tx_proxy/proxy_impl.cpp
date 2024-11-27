@@ -438,8 +438,10 @@ public:
         Services.Proxy = SelfId();
 
         auto cacheConfig = MakeIntrusive<NSchemeCache::TSchemeCacheConfig>(AppData(ctx), CacheCounters);
-        Services.SchemeCache = ctx.ExecutorThread.RegisterActor(CreateSchemeBoardSchemeCache(cacheConfig.Get()));
+        IActor* schemeCacheActor = CreateSchemeBoardSchemeCache(cacheConfig.Get());
+        Services.SchemeCache = ctx.ExecutorThread.RegisterActor(schemeCacheActor);
         ctx.ExecutorThread.ActorSystem->RegisterLocalService(MakeSchemeCacheID(), Services.SchemeCache);
+        NSchemeBoard::SetSchemeBoardLocalServiceCache(schemeCacheActor);
 
         // PipePerNodeCaches are an external dependency
         Services.LeaderPipeCache = MakePipePerNodeCacheID(false);
