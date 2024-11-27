@@ -4,8 +4,9 @@
 #include <ydb/core/base/cputime.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
-#include <ydb/library/actors/core/actor_bootstrapped.h>
+#include <ydb/core/tx/scheme_board/cache.h>
 
+#include <ydb/library/actors/core/actor_bootstrapped.h>
 
 
 namespace NKikimr::NKqp {
@@ -61,7 +62,13 @@ private:
             PassAway();
             return;
         }
-        auto& results = ev->Get()->Request->ResultSet;
+
+        // might die, must be no code below this line
+        HandleResolveKeysImpl(*ev->Get());
+    }
+
+    void HandleResolveKeysImpl(TEvTxProxySchemeCache::TEvNavigateKeySetResult& result) {
+        auto& results = result.Request->ResultSet;
         if (results.size() != TableRequestIds.size()) {
             ReplyErrorAndDie(Ydb::StatusIds::INTERNAL_ERROR, TIssue(TStringBuilder() << "navigation problems for tables"));
             return;
@@ -104,9 +111,14 @@ private:
             return;
         }
 
+        // might die, must be no code below this line
+        HandleResolveKeysImpl(*ev->Get());
+    }
+
+    void HandleResolveKeysImpl(TEvTxProxySchemeCache::TEvResolveKeySetResult& result) {
         auto timer = std::make_unique<NCpuTime::TCpuTimer>(CpuTime);
 
-        auto& results = ev->Get()->Request->ResultSet;
+        auto& results = result.Request->ResultSet;
         LOG_D("Resolved key sets: " << results.size());
 
         for (auto& entry : results) {
@@ -144,9 +156,10 @@ private:
     }
 
 private:
-    void ResolveKeys() {
-        FillKqpTasksGraphStages(TasksGraph, Transactions);
-
+    std::pair<
+        std::unique_ptr<NSchemeCache::TSchemeCacheNavigate>,
+        THolder<NSchemeCache::TSchemeCacheRequest>>
+    BuildKeyResolveRequests() {
         auto requestNavigate = std::make_unique<NSchemeCache::TSchemeCacheNavigate>();
         auto request = MakeHolder<NSchemeCache::TSchemeCacheRequest>();
         request->ResultSet.reserve(TasksGraph.GetStagesInfo().size());
@@ -194,12 +207,42 @@ private:
                 }
             }
         }
+
+        return std::make_pair(std::move(requestNavigate), std::move(request));
+    }
+
+    void ResolveKeys() {
+        FillKqpTasksGraphStages(TasksGraph, Transactions);
+
+        auto [requestNavigate, request] = BuildKeyResolveRequests();
+
         if (requestNavigate->ResultSet.size()) {
-            Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(requestNavigate.release()));
+            auto navigateResponse = NSchemeBoard::NavigateKeySet(
+                std::make_unique<TEvTxProxySchemeCache::TEvNavigateKeySet>(requestNavigate.release()));
+
+            if (navigateResponse) {
+                // TODO: might die
+                HandleResolveKeysImpl(*navigateResponse);
+            } else {
+                requestNavigate = BuildKeyResolveRequests().first;
+                Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(requestNavigate.release()));
+                Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvResolveKeySet(request));
+                return;
+            }
         } else {
             NavigationFinished = true;
         }
-        Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvResolveKeySet(request));
+
+        auto resolveResponse = NSchemeBoard::ResolveKeySet(
+            std::make_unique<TEvTxProxySchemeCache::TEvResolveKeySet>(request.Release()));
+        if (resolveResponse) {
+            // TODO: might die
+            HandleResolveKeysImpl(*resolveResponse);
+            return;
+        }
+
+        request = BuildKeyResolveRequests().second;
+        Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvResolveKeySet(request.Release()));
     }
 
 private:

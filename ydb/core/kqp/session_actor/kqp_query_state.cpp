@@ -40,6 +40,29 @@ void TKqpQueryState::TQueryTxId::Reset() {
     Id = TTxId();
 }
 
+TKqpQueryState::ETableCheckResult TKqpQueryState::NeedCheckTableVersions() /* const */ {
+    if (!CompileStats.FromCache) {
+        return ETableCheckResult::MATCHED;
+    }
+
+    // TODO: query info should actually contain SchemeCacheVersion, so that we can quickly check.
+    // E.g. nothing changes, version is 111222 and compiled result is also 111222
+
+    auto response = NSchemeBoard::NavigateKeySet(BuildNavigateKeySet());
+    if (response) {
+        if (EnsureTableVersions(*response)) {
+            LOG_T("Table versions matched");
+            return ETableCheckResult::MATCHED;
+        } else {
+            LOG_T("Table versions mismatched");
+            return ETableCheckResult::COMPILATION_NEEDED;
+        }
+    }
+
+    LOG_T("SCHEME_CACHE_NEEDED");
+    return ETableCheckResult::SCHEME_CACHE_NEEDED;
+}
+
 bool TKqpQueryState::EnsureTableVersions(const TEvTxProxySchemeCache::TEvNavigateKeySetResult& response) {
     Y_ENSURE(response.Request);
     const auto& navigate = *response.Request;
