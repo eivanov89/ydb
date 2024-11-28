@@ -100,7 +100,10 @@ struct TEvKqpExecuter {
 
 struct TKqpFederatedQuerySetup;
 
-IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
+IActor* CreateKqpExecuter(
+    const std::optional<ui64>& maybeTxId,
+    const TActorId& target,
+    IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters,
     const NKikimrConfig::TTableServiceConfig tableServiceConfig,
     NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory, TPreparedQueryHolder::TConstPtr preparedQuery, const TActorId& creator,

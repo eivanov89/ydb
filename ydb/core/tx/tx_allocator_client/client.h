@@ -8,6 +8,7 @@
 
 #include <util/generic/ptr.h>
 #include <util/generic/vector.h>
+#include <util/system/spinlock.h>
 
 namespace NKikimr {
 
@@ -38,6 +39,7 @@ public:
 
     void Bootstrap(const TActorContext& ctx);
 
+    std::optional<ui64> AllocateTxIdFast();
     TVector<ui64> AllocateTxIds(ui64 count, const TActorContext& ctx);
 
     void SendRequest(const TTabletId& txAllocator, const TActorContext& ctx);
@@ -86,6 +88,8 @@ private:
     static constexpr ui64 PreRequestThreshhold = RequestPerAllocator / 3;
 
     const ui64 MaxCapacity = 0;
+
+    TAdaptiveLock Lock;
     ui64 Capacity = 0;
     TDeque<TAllocationRange> ReservedRanges;
 

@@ -1,7 +1,9 @@
 #include "client.h"
 
 void NKikimr::TTxAllocatorClient::AddAllocationRange(const NKikimr::TTxAllocatorClient::TTabletId &from, const NKikimrTx::TEvTxAllocateResult &allocation) {
+    TGuard<TAdaptiveLock> guard(Lock);
     ReservedRanges.emplace_back(from, allocation.GetRangeBegin(), allocation.GetRangeEnd());
+
     Capacity += ReservedRanges.back().Capacity();
 }
 
@@ -18,6 +20,36 @@ void NKikimr::TTxAllocatorClient::Bootstrap(const NActors::TActorContext &ctx) {
     for (const TTabletId& tabletId : TxAllocators) {
         RegisterRequest(tabletId, ctx);
     }
+}
+
+std::optional<ui64> NKikimr::TTxAllocatorClient::AllocateTxIdFast() {
+    TGuard<TAdaptiveLock> guard(Lock);
+
+    if (!Capacity || ReservedRanges.empty()) {
+        return {};
+    }
+
+    // quick and dirty: fast path could still proceed
+    while (ReservedRanges) {
+        TAllocationRange& head = ReservedRanges.front();
+
+        // might be better
+        if (head.Capacity() == PreRequestThreshhold + 1) {
+            return {};
+        }
+
+        if (head.Empty()) {
+            ReservedRanges.pop_front();
+            continue;
+        }
+
+        std::optional<ui64> result = head.Allocate();
+        --Capacity;
+
+        return result;
+    }
+
+    return {};
 }
 
 TVector<ui64> NKikimr::TTxAllocatorClient::AllocateTxIds(ui64 count, const NActors::TActorContext &ctx) {
@@ -38,12 +70,15 @@ TVector<ui64> NKikimr::TTxAllocatorClient::AllocateTxIds(ui64 count, const NActo
                    << " BatchAllocationWarning: " << BatchAllocationWarning);
     }
 
+    // TODO: check capacity before and without lock?
+    TVector<ui64> txIds;
+    txIds.reserve(count);
+
+    TGuard<TAdaptiveLock> guard(Lock);
+
     if (count > Capacity) {
         return TVector<ui64>();
     }
-
-    TVector<ui64> txIds;
-    txIds.reserve(count);
 
     while (count && ReservedRanges) {
         TAllocationRange& head = ReservedRanges.front();

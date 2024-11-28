@@ -314,4 +314,6 @@ namespace NTxProxy {
 IActor* CreateTxProxy(const TVector<ui64> &allocators);
 TActorId MakeTxProxyID();
 
+std::optional<ui64> FastAllocateTxId();
+
 }
