@@ -125,14 +125,19 @@ template <class TDerived, EExecType ExecType>
 class TKqpExecuterBase : public TActorBootstrapped<TDerived> {
     static_assert(ExecType == EExecType::Data || ExecType == EExecType::Scan);
 public:
-    TKqpExecuterBase(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
+    TKqpExecuterBase(
+        const std::optional<ui64> maybeTxId,
+        const TActorId& target,
+        IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
         const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
         TKqpRequestCounters::TPtr counters,
         const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
         const TIntrusivePtr<TUserRequestContext>& userRequestContext,
         ui32 statementResultIndex, ui64 spanVerbosity = 0, TString spanName = "KqpExecuterBase",
         bool streamResult = false, const TActorId bufferActorId = {}, const IKqpTransactionManagerPtr& txManager = nullptr)
-        : Request(std::move(request))
+        : MaybeTxId(maybeTxId)
+        , MaybeTarget(target)
+        , Request(std::move(request))
         , BufferActorId(bufferActorId)
         , TxManager(txManager)
         , Database(database)
@@ -170,6 +175,13 @@ public:
 
         LOG_T("Bootstrap done, become ReadyState");
         this->Become(&TKqpExecuterBase::ReadyState);
+
+
+        if (MaybeTxId && MaybeTarget) {
+            TxId = *MaybeTxId;
+            Target = MaybeTarget;
+            ProcessReady();
+        }
     }
 
     TActorId SelfId() {
@@ -494,7 +506,10 @@ protected:
     void HandleReady(TEvKqpExecuter::TEvTxRequest::TPtr& ev) {
         TxId = ev->Get()->Record.GetRequest().GetTxId();
         Target = ActorIdFromProto(ev->Get()->Record.GetTarget());
+        ProcessReady();
+    }
 
+    void ProcessReady() {
         auto lockTxId = Request.AcquireLocksTxId;
         if (lockTxId.Defined() && *lockTxId == 0) {
             lockTxId = TxId;
@@ -1967,6 +1982,8 @@ protected:
     }
 
 protected:
+    const std::optional<ui64> MaybeTxId;
+    const TActorId MaybeTarget;
     IKqpGateway::TExecPhysicalRequest Request;
     TActorId BufferActorId;
     IKqpTransactionManagerPtr TxManager;
@@ -2033,7 +2050,10 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
+IActor* CreateKqpDataExecuter(
+    const std::optional<ui64>& maybeTxId,
+    const TActorId& target,
+    IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters, bool streamResult,
     const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
     NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory, const TActorId& creator,

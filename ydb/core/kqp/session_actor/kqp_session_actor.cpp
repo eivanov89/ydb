@@ -1394,7 +1394,13 @@ public:
             auto* actor = CreateKqpBufferWriterActor(std::move(settings));
             txCtx->BufferActorId = RegisterWithSameMailbox(actor);
         }
-        auto executerActor = CreateKqpExecuter(std::move(request), Settings.Database,
+
+        std::optional<ui64> maybeTxId = ::NKikimr::FastAllocateTxId();
+
+        auto executerActor = CreateKqpExecuter(
+            maybeTxId,
+            SelfId(),
+            std::move(request), Settings.Database,
             QueryState ? QueryState->UserToken : TIntrusiveConstPtr<NACLib::TUserToken>(),
             RequestCounters, Settings.TableService,
             AsyncIoFactory, QueryState ? QueryState->PreparedQuery : nullptr, SelfId(),
@@ -1404,8 +1410,12 @@ public:
 
         auto exId = RegisterWithSameMailbox(executerActor);
         LOG_D("Created new KQP executer: " << exId << " isRollback: " << isRollback);
-        auto ev = std::make_unique<TEvTxUserProxy::TEvProposeKqpTransaction>(exId);
-        Send(MakeTxProxyID(), ev.release());
+
+        if (!maybeTxId) {
+            auto ev = std::make_unique<TEvTxUserProxy::TEvProposeKqpTransaction>(exId);
+            Send(MakeTxProxyID(), ev.release());
+        }
+
         if (!isRollback) {
             YQL_ENSURE(!ExecuterId);
         }

@@ -48,7 +48,7 @@ public:
         TPreparedQueryHolder::TConstPtr preparedQuery,
         const TIntrusivePtr<TUserRequestContext>& userRequestContext,
         ui32 statementResultIndex)
-        : TBase(std::move(request), database, userToken, counters, tableServiceConfig,
+        : TBase({}, {}, std::move(request), database, userToken, counters, tableServiceConfig,
             userRequestContext, statementResultIndex, TWilsonKqp::ScanExecuter, "ScanExecuter",
             false
         )
