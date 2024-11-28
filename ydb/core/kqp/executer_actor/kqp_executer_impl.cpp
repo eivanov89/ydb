@@ -76,7 +76,10 @@ TActorId ReportToRl(ui64 ru, const TString& database, const TString& userToken,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
+IActor* CreateKqpExecuter(
+    const std::optional<ui64>& maybeTxId,
+    const TActorId& target,
+    IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters,
     const NKikimrConfig::TTableServiceConfig tableServiceConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory,
     TPreparedQueryHolder::TConstPtr preparedQuery, const TActorId& creator,
@@ -87,9 +90,11 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
     if (request.Transactions.empty()) {
         // commit-only or rollback-only data transaction
         return CreateKqpDataExecuter(
+            maybeTxId,
+            target,
             std::move(request), database, userToken, counters, false, tableServiceConfig,
-            std::move(asyncIoFactory), creator, 
-            userRequestContext, statementResultIndex, 
+            std::move(asyncIoFactory), creator,
+            userRequestContext, statementResultIndex,
             federatedQuerySetup, /*GUCSettings*/nullptr,
             shardIdToTableInfo, txManager, bufferActorId
         );
@@ -111,9 +116,11 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
         case NKqpProto::TKqpPhyTx::TYPE_COMPUTE:
         case NKqpProto::TKqpPhyTx::TYPE_DATA:
             return CreateKqpDataExecuter(
+                maybeTxId,
+                target,
                 std::move(request), database, userToken, counters, false, tableServiceConfig,
-                std::move(asyncIoFactory), creator, 
-                userRequestContext, statementResultIndex, 
+                std::move(asyncIoFactory), creator,
+                userRequestContext, statementResultIndex,
                 federatedQuerySetup, /*GUCSettings*/nullptr,
                 shardIdToTableInfo, txManager, bufferActorId
             );
@@ -121,12 +128,14 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
         case NKqpProto::TKqpPhyTx::TYPE_SCAN:
             return CreateKqpScanExecuter(
                 std::move(request), database, userToken, counters,
-                tableServiceConfig, preparedQuery, userRequestContext, 
+                tableServiceConfig, preparedQuery, userRequestContext,
                 statementResultIndex
             );
 
         case NKqpProto::TKqpPhyTx::TYPE_GENERIC:
             return CreateKqpDataExecuter(
+                maybeTxId,
+                target,
                 std::move(request), database, userToken, counters, true,
                 tableServiceConfig, std::move(asyncIoFactory), creator,
                 userRequestContext, statementResultIndex,

@@ -124,7 +124,10 @@ public:
         return NKikimrServices::TActivity::KQP_DATA_EXECUTER_ACTOR;
     }
 
-    TKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
+    TKqpDataExecuter(
+        const std::optional<ui64>& maybeTxId,
+        const TActorId& target,
+        IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
         const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
         TKqpRequestCounters::TPtr counters, bool streamResult,
         const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
@@ -135,7 +138,7 @@ public:
         const TShardIdToTableInfoPtr& shardIdToTableInfo,
         const IKqpTransactionManagerPtr& txManager,
         const TActorId bufferActorId)
-        : TBase(std::move(request), database, userToken, counters, tableServiceConfig,
+        : TBase(maybeTxId, target, std::move(request), database, userToken, counters, tableServiceConfig,
             userRequestContext, statementResultIndex, TWilsonKqp::DataExecuter,
             "DataExecuter", streamResult, bufferActorId, txManager)
         , AsyncIoFactory(std::move(asyncIoFactory))
@@ -3017,14 +3020,20 @@ private:
 
 } // namespace
 
-IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database, const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
+IActor* CreateKqpDataExecuter(
+    const std::optional<ui64>& maybeTxId,
+    const TActorId& target,
+    IKqpGateway::TExecPhysicalRequest&& request, const TString& database, const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
     TKqpRequestCounters::TPtr counters, bool streamResult, const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
     NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory, const TActorId& creator,
     const TIntrusivePtr<TUserRequestContext>& userRequestContext, ui32 statementResultIndex,
     const std::optional<TKqpFederatedQuerySetup>& federatedQuerySetup, const TGUCSettings::TPtr& GUCSettings,
     const TShardIdToTableInfoPtr& shardIdToTableInfo, const IKqpTransactionManagerPtr& txManager, const TActorId bufferActorId)
 {
-    return new TKqpDataExecuter(std::move(request), database, userToken, counters, streamResult, tableServiceConfig,
+    return new TKqpDataExecuter(
+        maybeTxId,
+        target,
+        std::move(request), database, userToken, counters, streamResult, tableServiceConfig,
         std::move(asyncIoFactory), creator, userRequestContext, statementResultIndex, federatedQuerySetup, GUCSettings,
         shardIdToTableInfo, txManager, bufferActorId);
 }

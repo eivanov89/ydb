@@ -18,6 +18,9 @@ using namespace NTabletFlatExecutor;
 
 namespace NTxProxy {
 
+class TTxProxy;
+TTxProxy* TxProxy;
+
 template<class EventType>
 struct TDelayedQueue {
     typedef typename EventType::TPtr EventTypePtr;
@@ -450,9 +453,14 @@ public:
         TxAllocatorClient.Bootstrap(ctx);
 
         Become(&TThis::StateWork);
+        TxProxy = this;
         LOG_DEBUG_S(ctx, NKikimrServices::TX_PROXY,
                     "actor# " << SelfId() <<
                     " Become StateWork (SchemeCache " << Services.SchemeCache << ")");
+    }
+
+    std::optional<ui64> FastAllocateTxId() {
+        return TxAllocatorClient.AllocateTxIdFast();
     }
 
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -490,10 +498,19 @@ public:
 
 const TDuration TTxProxy::TimeoutDelayedRequest = TDuration::Seconds(15);
 
-}
+} // namespace NTxProxy
 
 IActor* CreateTxProxy(const TVector<ui64> &allocators) {
     return new NTxProxy::TTxProxy(allocators);
 }
 
+std::optional<ui64> FastAllocateTxId()
+{
+    if (NTxProxy::TxProxy) {
+        return NTxProxy::TxProxy->FastAllocateTxId();
+    }
+
+    return {};
 }
+
+} // namespace NKikimr
