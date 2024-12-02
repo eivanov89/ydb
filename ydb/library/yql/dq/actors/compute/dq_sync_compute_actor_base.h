@@ -29,9 +29,19 @@ protected:
 
     void DoExecuteImpl() override{
         auto sourcesState = static_cast<TDerived*>(this)->GetSourcesState();
-
         TBase::PollAsyncInput();
-        ERunStatus status = TaskRunner->Run();
+
+        ERunStatus status;
+
+        if (!MaybePrevStatus) {
+            status = TaskRunner->Run();
+            MaybePrevStatus = status;
+        } else if (*MaybePrevStatus != ERunStatus::Finished) {
+            status = TaskRunner->Run();
+            MaybePrevStatus = status;
+        } else {
+            status = *MaybePrevStatus;
+        }
 
         CA_LOG_T("Resume execution, run status: " << status);
 
@@ -57,7 +67,7 @@ protected:
         }
     }
 
-    bool DoHandleChannelsAfterFinishImpl() override final{ 
+    bool DoHandleChannelsAfterFinishImpl() override final{
         Y_ABORT_UNLESS(this->Checkpoints);
 
         if (this->Checkpoints->HasPendingCheckpoint() && !this->Checkpoints->ComputeActorStateSaved() && ReadyToCheckpoint()) {
@@ -211,7 +221,7 @@ protected:
         if (!limits.OutputChunkMaxSize) {
             limits.OutputChunkMaxSize = GetDqExecutionSettings().FlowControl.MaxOutputChunkSize;
 	}
-    
+
         if (this->Task.GetEnableSpilling()) {
             TaskRunner->SetSpillerFactory(std::make_shared<TDqSpillerFactory>(execCtx.GetTxId(), NActors::TActivationContext::ActorSystem(), execCtx.GetWakeupCallback(), execCtx.GetErrorCallback()));
         }
@@ -367,6 +377,7 @@ protected:
 
 protected:
     TIntrusivePtr<IDqTaskRunner> TaskRunner;
+    std::optional<ERunStatus> MaybePrevStatus;
 
 };
 

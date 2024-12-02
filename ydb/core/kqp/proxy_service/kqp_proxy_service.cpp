@@ -48,6 +48,8 @@
 
 #include <util/folder/dirut.h>
 
+LWTRACE_USING(KQP_PROVIDER);
+
 namespace NKikimr::NKqp {
 
 namespace {
@@ -652,6 +654,8 @@ public:
     }
 
     void Handle(TEvKqp::TEvQueryRequest::TPtr& ev) {
+        LWTRACK(KqpProxy, ev->Get()->Orbit);
+
         if (!DatabasesCache.SetDatabaseIdOrDefer(ev, static_cast<i32>(EDelayedRequestType::QueryRequest), ActorContext())) {
             return;
         }
