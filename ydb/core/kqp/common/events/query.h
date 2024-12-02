@@ -367,6 +367,8 @@ public:
 
     mutable NKikimrKqp::TEvQueryRequest Record;
 
+    NLWTrace::TOrbit Orbit;
+
 private:
     void PrepareRemote() const;
 
@@ -419,6 +421,8 @@ struct TEvQueryResponse: public TEventPBWithArena<TEvQueryResponse, NKikimrKqp::
     explicit TEvQueryResponse(TIntrusivePtr<NActors::TProtoArenaHolder> arena)
         : TEventPBBase(arena ? std::move(arena) : MakeIntrusive<NActors::TProtoArenaHolder>())
     {}
+
+    std::optional<NLWTrace::TOrbit> Orbit;
 };
 
 } // namespace NKikimr::NKqp

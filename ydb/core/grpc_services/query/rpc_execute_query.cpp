@@ -8,12 +8,14 @@
 #include <ydb/core/grpc_services/grpc_integrity_trails.h>
 #include <ydb/core/grpc_services/rpc_kqp_base.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
+#include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
 #include <ydb/library/ydb_issue/issue_helpers.h>
 #include <ydb/public/api/protos/ydb_query.pb.h>
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/wilson_ids/wilson.h>
 
+LWTRACE_USING(KQP_PROVIDER);
 
 namespace NKikimr::NGRpcService {
 
@@ -277,6 +279,8 @@ private:
             nullptr, // operationParams
             settings,
             req->pool_id());
+
+        LWTRACK(KqpRpcActor, ev->Orbit);
 
         if (!ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), ev.Release(), 0, 0, Span_.GetTraceId())) {
             NYql::TIssues issues;
