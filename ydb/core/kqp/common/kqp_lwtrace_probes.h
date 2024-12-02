@@ -23,6 +23,12 @@ struct TQueryAction {
 };
 
 #define KQP_PROVIDER(PROBE, EVENT, GROUPS, TYPES, NAMES) \
+    PROBE(KqpRpcActor, GROUPS("KQP"), \
+        TYPES(), \
+        NAMES()) \
+    PROBE(KqpProxy, GROUPS("KQP"), \
+        TYPES(), \
+        NAMES()) \
     PROBE(KqpSessionQueryRequest, GROUPS("KQP"), \
         TYPES(TString, TQueryType, TQueryAction, TString), \
         NAMES("database", "type", "action", "query")) \

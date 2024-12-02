@@ -69,6 +69,7 @@ public:
         , UserToken(ev->Get()->GetUserToken())
         , ClientAddress(ev->Get()->GetClientAddress())
         , StartedAt(startedAt)
+        , Orbit(std::move(ev->Get()->Orbit))
     {
         RequestEv.reset(ev->Release().Release());
         bool enableImplicitQueryParameterTypes = tableServiceConfig.GetEnableImplicitQueryParameterTypes() ||
