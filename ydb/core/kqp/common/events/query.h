@@ -128,6 +128,14 @@ public:
         return RequestCtx ? SessionId : Record.GetRequest().GetSessionId();
     }
 
+    void SetNewSessionId(TString&& sessionId) {
+        NewSessionId = std::move(sessionId);
+    }
+
+    const TString& GetNewSessionId() const {
+        return NewSessionId;
+    }
+
     NKikimrKqp::EQueryAction GetAction() const {
         return RequestCtx ? QueryAction : Record.GetRequest().GetAction();
     }
@@ -381,6 +389,7 @@ private:
     TString Database;
     TString DatabaseId;
     TString SessionId;
+    TString NewSessionId;
     TString YqlText;
     TString QueryId;
     TString PoolId;

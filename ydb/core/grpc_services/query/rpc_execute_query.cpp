@@ -15,6 +15,8 @@
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/wilson_ids/wilson.h>
 
+#include <util/random/random.h>
+
 LWTRACE_USING(KQP_PROVIDER);
 
 namespace NKikimr::NGRpcService {
@@ -282,7 +284,20 @@ private:
 
         LWTRACK(KqpRpcActor, ev->Orbit);
 
-        if (!ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), ev.Release(), 0, 0, Span_.GetTraceId())) {
+        constexpr size_t kqpProxyCount = 2;
+        size_t sessionNameHash = 0;
+
+        if (ev->GetSessionId().empty()) {
+            auto sessionId = NKqp::EncodeSessionId(SelfId().NodeId(), CreateGuidAsString());
+            sessionNameHash = THash<TString>()(sessionId);
+            ev->SetNewSessionId(std::move(sessionId));
+        } else {
+            sessionNameHash = THash<TString>()(ev->GetSessionId());
+        }
+
+        int proxyId = sessionNameHash % kqpProxyCount;
+
+        if (!ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId(), proxyId), ev.Release(), 0, 0, Span_.GetTraceId())) {
             NYql::TIssues issues;
             issues.AddIssue(MakeIssue(NKikimrIssues::TIssuesIds::DEFAULT_ERROR, "Internal error"));
             ReplyFinishStream(Ydb::StatusIds::INTERNAL_ERROR, std::move(issues));

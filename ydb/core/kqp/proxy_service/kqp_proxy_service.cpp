@@ -100,14 +100,6 @@ std::optional<ui32> TryDecodeYdbSessionId(const TString& sessionId) {
     return std::nullopt;
 }
 
-TString EncodeSessionId(ui32 nodeId, const TString& id) {
-    Ydb::TOperationId opId;
-    opId.SetKind(NOperationId::TOperationId::SESSION_YQL);
-    NOperationId::AddOptionalValue(opId, "node_id", ToString(nodeId));
-    NOperationId::AddOptionalValue(opId, "id", Base64Encode(id));
-    return NOperationId::ProtoToString(opId);
-}
-
 class TKqpTempTablesAgentActor: public TActorBootstrapped<TKqpTempTablesAgentActor> {
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -627,7 +619,7 @@ public:
                 event.GetSupportsBalancing(), event.GetPgWire(),
                 event.GetClientAddress(), event.GetUserSID(), event.GetClientUserAgent(), event.GetClientSdkBuildInfo(),
                 event.GetClientPID(),
-                event.GetApplicationName(), event.GetUserName(), result))
+                event.GetApplicationName(), event.GetUserName(), result, event.GetNewSessionId()))
         {
             auto& response = *responseEv->Record.MutableResponse();
             response.SetSessionId(result.Value->SessionId);
@@ -670,13 +662,13 @@ public:
         if (ev->Get()->GetSessionId().empty()) {
             TProcessResult<TKqpSessionInfo*> result;
             if (!CreateNewSessionWorker(requestInfo, TString(DefaultKikimrPublicClusterName), false,
-                database, false, false, "", "", "", "", "", "", Nothing(), result))
+                database, false, false, "", "", "", "", "", "", Nothing(), result, ev->Get()->GetNewSessionId()))
             {
                 ReplyProcessError(result.YdbStatus, result.Error, requestId);
                 return;
             }
             explicitSession = false;
-            ev->Get()->SetSessionId(result.Value->SessionId);
+            ev->Get()->SetSessionId(ev->Get()->GetNewSessionId());
         }
 
         const TString& sessionId = ev->Get()->GetSessionId();
@@ -1465,7 +1457,8 @@ private:
         const TString& clientPid,
         const TString& clientApplicationName,
         const TMaybe<TString>& clientUserName,
-        TProcessResult<TKqpSessionInfo*>& result)
+        TProcessResult<TKqpSessionInfo*>& result,
+        const TString& newSessionId)
     {
         if (!database.empty() && AppData()->TenantName.empty()) {
             TString error = TStringBuilder() << "Node isn't ready to serve database requests.";
@@ -1499,8 +1492,6 @@ private:
             return false;
         }
 
-        auto sessionId = EncodeSessionId(SelfId().NodeId(), CreateGuidAsString());
-
         auto dbCounters = Counters->GetDbCounters(database);
 
         TKqpWorkerSettings workerSettings(cluster, database, clientApplicationName, clientUserName, TableServiceConfig, QueryServiceConfig, dbCounters);
@@ -1508,12 +1499,12 @@ private:
 
         auto config = CreateConfig(KqpSettings, workerSettings);
 
-        IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
+        IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, ResourceManager_, CaFactory_, newSessionId, KqpSettings, workerSettings,
             FederatedQuerySetup, AsyncIoFactory, ModuleResolverState, Counters,
             QueryServiceConfig, KqpTempTablesAgentActor);
         auto workerId = TlsActivationContext->ExecutorThread.RegisterActor(sessionActor, TMailboxType::HTSwap, AppData()->UserPoolId);
         TKqpSessionInfo* sessionInfo = LocalSessions->Create(
-            sessionId, workerId, database, dbCounters, supportsBalancing, GetSessionIdleDuration(), pgWire);
+            newSessionId, workerId, database, dbCounters, supportsBalancing, GetSessionIdleDuration(), pgWire);
         KqpProxySharedResources->AtomicLocalSessionCount.store(LocalSessions->size());
 
         sessionInfo->ClientSID = clientSid;
@@ -1953,10 +1944,18 @@ private:
 
 } // namespace
 
+TString EncodeSessionId(ui32 nodeId, const TString& id) {
+    Ydb::TOperationId opId;
+    opId.SetKind(NOperationId::TOperationId::SESSION_YQL);
+    NOperationId::AddOptionalValue(opId, "node_id", ToString(nodeId));
+    NOperationId::AddOptionalValue(opId, "id", Base64Encode(id));
+    return NOperationId::ProtoToString(opId);
+}
+
 IActor* CreateKqpProxyService(const NKikimrConfig::TLogConfig& logConfig,
     const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
     const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
-    TVector<NKikimrKqp::TKqpSetting>&& settings,
+    TVector<NKikimrKqp::TKqpSetting> settings,
     std::shared_ptr<IQueryReplayBackendFactory> queryReplayFactory,
     std::shared_ptr<TKqpProxySharedResources> kqpProxySharedResources,
     IKqpFederatedQuerySetupFactory::TPtr federatedQuerySetupFactory,

@@ -2136,13 +2136,17 @@ void TKqpServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setu
         auto federatedQuerySetupFactory = NKqp::MakeKqpFederatedQuerySetupFactory(setup, appData, Config);
 
         auto s3ActorsFactory = NYql::NDq::CreateS3ActorsFactory();
-        auto proxy = NKqp::CreateKqpProxyService(Config.GetLogConfig(), Config.GetTableServiceConfig(),
-            Config.GetQueryServiceConfig(), std::move(settings), Factories->QueryReplayBackendFactory, std::move(kqpProxySharedResources),
-            federatedQuerySetupFactory, s3ActorsFactory
-        );
-        setup->LocalServices.push_back(std::make_pair(
-            NKqp::MakeKqpProxyID(NodeId),
-            TActorSetupCmd(proxy, TMailboxType::HTSwap, appData->UserPoolId)));
+
+        constexpr size_t kqpProxyCount = 2;
+        for (size_t i = 0; i < kqpProxyCount; ++i) {
+            auto proxy = NKqp::CreateKqpProxyService(Config.GetLogConfig(), Config.GetTableServiceConfig(),
+                Config.GetQueryServiceConfig(), settings, Factories->QueryReplayBackendFactory, kqpProxySharedResources,
+                federatedQuerySetupFactory, s3ActorsFactory
+            );
+            setup->LocalServices.push_back(std::make_pair(
+                NKqp::MakeKqpProxyID(NodeId, i),
+                TActorSetupCmd(proxy, TMailboxType::HTSwap, appData->UserPoolId)));
+        }
 
         // Create finalize script service
         auto finalize = NKqp::CreateKqpFinalizeScriptService(

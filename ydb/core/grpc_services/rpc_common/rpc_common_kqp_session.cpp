@@ -65,8 +65,14 @@ public:
 
 private:
     void CreateSessionImpl() {
+        constexpr size_t kqpProxyCount = 2;
+
         const auto& traceId = Request->GetTraceId();
         auto ev = MakeHolder<NKqp::TEvKqp::TEvCreateSessionRequest>();
+        auto newSessionId = NKqp::EncodeSessionId(SelfId().NodeId(), CreateGuidAsString());
+        auto sessionNameHash = THash<TString>()(newSessionId);
+        int proxyId = sessionNameHash % kqpProxyCount;
+        ev->Record.SetNewSessionId(newSessionId);
 
         ev->Record.SetDeadlineUs(Request->GetDeadline().MicroSeconds());
         SetClientIdentitySettings(ev, *Request);
@@ -82,7 +88,7 @@ private:
 
         SetDatabase(ev, *Request);
 
-        Send(NKqp::MakeKqpProxyID(SelfId().NodeId()), ev.Release(), 0, 0, Span.GetTraceId());
+        Send(NKqp::MakeKqpProxyID(SelfId().NodeId(), proxyId), ev.Release(), 0, 0, Span.GetTraceId());
     }
 
     void StateWork(TAutoPtr<IEventHandle>& ev) {
