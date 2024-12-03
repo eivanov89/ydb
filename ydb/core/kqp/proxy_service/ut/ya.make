@@ -7,6 +7,7 @@ SIZE(MEDIUM)
 SRCS(
     kqp_proxy_ut.cpp
     kqp_script_executions_ut.cpp
+    kqp_shared_multitimer_ut.cpp
 )
 
 PEERDIR(

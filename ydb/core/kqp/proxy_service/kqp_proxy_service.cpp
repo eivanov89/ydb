@@ -1,6 +1,7 @@
 #include "kqp_proxy_service.h"
 #include "kqp_proxy_service_impl.h"
 #include "kqp_script_executions.h"
+#include "kqp_shared_multitimer.h"
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/path.h>
@@ -317,6 +318,12 @@ public:
 
         KqpTempTablesAgentActor = Register(new TKqpTempTablesAgentActor());
 
+        std::tie(SharedMultitimer, SharedMultitimerActor) = CreateMultiTimer(
+            [this](IActor* actor) {
+                return this->Register(actor);
+            }
+        );
+
         Become(&TKqpProxyService::MainState);
         StartCollectPeerProxyData();
         PublishResourceUsage();
@@ -501,6 +508,8 @@ public:
 
         ResourcePoolsCache.UnsubscribeFromResourcePoolClassifiers(ActorContext());
         DatabasesCache.StopSubscriberActor(ActorContext());
+
+        Send(SharedMultitimerActor, new TEvents::TEvPoisonPill());
 
         return TActor::PassAway();
     }
@@ -1280,21 +1289,24 @@ public:
     }
 
     void StartQueryTimeout(ui64 requestId, TDuration timeout, NYql::NDqProto::StatusIds::StatusCode status = NYql::NDqProto::StatusIds::TIMEOUT) {
-        TActorId timeoutTimer = CreateLongTimer(
-            TlsActivationContext->AsActorContext(), timeout,
-            new IEventHandle(SelfId(), SelfId(), new TEvPrivate::TEvOnRequestTimeout{requestId, timeout, status, 0})
-        );
+        std::unique_ptr<IEventHandle> ev(
+            new IEventHandle(SelfId(), SelfId(), new TEvPrivate::TEvOnRequestTimeout{requestId, timeout, status, 0}));
 
-        KQP_PROXY_LOG_D("Scheduled timeout timer for requestId: " << requestId << " timeout: " << timeout << " actor id: " << timeoutTimer);
-        if (timeoutTimer) {
-            TimeoutTimers.emplace(requestId, timeoutTimer);
+        auto timerId = SharedMultitimer->ScheduleTimer(
+            TlsActivationContext->AsActorContext(),
+            timeout,
+            std::move(ev));
+
+        KQP_PROXY_LOG_D("Scheduled timeout timer for requestId: " << requestId << " timeout: " << timeout << " timer id: " << timerId);
+        if (timerId) {
+            TimeoutTimers.emplace(requestId, timerId);
         }
    }
 
     void StopQueryTimeout(ui64 requestId) {
         auto it = TimeoutTimers.find(requestId);
         if (it != TimeoutTimers.end()) {
-            Send(it->second, new TEvents::TEvPoison);
+            SharedMultitimer->CancelTimer(it->second);
             TimeoutTimers.erase(it);
         }
     }
@@ -1324,9 +1336,10 @@ public:
 
             // We must not reply before session actor in case of CANCEL AFTER settings
             if (msg->Status != NYql::NDqProto::StatusIds::CANCELLED) {
-                auto newEv = ev->Release().Release();
-                newEv->TickNextRound();
-                Schedule(newEv->Timeout, newEv);
+                ev->Get()->TickNextRound();
+                auto timeout = ev->Get()->Timeout;
+                std::unique_ptr<NActors::IEventHandle> newEv(new IEventHandle(SelfId(), SelfId(), ev->Release().Release()));
+                SharedMultitimer->ScheduleTimer(TlsActivationContext->AsActorContext(), timeout, std::move(newEv));
             }
         } else {
             TString message = TStringBuilder()
@@ -1908,7 +1921,7 @@ private:
     TKqpProxyRequestTracker PendingRequests;
     bool ShutdownRequested = false;
     THashMap<ui64, NKikimrConsole::TConfigItem::EKind> ConfigSubscriptions;
-    THashMap<ui64, TActorId> TimeoutTimers;
+    THashMap<ui64, ui64> TimeoutTimers; // requestId -> timerId
 
     std::shared_ptr<NRm::IKqpResourceManager> ResourceManager_;
     std::shared_ptr<NComputeActor::IKqpNodeComputeActorFactory> CaFactory_;
@@ -1952,6 +1965,9 @@ private:
     std::deque<TDatabasesCache::TDelayedEvent> DelayedEventsQueue;
     bool IsLookupByRmScheduled = false;
     TActorId KqpTempTablesAgentActor;
+
+    TMultiTimerMtSafePtr SharedMultitimer;
+    TActorId SharedMultitimerActor;
 
     TResourcePoolsCache ResourcePoolsCache;
     TDatabasesCache DatabasesCache;
