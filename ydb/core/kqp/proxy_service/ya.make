@@ -6,12 +6,14 @@ SRCS(
     kqp_proxy_peer_stats_calculator.cpp
     kqp_script_executions.cpp
     kqp_session_info.cpp
+    kqp_shared_multitimer.cpp
 )
 
 PEERDIR(
     ydb/library/actors/core
     ydb/library/actors/http
     library/cpp/protobuf/json
+    library/cpp/threading/queue
     ydb/core/actorlib_impl
     ydb/core/base
     ydb/core/cms/console
