@@ -58,9 +58,11 @@ struct TKqpWorkerSettings {
 };
 
 class TKqpQueryCache;
+class IMultiTimerMtSafe;
 
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TIntrusivePtr<TKqpQueryCache> queryCache,
+    TIntrusivePtr<IMultiTimerMtSafe> multiTimer,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager_,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory_,
     const TString& sessionId,
@@ -68,6 +70,7 @@ IActor* CreateKqpSessionActor(const TActorId& owner,
     std::optional<TKqpFederatedQuerySetup> federatedQuerySetup,
     NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory,
     TIntrusivePtr<TModuleResolverState> moduleResolverState, TIntrusivePtr<TKqpCounters> counters,
+    const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
     const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
     const TActorId& kqpTempTablesAgentActor);
 

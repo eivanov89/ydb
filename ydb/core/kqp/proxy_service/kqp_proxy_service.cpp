@@ -1,7 +1,6 @@
 #include "kqp_proxy_service.h"
 #include "kqp_proxy_service_impl.h"
 #include "kqp_script_executions.h"
-#include "kqp_shared_multitimer.h"
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/path.h>
@@ -14,6 +13,7 @@
 #include <ydb/core/kqp/common/events/script_executions.h>
 #include <ydb/core/kqp/common/events/workload_service.h>
 #include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
+#include <ydb/core/kqp/common/kqp_shared_multitimer.h>
 #include <ydb/core/kqp/common/kqp_timeouts.h>
 #include <ydb/core/kqp/compile_service/kqp_compile_service.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
@@ -759,17 +759,6 @@ public:
             }
         }
 
-        auto cancelAfter = ev->Get()->GetCancelAfter();
-        auto timeout = ev->Get()->GetOperationTimeout();
-        auto timerDuration = GetQueryTimeout(queryType, timeout.MilliSeconds(), TableServiceConfig, QueryServiceConfig);
-        if (cancelAfter) {
-            timerDuration = Min(timerDuration, cancelAfter);
-        }
-        KQP_PROXY_LOG_D("Ctx: " << *ev->Get()->GetUserRequestContext() << ". TEvQueryRequest, set timer for: " << timerDuration
-            << " timeout: " << timeout << " cancelAfter: " << cancelAfter
-            << ". " << "Send request to target, requestId: " << requestId << ", targetId: " << targetId);
-        auto status = timerDuration == cancelAfter ? NYql::NDqProto::StatusIds::CANCELLED : NYql::NDqProto::StatusIds::TIMEOUT;
-        StartQueryTimeout(requestId, timerDuration, status);
         Send(targetId, ev->Release().Release(), IEventHandle::FlagTrackDelivery, requestId, std::move(ev->TraceId));
     }
 
@@ -1527,9 +1516,9 @@ private:
 
         auto config = CreateConfig(KqpSettings, workerSettings);
 
-        IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
+        IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, SharedMultitimer, ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
             FederatedQuerySetup, AsyncIoFactory, ModuleResolverState, Counters,
-            QueryServiceConfig, KqpTempTablesAgentActor);
+            TableServiceConfig, QueryServiceConfig, KqpTempTablesAgentActor);
         auto workerId = TlsActivationContext->ExecutorThread.RegisterActor(sessionActor, TMailboxType::HTSwap, AppData()->UserPoolId);
         TKqpSessionInfo* sessionInfo = LocalSessions->Create(
             sessionId, workerId, database, dbCounters, supportsBalancing, GetSessionIdleDuration(), pgWire);

@@ -6,7 +6,6 @@ SRCS(
     kqp_proxy_peer_stats_calculator.cpp
     kqp_script_executions.cpp
     kqp_session_info.cpp
-    kqp_shared_multitimer.cpp
 )
 
 PEERDIR(

@@ -9,6 +9,7 @@ SRCS(
     kqp_resolve.cpp
     kqp_resolve.h
     kqp_ru_calc.cpp
+    kqp_shared_multitimer.cpp
     kqp_script_executions.cpp
     kqp_timeouts.cpp
     kqp_timeouts.h
@@ -61,4 +62,8 @@ RECURSE(
     compilation
     events
     simple
+)
+
+RECURSE_FOR_TESTS(
+    ut
 )

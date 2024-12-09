@@ -8,6 +8,7 @@
 #include <ydb/core/kqp/common/kqp_data_integrity_trails.h>
 #include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
 #include <ydb/core/kqp/common/kqp_ru_calc.h>
+#include <ydb/core/kqp/common/kqp_shared_multitimer.h>
 #include <ydb/core/kqp/common/kqp_timeouts.h>
 #include <ydb/core/kqp/common/kqp_tx.h>
 #include <ydb/core/kqp/common/kqp.h>
@@ -143,6 +144,24 @@ class TKqpSessionActor : public TActorBootstrapped<TKqpSessionActor> {
         TKqpSessionActor* This;
     };
 
+    struct TEvPrivate {
+        enum EEv {
+            EvOnRequestTimeout = EventSpaceBegin(TEvents::ES_PRIVATE),
+        };
+
+        struct TEvOnRequestTimeout: public TEventLocal<TEvOnRequestTimeout, EEv::EvOnRequestTimeout> {
+            ui64 QueryId;
+            TDuration Timeout;
+            Ydb::StatusIds::StatusCode Status;
+
+            TEvOnRequestTimeout(ui64 queryId, TDuration timeout, Ydb::StatusIds::StatusCode status)
+                : QueryId(queryId)
+                , Timeout(timeout)
+                , Status(status)
+            {}
+        };
+    };
+
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::KQP_SESSION_ACTOR;
@@ -150,6 +169,7 @@ public:
 
    TKqpSessionActor(const TActorId& owner,
             TKqpQueryCachePtr queryCache,
+            TMultiTimerMtSafePtr multitimer,
             std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
             std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory,
             const TString& sessionId, const TKqpSettings::TConstPtr& kqpSettings,
@@ -157,10 +177,12 @@ public:
             std::optional<TKqpFederatedQuerySetup> federatedQuerySetup,
             NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory,
             TIntrusivePtr<TModuleResolverState> moduleResolverState, TIntrusivePtr<TKqpCounters> counters,
+            const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
             const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
             const TActorId& kqpTempTablesAgentActor)
         : Owner(owner)
         , QueryCache(std::move(queryCache))
+        , SharedMultitimer(std::move(multitimer))
         , SessionId(sessionId)
         , ResourceManager_(std::move(resourceManager))
         , CaFactory_(std::move(caFactory))
@@ -172,6 +194,7 @@ public:
         , KqpSettings(kqpSettings)
         , Config(CreateConfig(kqpSettings, workerSettings))
         , Transactions(*Config->_KqpMaxActiveTxPerSession.Get(), TDuration::Seconds(*Config->_KqpTxIdleTimeoutSec.Get()))
+        , TableServiceConfig(tableServiceConfig)
         , QueryServiceConfig(queryServiceConfig)
         , KqpTempTablesAgentActor(kqpTempTablesAgentActor)
         , GUCSettings(std::make_shared<TGUCSettings>())
@@ -385,6 +408,31 @@ public:
         }
 
         MakeNewQueryState(ev);
+
+        const auto queryType = ev->Get()->GetType();
+        auto cancelAfter = ev->Get()->GetCancelAfter();
+        auto timeout = ev->Get()->GetOperationTimeout();
+        auto timerDuration = GetQueryTimeout(queryType, timeout.MilliSeconds(), TableServiceConfig, QueryServiceConfig);
+        if (cancelAfter) {
+            timerDuration = Min(timerDuration, cancelAfter);
+        }
+        LOG_D("Ctx: " << *ev->Get()->GetUserRequestContext() << ". TEvQueryRequest " << QueryId
+            << ", set timer for: " << timerDuration
+            << " timeout: " << timeout << " cancelAfter: " << cancelAfter);
+        auto status = timerDuration == cancelAfter ?
+            Ydb::StatusIds::CANCELLED : Ydb::StatusIds::TIMEOUT;
+
+        std::unique_ptr<IEventHandle> timerEv(
+            new IEventHandle(
+                SelfId(),
+                SelfId(),
+                new TEvPrivate::TEvOnRequestTimeout{QueryId, timeout, status}));
+
+        QueryState->QueryTimerId = SharedMultitimer->ScheduleTimer(
+            TlsActivationContext->AsActorContext(),
+            timerDuration,
+            std::move(timerEv));
+
         TTimerGuard timer(this);
         YQL_ENSURE(QueryState->GetDatabase() == Settings.Database,
                 "Wrong database, expected:" << Settings.Database << ", got: " << QueryState->GetDatabase());
@@ -465,6 +513,32 @@ public:
         } else {
             CompileQuery();
         }
+    }
+
+    void Handle(TEvPrivate::TEvOnRequestTimeout::TPtr& ev) {
+        auto* msg = ev->Get();
+        ui64 queryId = ev->Get()->QueryId;
+
+        if (!QueryState) {
+            LOG_D("Handle TEvPrivate::TEvOnRequestTimeout(" << queryId << "), but state is lost");
+            return;
+        }
+
+        if (QueryState->QueryId != queryId) {
+            LOG_D("Handle TEvPrivate::TEvOnRequestTimeout(" << queryId
+                << "), but current query is " << QueryState->QueryId);
+            return;
+        }
+
+        TString message = msg->Status == Ydb::StatusIds::TIMEOUT
+            ? (TStringBuilder() << "Request timeout " << msg->Timeout.MilliSeconds() << "ms exceeded")
+            : (TStringBuilder() << "Request canceled after " << msg->Timeout.MilliSeconds() << "ms");
+
+        LOG_D("Handle TEvPrivate::TEvOnRequestTimeout: " << message);
+
+        // TODO: convert msg->Status
+        auto abortEv = MakeHolder<TEvKqp::TEvAbortExecution>(NYql::NDqProto::StatusIds::TIMEOUT, message);
+        Send(SelfId(), abortEv.Release());
     }
 
     void Handle(TEvents::TEvUndelivered::TPtr& ev) {
@@ -1852,6 +1926,11 @@ public:
             AddQueryIssues(*response, QueryState->CompileResult->Issues);
         }
 
+        if (QueryState->QueryTimerId) {
+            SharedMultitimer->CancelTimer(QueryState->QueryTimerId);
+            QueryState->QueryTimerId = 0;
+        }
+
         AddQueryIssues(*response, QueryState->Issues);
 
         FillStats(record);
@@ -2047,6 +2126,11 @@ public:
             TlsActivationContext->AsActorContext()
         );
 
+        if (QueryState && QueryState->QueryTimerId) {
+            SharedMultitimer->CancelTimer(QueryState->QueryTimerId);
+            QueryState->QueryTimerId = 0;
+        }
+
         Send(request->Sender, response.release(), 0, proxyRequestId);
     }
 
@@ -2076,6 +2160,11 @@ public:
 
         if (QueryState->KeepSession) {
             response.SetSessionId(SessionId);
+        }
+
+        if (QueryState->QueryTimerId) {
+            SharedMultitimer->CancelTimer(QueryState->QueryTimerId);
+            QueryState->QueryTimerId = 0;
         }
 
         if (status == Ydb::StatusIds::SUCCESS) {
@@ -2300,6 +2389,11 @@ public:
             QueryState->PoolHandlerActor = Nothing();
         }
 
+        if (QueryState && QueryState->QueryTimerId) {
+            SharedMultitimer->CancelTimer(QueryState->QueryTimerId);
+            QueryState->QueryTimerId = 0;
+        }
+
         LOG_I("Cleanup start, isFinal: " << isFinal << " CleanupCtx: " << bool{CleanupCtx}
             << " TransactionsToBeAborted.size(): " << (CleanupCtx ? CleanupCtx->TransactionsToBeAborted.size() : 0)
             << " WorkerId: " << (workerId ? *workerId : TActorId())
@@ -2437,6 +2531,11 @@ public:
             QueryState->TxCtx->Invalidate();
         }
 
+        if (QueryState->QueryTimerId) {
+            SharedMultitimer->CancelTimer(QueryState->QueryTimerId);
+            QueryState->QueryTimerId = 0;
+        }
+
         FillTxInfo(response);
 
         ExecuterId = TActorId{};
@@ -2500,6 +2599,8 @@ public:
                 hFunc(TEvKqpBuffer::TEvError, Handle);
                 hFunc(TEvTxUserProxy::TEvAllocateTxIdResult, HandleNoop);
 
+                hFunc(TEvPrivate::TEvOnRequestTimeout, Handle);
+
             default:
                 UnexpectedEvent("ReadyState", ev);
             }
@@ -2543,6 +2644,8 @@ public:
                 hFunc(TEvKqp::TEvParseResponse, Handle);
                 hFunc(TEvKqp::TEvSplitResponse, Handle);
                 hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
+
+                hFunc(TEvPrivate::TEvOnRequestTimeout, Handle);
 
                 // always come from WorkerActor
                 hFunc(TEvKqp::TEvQueryResponse, ForwardResponse);
@@ -2721,6 +2824,7 @@ private:
 private:
     TActorId Owner;
     TKqpQueryCachePtr QueryCache;
+    TMultiTimerMtSafePtr SharedMultitimer;
     TString SessionId;
 
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> ResourceManager_;
@@ -2752,6 +2856,7 @@ private:
 
     TKqpTempTablesState TempTablesState;
 
+    NKikimrConfig::TTableServiceConfig TableServiceConfig;
     NKikimrConfig::TQueryServiceConfig QueryServiceConfig;
     TActorId KqpTempTablesAgentActor;
     std::shared_ptr<std::atomic<bool>> CompilationCookie;
@@ -2763,20 +2868,22 @@ private:
 
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TKqpQueryCachePtr queryCache,
+    TMultiTimerMtSafePtr multitimer,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory, const TString& sessionId,
     const TKqpSettings::TConstPtr& kqpSettings, const TKqpWorkerSettings& workerSettings,
     std::optional<TKqpFederatedQuerySetup> federatedQuerySetup,
     NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory,
     TIntrusivePtr<TModuleResolverState> moduleResolverState, TIntrusivePtr<TKqpCounters> counters,
+    const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
     const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
     const TActorId& kqpTempTablesAgentActor)
 {
     return new TKqpSessionActor(
-        owner, std::move(queryCache),
+        owner, std::move(queryCache), std::move(multitimer),
         std::move(resourceManager), std::move(caFactory), sessionId, kqpSettings, workerSettings, federatedQuerySetup,
                                 std::move(asyncIoFactory),  std::move(moduleResolverState), counters,
-                                queryServiceConfig, kqpTempTablesAgentActor);
+                                tableServiceConfig, queryServiceConfig, kqpTempTablesAgentActor);
 }
 
 }
