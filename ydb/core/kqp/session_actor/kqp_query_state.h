@@ -173,6 +173,8 @@ public:
 
     TMaybe<TString> CommandTagName;
 
+    size_t QueryTimerId = 0;
+
     NKikimrKqp::EQueryAction GetAction() const {
         return QueryAction;
     }
