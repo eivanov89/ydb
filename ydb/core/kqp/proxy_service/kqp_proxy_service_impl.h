@@ -3,6 +3,7 @@
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/kqp/common/kqp.h>
+#include <ydb/core/kqp/common/kqp_session_router.h>
 #include <ydb/core/kqp/common/events/workload_service.h>
 #include <ydb/core/kqp/counters/kqp_counters.h>
 #include <ydb/core/kqp/gateway/behaviour/resource_pool_classifier/fetcher.h>
@@ -93,7 +94,7 @@ struct TKqpSessionInfo {
     std::vector<i32> ReadyPos;
     NActors::TMonotonic IdleTimeout;
     // position in the idle list.
-    std::list<TKqpSessionInfo*>::iterator IdlePos;
+    std::list<TKqpSessionInfo*>::iterator IdlePos; // TODO: remove
     TNodeId AttachedNodeId;
     TActorId AttachedRpcId;
     bool PgWire;
@@ -213,7 +214,11 @@ public:
         SessionsCountPerDatabase[database]++;
         Y_ABORT_UNLESS(result.second, "Duplicate session id!");
         TargetIdIndex.emplace(workerId, sessionId);
-        StartIdleCheck(&(result.first->second), idleDuration);
+
+        GetGlobalSessionRouter().AddIdleSessionActor(
+            sessionId,
+            workerId,
+            NActors::TActivationContext::Monotonic() + idleDuration);
         return &result.first->second;
     }
 
@@ -225,60 +230,13 @@ public:
         ShutdownInFlightSessions.emplace(sessionId);
         auto ptr = LocalSessions.FindPtr(sessionId);
         ptr->ShutdownStartedAt = TAppData::TimeProvider->Now();
+        GetGlobalSessionRouter().Erase(sessionId);
         RemoveSessionFromLists(ptr);
         return ptr;
     }
 
     bool IsSessionIdle(const TKqpSessionInfo* sessionInfo) const {
-        return sessionInfo->IdlePos != IdleSessions.end();
-    }
-
-    const TKqpSessionInfo* GetIdleSession(const NActors::TMonotonic& now) {
-        if (IdleSessions.empty()) {
-            return nullptr;
-        }
-
-        const TKqpSessionInfo* candidate = (*IdleSessions.begin());
-        if (candidate->IdleTimeout > now) {
-            return nullptr;
-        }
-
-        return candidate;
-    }
-
-    void StartIdleCheck(const TKqpSessionInfo* sessionInfo, const TDuration idleDuration) {
-        if (!sessionInfo) {
-            return;
-        }
-
-        if (sessionInfo->PgWire) {
-            return;
-        }
-
-        TKqpSessionInfo* info = const_cast<TKqpSessionInfo*>(sessionInfo);
-
-        info->IdleTimeout = NActors::TActivationContext::Monotonic() + idleDuration;
-        if (info->IdlePos != IdleSessions.end()) {
-            IdleSessions.erase(info->IdlePos);
-        }
-
-        info->IdlePos = IdleSessions.insert(IdleSessions.end(), info);
-    }
-
-    void StopIdleCheck(const TKqpSessionInfo* sessionInfo) {
-        if (!sessionInfo) {
-            return;
-        }
-
-        if (sessionInfo->PgWire) {
-            return;
-        }
-
-        TKqpSessionInfo* info = const_cast<TKqpSessionInfo*>(sessionInfo);
-        if (info->IdlePos != IdleSessions.end()) {
-            IdleSessions.erase(info->IdlePos);
-            info->IdlePos = IdleSessions.end();
-        }
+        return GetGlobalSessionRouter().IsIdle(sessionInfo->SessionId);
     }
 
     TKqpSessionInfo* PickSessionToShutdown(bool force, ui32 minReasonableToKick) {
@@ -324,7 +282,7 @@ public:
                 }
             }
 
-            StopIdleCheck(&(it->second));
+            GetGlobalSessionRouter().Erase(sessionId);
             RemoveSessionFromLists(&(it->second));
             ShutdownInFlightSessions.erase(sessionId);
             TargetIdIndex.erase(it->second.WorkerId);

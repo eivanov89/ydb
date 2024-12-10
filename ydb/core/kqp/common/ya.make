@@ -8,6 +8,8 @@ SRCS(
     kqp_resolve.cpp
     kqp_resolve.h
     kqp_ru_calc.cpp
+    kqp_session_router.h
+    kqp_session_router.cpp
     kqp_shared_multitimer.cpp
     kqp_script_executions.cpp
     kqp_timeouts.cpp

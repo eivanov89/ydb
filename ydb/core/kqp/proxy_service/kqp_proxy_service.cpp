@@ -13,6 +13,7 @@
 #include <ydb/core/kqp/common/events/script_executions.h>
 #include <ydb/core/kqp/common/events/workload_service.h>
 #include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
+#include <ydb/core/kqp/common/kqp_session_router.h>
 #include <ydb/core/kqp/common/kqp_shared_multitimer.h>
 #include <ydb/core/kqp/common/kqp_timeouts.h>
 #include <ydb/core/kqp/compile_service/kqp_compile_service.h>
@@ -357,22 +358,24 @@ public:
     }
 
     bool CheckIdleSessions(const ui32 maxSessionsToClose = 10) {
-        ui32 closedIdleSessions = 0;
         const NActors::TMonotonic now = TActivationContext::Monotonic();
-        while(true) {
-            const TKqpSessionInfo* sessionInfo = LocalSessions->GetIdleSession(now);
-            if (sessionInfo == nullptr)
-                return false;
+
+        std::vector<TString> sessionsToClose = GetGlobalSessionRouter().ForgetIdleSessions(
+            now,
+            maxSessionsToClose);
+
+        for (const auto& sessionId: sessionsToClose) {
+            const TKqpSessionInfo* sessionInfo = LocalSessions->FindPtr(sessionId);
+            if (!sessionInfo) {
+                // TODO: verify
+                continue;
+            }
 
             Counters->ReportSessionActorClosedIdle(sessionInfo->DbCounters);
-            LocalSessions->StopIdleCheck(sessionInfo);
             SendSessionClose(sessionInfo);
-            ++closedIdleSessions;
-
-            if (closedIdleSessions > maxSessionsToClose) {
-                return true;
-            }
         }
+
+        return sessionsToClose.size() >= maxSessionsToClose;
     }
 
     void SendSessionClose(const TKqpSessionInfo* sessionInfo) {
@@ -746,7 +749,7 @@ public:
         TActorId targetId;
         if (sessionInfo) {
             targetId = sessionInfo->WorkerId;
-            LocalSessions->StopIdleCheck(sessionInfo);
+            GetGlobalSessionRouter().MarkNonIdle(sessionInfo->SessionId);
         } else {
             targetId = TryGetSessionTargetActor(sessionId, requestInfo, requestId);
             if (!targetId) {
@@ -820,11 +823,15 @@ public:
                 << ", sameNode: " << sameNode
                 << ", trace_id: " << traceId);
 
-            const bool isIdle = LocalSessions->IsSessionIdle(sessionInfo);
+            auto& sessionRouter = GetGlobalSessionRouter();
+            const bool isIdle = sessionRouter.IsIdle(sessionInfo->SessionId);
             if (isIdle) {
-                LocalSessions->StopIdleCheck(sessionInfo);
                 if (!ctrlActor) {
-                    LocalSessions->StartIdleCheck(sessionInfo, GetSessionIdleDuration());
+                    sessionRouter.MarkIdle(
+                        sessionInfo->SessionId,
+                        NActors::TActivationContext::Monotonic() + GetSessionIdleDuration());
+                } else {
+                    sessionRouter.MarkNonIdle(sessionInfo->SessionId);
                 }
             }
 
@@ -899,7 +906,7 @@ public:
         TActorId targetId;
         if (sessionInfo) {
             targetId = sessionInfo->WorkerId;
-            LocalSessions->StopIdleCheck(sessionInfo);
+            GetGlobalSessionRouter().MarkNonIdle(sessionInfo->SessionId);
         } else {
             targetId = TryGetSessionTargetActor(sessionId, requestInfo, requestId);
             if (!targetId) {
@@ -925,7 +932,9 @@ public:
 
         const TKqpSessionInfo* info = LocalSessions->FindPtr(proxyRequest->SessionId);
         if (info && !info->AttachedRpcId) {
-            LocalSessions->StartIdleCheck(info, GetSessionIdleDuration());
+            GetGlobalSessionRouter().MarkIdle(
+                info->SessionId,
+                NActors::TActivationContext::Monotonic() + GetSessionIdleDuration());
         }
 
         Send<ESendingType::Tail>(proxyRequest->Sender, ev->Release().Release(), 0, proxyRequest->SenderCookie);
@@ -1789,12 +1798,13 @@ private:
     void Handle(TEvInterconnect::TEvNodeDisconnected::TPtr& ev) {
         TNodeId nodeId = ev->Get()->NodeId;
         auto sessions = LocalSessions->FindSessions(nodeId);
+        auto now = NActors::TActivationContext::Monotonic();
         KQP_PROXY_LOG_D("Node: " << nodeId << " disconnected, had " << sessions.size() << " sessions.");
         const static auto IdleDurationAfterDisconnect = TDuration::Seconds(1);
         // Just start standard idle check with small timeout
         // It allows to use common code to close and delete expired session
         for (const auto sessionInfo : sessions) {
-            LocalSessions->StartIdleCheck(sessionInfo, IdleDurationAfterDisconnect);
+            GetGlobalSessionRouter().MarkIdle(sessionInfo->SessionId, now + IdleDurationAfterDisconnect);
         }
     }
 
