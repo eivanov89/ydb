@@ -297,6 +297,10 @@ private:
         return TActivationContext::AsActorContext().Register(actor);
     }
 
+    TActorId RegisterActorTail(IActor* actor) const override {
+        return TActivationContext::AsActorContext().Register<ESendingType::Tail>(actor);
+    }
+
     virtual void PassAway() override {
         for (auto& [_, queue] : DeferredEvents) {
             for (TEventReqHolder& req : queue) {

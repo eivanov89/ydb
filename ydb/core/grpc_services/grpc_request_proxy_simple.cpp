@@ -145,6 +145,10 @@ private:
         return TActivationContext::AsActorContext().Register(actor);
     }
 
+    TActorId RegisterActorTail(IActor* actor) const override {
+        return TActivationContext::AsActorContext().Register<ESendingType::Tail>(actor);
+    }
+
     const NKikimrConfig::TAppConfig AppConfig;
     std::atomic<ui64> ChannelBufferSize;
     IGRpcProxyCounters::TPtr Counters;

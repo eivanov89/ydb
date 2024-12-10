@@ -358,6 +358,8 @@ public:
     virtual ui64 GetChannelBufferSize() const = 0;
     // Registers new actor using method chosen by grpc proxy
     virtual TActorId RegisterActor(IActor* actor) const = 0;
+
+    virtual TActorId RegisterActorTail(IActor* actor) const = 0;
 };
 
 struct TRequestAuxSettings {

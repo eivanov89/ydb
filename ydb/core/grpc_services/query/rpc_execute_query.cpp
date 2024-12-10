@@ -9,6 +9,8 @@
 #include <ydb/core/grpc_services/rpc_kqp_base.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
+#include <ydb/core/kqp/common/kqp_session_router.h>
+#include <ydb/core/kqp/common/kqp_user_request_context.h>
 #include <ydb/library/ydb_issue/issue_helpers.h>
 #include <ydb/public/api/protos/ydb_query.pb.h>
 
@@ -282,7 +284,35 @@ private:
 
         LWTRACK(KqpRpcActor, ev->Orbit);
 
-        if (!ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), ev.Release(), 0, 0, Span_.GetTraceId())) {
+        bool sent = false;
+
+        // TODO: check database ID
+        if (req->session_id()) {
+            // TODO: get deadline from config
+
+            if (!ev->GetUserRequestContext()) {
+                const TString& database = ev->GetDatabase();
+                const TString& traceId = ev->GetTraceId();
+                ev->SetUserRequestContext(
+                    MakeIntrusive<NKqp::TUserRequestContext>(traceId, database, req->session_id()));
+            }
+
+            TActorId sessionActorId = NKqp::GetGlobalSessionRouter().GetSessionActor(
+                req->session_id(),
+                ctx.Monotonic() + TDuration::Seconds(600));
+            if (sessionActorId) {
+                sent = ctx.Send<ESendingType::Tail>(sessionActorId, ev.Release(), 0, 0, Span_.GetTraceId());
+                LOG_TRACE_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " sent query directly to session "
+                    << req->session_id());
+            }
+        }
+
+        if (!sent) {
+            sent = ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), ev.Release(), 0, 0, Span_.GetTraceId());
+            LOG_TRACE_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " sent query to proxy ");
+        }
+
+        if (!sent) {
             NYql::TIssues issues;
             issues.AddIssue(MakeIssue(NKikimrIssues::TIssuesIds::DEFAULT_ERROR, "Internal error"));
             ReplyFinishStream(Ydb::StatusIds::INTERNAL_ERROR, std::move(issues));
@@ -508,7 +538,7 @@ void DoExecuteQuery(std::unique_ptr<IRequestNoOpCtx> p, const IFacilityProvider&
 
     auto* req = dynamic_cast<TEvExecuteQueryRequest*>(p.release());
     Y_ABORT_UNLESS(req != nullptr, "Wrong using of TGRpcRequestWrapper");
-    f.RegisterActor(new TExecuteQueryRPC(req, inflightLimitBytes));
+    f.RegisterActorTail(new TExecuteQueryRPC(req, inflightLimitBytes));
 }
 
 }

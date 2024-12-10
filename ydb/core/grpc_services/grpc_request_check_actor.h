@@ -290,6 +290,10 @@ public:
         return this->RegisterWithSameMailbox(actor);
     }
 
+    TActorId RegisterActorTail(IActor* actor) const override {
+        return this->RegisterActor(actor);
+    }
+
     void PassAway() override {
         Span_.EndOk();
         TBase::PassAway();
