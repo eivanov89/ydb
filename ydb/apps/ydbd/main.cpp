@@ -7,9 +7,13 @@
 #include <ydb/library/pdisk_io/aio.h>
 #include <yql/essentials/parser/pg_wrapper/interface/comp_factory.h>
 
+#include <contrib/libs/tcmalloc/tcmalloc/malloc_extension.h>
+
 
 int main(int argc, char **argv) {
     SetupTerminateHandler();
+
+    tcmalloc::MallocExtension::SetMaxPerCpuCacheSize(std::numeric_limits<i32>::max());
 
     auto factories = std::make_shared<NKikimr::TModuleFactories>();
     factories->DataShardExportFactory = std::make_shared<TDataShardExportFactory>();
