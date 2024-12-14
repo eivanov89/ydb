@@ -609,6 +609,7 @@ class TTcMallocMonitor : public IAllocMonitor {
 
 private:
     void UpdateCounters() {
+    /*
         auto profile = tcmalloc::MallocExtension::SnapshotCurrent(tcmalloc::ProfileType::kHeap);
 
         TAllocationAnalyzer analyzer(std::move(profile));
@@ -649,6 +650,7 @@ private:
             size->Set(allocationStats.TagSizes[t]);
             count->Set(allocationStats.TagCounts[t]);
         }
+    */
     }
 
     void UpdateControls() {
