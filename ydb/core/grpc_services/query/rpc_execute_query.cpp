@@ -284,39 +284,46 @@ private:
 
         LWTRACK(KqpRpcActor, ev->Orbit);
 
-        bool sent = false;
-
         // TODO: check database ID
         if (req->session_id()) {
-            // TODO: get deadline from config
-
-            if (!ev->GetUserRequestContext()) {
-                const TString& database = ev->GetDatabase();
-                const TString& traceId = ev->GetTraceId();
-                ev->SetUserRequestContext(
-                    MakeIntrusive<NKqp::TUserRequestContext>(traceId, database, req->session_id()));
-            }
-
             TActorId sessionActorId = NKqp::GetGlobalSessionRouter().GetSessionActor(
                 req->session_id(),
                 ctx.Monotonic() + TDuration::Seconds(600));
             if (sessionActorId) {
-                sent = ctx.Send<ESendingType::Tail>(sessionActorId, ev.Release(), 0, 0, Span_.GetTraceId());
+                // TODO: get deadline from config
+
+                if (!ev->GetUserRequestContext()) {
+                    const TString& database = ev->GetDatabase();
+                    const TString& traceId = ev->GetTraceId();
+                    ev->SetUserRequestContext(
+                        MakeIntrusive<NKqp::TUserRequestContext>(traceId, database, req->session_id()));
+                }
+
+                if (!ctx.Send<ESendingType::Tail>(sessionActorId, ev.Release(), 0, 0, Span_.GetTraceId())) {
+                    // we could try to send to proxy, but then we must create another event (we released it here),
+                    // and to create another event we must always retain here a version of query (which we move).
+                    // normally this shouldn't happen, so it's OK to return error
+                    NYql::TIssues issues;
+                    issues.AddIssue(MakeIssue(
+                        NKikimrIssues::TIssuesIds::DEFAULT_ERROR,
+                        "Internal error: shortpath rpc-session"));
+                    ReplyFinishStream(Ydb::StatusIds::INTERNAL_ERROR, std::move(issues));
+                    return;
+                }
                 LOG_TRACE_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " sent query directly to session "
                     << req->session_id());
+                return;
             }
         }
 
-        if (!sent) {
-            sent = ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), ev.Release(), 0, 0, Span_.GetTraceId());
-            LOG_TRACE_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " sent query to proxy ");
-        }
-
-        if (!sent) {
+        if (!ctx.Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), ev.Release(), 0, 0, Span_.GetTraceId())) {
             NYql::TIssues issues;
             issues.AddIssue(MakeIssue(NKikimrIssues::TIssuesIds::DEFAULT_ERROR, "Internal error"));
             ReplyFinishStream(Ydb::StatusIds::INTERNAL_ERROR, std::move(issues));
+            return;
         }
+
+        LOG_TRACE_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " sent query to proxy ");
     }
 
     void Handle(NKikimr::NGRpcService::TEvSubscribeGrpcCancel::TPtr& ev) {
