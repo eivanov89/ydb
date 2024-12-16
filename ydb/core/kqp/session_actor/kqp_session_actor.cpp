@@ -416,7 +416,7 @@ public:
         if (cancelAfter) {
             timerDuration = Min(timerDuration, cancelAfter);
         }
-        LOG_D("Ctx: " << *ev->Get()->GetUserRequestContext() << ". TEvQueryRequest " << QueryId
+        LOG_D("Ctx: " << *QueryState->UserRequestContext << ". TEvQueryRequest " << QueryId
             << ", set timer for: " << timerDuration
             << " timeout: " << timeout << " cancelAfter: " << cancelAfter);
         auto status = timerDuration == cancelAfter ?
