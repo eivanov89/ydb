@@ -128,7 +128,10 @@ bool TStagePredictor::DeserializeFromKqpSettings(const NYql::NDqProto::TProgram:
 ui32 TStagePredictor::GetUsableThreads() {
     std::optional<ui32> userPoolSize;
     if (TlsActivationContext && TlsActivationContext->ActorSystem()) {
-        userPoolSize = TlsActivationContext->ActorSystem()->GetPoolThreadsCount(AppData()->UserPoolId);
+        NActors::TExecutorPoolStats poolStats;
+        TVector<NActors::TExecutorThreadStats> threadsStats;
+        TlsActivationContext->ActorSystem()->GetPoolStats(AppData()->UserPoolId, poolStats, threadsStats);
+        userPoolSize = Max<ui64>(poolStats.MaxThreadCount, 1);
     }
     if (!userPoolSize) {
         ALS_INFO(NKikimrServices::KQP_EXECUTER) << "user pool is undefined for executer tasks construction";
