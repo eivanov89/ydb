@@ -601,7 +601,7 @@ protected:
             ComputeActorSpan.End();
         }
 
-        this->Send(ExecuterId, execEv.Release());
+        this->template Send<NActors::ESendingType::Tail>(ExecuterId, execEv.Release());
 
         if (!forceTerminate && Checkpoints && State == NDqProto::COMPUTE_STATE_FINISHED) {
             // checkpointed CAs must not self-destroy

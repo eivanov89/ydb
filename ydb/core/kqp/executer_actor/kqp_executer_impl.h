@@ -535,7 +535,7 @@ protected:
 
         auto kqpTableResolver = CreateKqpTableResolver(this->SelfId(), TxId, UserToken, Request.Transactions,
             TasksGraph);
-        KqpTableResolverId = this->RegisterWithSameMailbox(kqpTableResolver);
+        KqpTableResolverId = this->RegisterWithSameMailboxTail(kqpTableResolver);
 
         LOG_T("Got request, become WaitResolveState");
         this->Become(&TDerived::WaitResolveState);
@@ -791,7 +791,9 @@ protected:
             }
 
             LOG_T("Sending channels info to compute actor: " << computeActorId << ", channels: " << channelIds.size());
-            bool sent = this->Send(computeActorId, channelsInfoEv.Release());
+
+            // in case of multiple actors, let's hope one will be tailed
+            bool sent = this->template Send<ESendingType::Tail>(computeActorId, channelsInfoEv.Release());
             YQL_ENSURE(sent, "Failed to send event to " << computeActorId.ToString());
         }
     }
@@ -1911,7 +1913,7 @@ protected:
         }
 
         Request.Transactions.crop(0);
-        this->Send(Target, ResponseEv.release());
+        this->template Send<NActors::ESendingType::Tail>(Target, ResponseEv.release());
 
         for (auto channelPair: ResultChannelProxies) {
             LOG_D("terminate result channel " << channelPair.first << " proxy at " << channelPair.second->SelfId());

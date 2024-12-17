@@ -145,6 +145,10 @@ namespace NActors {
         return TlsActivationContext->ExecutorThread.RegisterActor(actor, &TlsActivationContext->Mailbox, SelfActorId.Hint(), SelfActorId);
     }
 
+    TActorId IActor::RegisterWithSameMailboxTail(IActor* actor) const noexcept {
+        return TlsActivationContext->ExecutorThread.RegisterActor<ESendingType::Tail>(actor, &TlsActivationContext->Mailbox, SelfActorId.Hint(), SelfActorId);
+    }
+
     TActorId TActivationContext::InterconnectProxy(ui32 destinationNodeId) {
         return TlsActivationContext->ExecutorThread.ActorSystem->InterconnectProxy(destinationNodeId);
     }

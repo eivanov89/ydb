@@ -2152,7 +2152,7 @@ private:
             ExecuterStateSpan = NWilson::TSpan(TWilsonKqp::ExecuterShardsResolve, ExecuterSpan.GetTraceId(), "WaitForShardsResolve", NWilson::EFlags::AUTO_END);
             auto kqpShardsResolver = CreateKqpShardsResolver(
                 SelfId(), TxId, TasksGraph.GetMeta().UseFollowers, std::move(shardIds));
-            RegisterWithSameMailbox(kqpShardsResolver);
+            RegisterWithSameMailboxTail(kqpShardsResolver);
             Become(&TKqpDataExecuter::WaitResolveState);
         } else {
             OnShardsResolve();
@@ -2206,7 +2206,7 @@ private:
                 ExecuterStateSpan = NWilson::TSpan(TWilsonKqp::ExecuterShardsResolve, ExecuterSpan.GetTraceId(), "WaitForShardsResolve", NWilson::EFlags::AUTO_END);
                 auto kqpShardsResolver = CreateKqpShardsResolver(
                     this->SelfId(), TxId, false, std::move(shardIds));
-                KqpShardsResolverId = this->RegisterWithSameMailbox(kqpShardsResolver);
+                KqpShardsResolverId = this->RegisterWithSameMailboxTail(kqpShardsResolver);
                 return;
             } else if (HasOlapTable) {
                 ResourceSnapshotRequired = true;

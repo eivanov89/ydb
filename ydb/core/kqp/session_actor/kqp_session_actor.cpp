@@ -1507,7 +1507,12 @@ public:
             QueryState ? QueryState->StatementResultIndex : 0, FederatedQuerySetup, GUCSettings,
             txCtx->ShardIdToTableInfo, txCtx->TxManager, txCtx->BufferActorId);
 
-        auto exId = RegisterWithSameMailbox(executerActor);
+        TActorId exId;
+        if (maybeTxId) {
+            exId = RegisterWithSameMailboxTail(executerActor);
+        } else {
+            exId = RegisterWithSameMailbox(executerActor);
+        }
         LOG_D("Created new KQP executer: " << exId << " isRollback: " << isRollback);
 
         if (!maybeTxId) {

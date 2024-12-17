@@ -291,7 +291,7 @@ private:
         auto replyEv = std::make_unique<TEvKqpExecuter::TEvTableResolveStatus>();
         replyEv->CpuTime = CpuTime;
 
-        Send(Owner, replyEv.release());
+        Send<ESendingType::Tail>(Owner, replyEv.release());
         PassAway();
     }
 

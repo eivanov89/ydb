@@ -103,7 +103,7 @@ private:
     void ReplyAndDie() {
         auto replyEv = std::make_unique<NShardResolver::TEvShardsResolveStatus>();
         replyEv->ShardNodes = std::move(Result);
-        Send(Owner, replyEv.release());
+        Send<ESendingType::Tail>(Owner, replyEv.release());
         PassAway();
     }
 

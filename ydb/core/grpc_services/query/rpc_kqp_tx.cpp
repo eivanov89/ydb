@@ -5,8 +5,9 @@
 #include <ydb/core/grpc_services/rpc_common/rpc_common.h>
 #include <ydb/core/grpc_services/audit_dml_operations.h>
 
-#include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
 #include <ydb/core/kqp/common/events/events.h>
+#include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
+#include <ydb/core/kqp/common/kqp_session_router.h>
 #include <ydb/core/kqp/common/simple/services.h>
 
 #include <ydb/public/api/protos/ydb_query.pb.h>
@@ -44,8 +45,8 @@ public:
     TBeginTransactionRPC(IRequestNoOpCtx* msg)
         : Request(msg) {}
 
-    void Bootstrap(const TActorContext&) {
-        BeginTransactionImpl();
+    void Bootstrap(const TActorContext& ctx) {
+        BeginTransactionImpl(ctx);
         Become(&TBeginTransactionRPC::StateWork);
     }
 
@@ -62,7 +63,7 @@ private:
         }
     }
 
-    void BeginTransactionImpl() {
+    void BeginTransactionImpl(const TActorContext& ctx) {
         const auto req = TEvBeginTransactionRequest::GetProtoRequest(Request);
         const auto traceId = Request->GetTraceId();
 
@@ -109,10 +110,18 @@ private:
                 break;
         }
 
-        LWTRACK(KqpRpcCommitActor, ev->Orbit);
-
         ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_BEGIN_TX);
-        Send(NKqp::MakeKqpProxyID(SelfId().NodeId()), ev.Release());
+
+        TActorId sessionActorId = NKqp::GetGlobalSessionRouter().GetSessionActor(
+            req->session_id(),
+            ctx.Monotonic() + TDuration::Seconds(600));
+        if (sessionActorId) {
+            // TODO: get deadline from config
+            Send<ESendingType::Tail>(sessionActorId, ev.Release());
+            return;
+        }
+
+        Send<ESendingType::Tail>(NKqp::MakeKqpProxyID(SelfId().NodeId()), ev.Release());
     }
 
     void Handle(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev) {
@@ -171,8 +180,8 @@ public:
         : Request(msg)
     {}
 
-    void Bootstrap(const TActorContext&) {
-        FinishTransactionImpl();
+    void Bootstrap(const TActorContext& ctx) {
+        FinishTransactionImpl(ctx);
         Become(&TFinishTransactionRPC::StateWork);
     }
 
@@ -193,7 +202,7 @@ private:
         }
     }
 
-    void FinishTransactionImpl() {
+    void FinishTransactionImpl(const TActorContext& ctx) {
         const auto traceId = Request->GetTraceId();
 
         auto ev = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
@@ -219,11 +228,21 @@ private:
             return Reply(Ydb::StatusIds::BAD_REQUEST);
         }
 
-        ev->Record.MutableRequest()->MutableTxControl()->set_tx_id(txId);
+        LWTRACK(KqpRpcCommitActor, ev->Orbit);
 
+        ev->Record.MutableRequest()->MutableTxControl()->set_tx_id(txId);
         Fill(ev->Record.MutableRequest());
 
-        Send(NKqp::MakeKqpProxyID(SelfId().NodeId()), ev.Release());
+        TActorId sessionActorId = NKqp::GetGlobalSessionRouter().GetSessionActor(
+            sessionId,
+            ctx.Monotonic() + TDuration::Seconds(600));
+        if (sessionActorId) {
+            // TODO: get deadline from config
+            Send<ESendingType::Tail>(sessionActorId, ev.Release());
+            return;
+        }
+
+        Send<ESendingType::Tail>(NKqp::MakeKqpProxyID(SelfId().NodeId()), ev.Release());
     }
 
     void Handle(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev) {
@@ -319,15 +338,15 @@ private:
 namespace NQuery {
 
 void DoBeginTransaction(std::unique_ptr<IRequestNoOpCtx> ctx, const IFacilityProvider& provider) {
-    provider.RegisterActor(new TBeginTransactionRPC(ctx.release()));
+    provider.RegisterActorTail(new TBeginTransactionRPC(ctx.release()));
 }
 
 void DoCommitTransaction(std::unique_ptr<IRequestNoOpCtx> ctx, const IFacilityProvider& provider) {
-    provider.RegisterActor(new TCommitTransactionRPC(ctx.release()));
+    provider.RegisterActorTail(new TCommitTransactionRPC(ctx.release()));
 }
 
 void DoRollbackTransaction(std::unique_ptr<IRequestNoOpCtx> ctx, const IFacilityProvider& provider) {
-    provider.RegisterActor(new TRollbackTransactionRPC(ctx.release()));
+    provider.RegisterActorTail(new TRollbackTransactionRPC(ctx.release()));
 }
 
 }

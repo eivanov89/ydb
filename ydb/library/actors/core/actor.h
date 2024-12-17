@@ -599,6 +599,8 @@ namespace NActors {
         // some memory.
         TActorId RegisterWithSameMailbox(IActor* actor) const noexcept final;
 
+        TActorId RegisterWithSameMailboxTail(IActor* actor) const noexcept;
+
         std::pair<ui32, ui32> CountMailboxEvents(ui32 maxTraverse = Max<ui32>()) const;
 
     private:
