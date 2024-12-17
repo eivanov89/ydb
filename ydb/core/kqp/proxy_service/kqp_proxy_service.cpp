@@ -214,7 +214,9 @@ public:
         , KqpProxySharedResources(std::move(kqpProxySharedResources))
         , S3ActorsFactory(std::move(s3ActorsFactory))
         , QueryCache(new TKqpQueryCache(TableServiceConfig.GetCompileQueryCacheSize(), TDuration::Seconds(TableServiceConfig.GetCompileQueryCacheTTLSec())))
-    {}
+    {
+        SharedMvccSnapshotPtr = MakeIntrusive<TSharedMvccSnapshot>();
+    }
 
     void Bootstrap(const TActorContext &ctx) {
         NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(KQP_PROVIDER));
@@ -1519,7 +1521,9 @@ private:
 
         auto config = CreateConfig(KqpSettings, workerSettings);
 
-        IActor* sessionActor = CreateKqpSessionActor(SelfId(), QueryCache, SharedMultitimer, ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
+        IActor* sessionActor = CreateKqpSessionActor(
+            SelfId(), QueryCache, SharedMultitimer, SharedMvccSnapshotPtr,
+            ResourceManager_, CaFactory_, sessionId, KqpSettings, workerSettings,
             FederatedQuerySetup, AsyncIoFactory, ModuleResolverState, Counters,
             TableServiceConfig, QueryServiceConfig, KqpTempTablesAgentActor);
         auto workerId = TlsActivationContext->ExecutorThread.RegisterActor(sessionActor, TMailboxType::HTSwap, AppData()->UserPoolId);
@@ -1964,6 +1968,8 @@ private:
 
     TResourcePoolsCache ResourcePoolsCache;
     TDatabasesCache DatabasesCache;
+
+    TSharedMvccSnapshotPtr SharedMvccSnapshotPtr;
 };
 
 } // namespace

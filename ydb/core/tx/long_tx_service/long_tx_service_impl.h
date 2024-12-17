@@ -353,6 +353,12 @@ namespace NLongTxService {
         const TString& GetDatabaseNameOrLegacyDefault(const TString& databaseName);
 
     private:
+        struct TSnapshotWithTs {
+            TRowVersion Snapshot;
+            TMonotonic Ts;
+        };
+
+
         const TLongTxServiceSettings Settings;
         TString LogPrefix;
         TSessionSubscribeActor* SessionSubscribeActor = nullptr;
@@ -360,6 +366,7 @@ namespace NLongTxService {
         TULIDGenerator IdGenerator;
         THashMap<ui32, TProxyNodeState> ProxyNodes;
         THashMap<TString, TDatabaseSnapshotState> DatabaseSnapshots;
+        THashMap<TString, TSnapshotWithTs> LastDatabaseSnapshots;
         THashMap<ui64, TAcquireSnapshotState> AcquireSnapshotInFlight;
         TString DefaultDatabaseName;
         THashMap<ui64, TLockState> Locks;

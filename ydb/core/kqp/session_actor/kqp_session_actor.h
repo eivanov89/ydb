@@ -60,9 +60,42 @@ struct TKqpWorkerSettings {
 class TKqpQueryCache;
 class IMultiTimerMtSafe;
 
+class TSharedMvccSnapshot: public TThrRefBase {
+public:
+    TSharedMvccSnapshot() = default;
+
+    std::pair<IKqpGateway::TKqpSnapshot, TMonotonic> Get(TMonotonic now) const {
+        TGuard<TAdaptiveLock> guard(Lock);
+        auto delta = now - Ts;
+        if (!SnapshotRequested && delta >= TDuration::MilliSeconds(1)) {
+            // hack to force only one session to request fresh mvcc snapshot
+            SnapshotRequested = true;
+            return {};
+        } else {
+            return {LastSnapshot, Ts};
+        }
+    }
+
+    void Set(const IKqpGateway::TKqpSnapshot& snapshot, TMonotonic ts) {
+        TGuard<TAdaptiveLock> guard(Lock);
+        LastSnapshot = snapshot;
+        Ts = ts;
+        SnapshotRequested = false;
+    }
+
+private:
+    mutable TAdaptiveLock Lock;
+    IKqpGateway::TKqpSnapshot LastSnapshot;
+    TMonotonic Ts;
+    mutable bool SnapshotRequested = false;
+};
+
+using TSharedMvccSnapshotPtr = TIntrusivePtr<TSharedMvccSnapshot>;
+
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TIntrusivePtr<TKqpQueryCache> queryCache,
     TIntrusivePtr<IMultiTimerMtSafe> multiTimer,
+    TSharedMvccSnapshotPtr sharedMvccSnapshot,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager_,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory_,
     const TString& sessionId,

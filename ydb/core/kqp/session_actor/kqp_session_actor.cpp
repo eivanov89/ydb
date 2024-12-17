@@ -170,6 +170,7 @@ public:
    TKqpSessionActor(const TActorId& owner,
             TKqpQueryCachePtr queryCache,
             TMultiTimerMtSafePtr multitimer,
+            TSharedMvccSnapshotPtr sharedMvccSnapshot,
             std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
             std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory,
             const TString& sessionId, const TKqpSettings::TConstPtr& kqpSettings,
@@ -183,6 +184,7 @@ public:
         : Owner(owner)
         , QueryCache(std::move(queryCache))
         , SharedMultitimer(std::move(multitimer))
+        , SharedMvccSnapshot(std::move(sharedMvccSnapshot))
         , SessionId(sessionId)
         , ResourceManager_(std::move(resourceManager))
         , CaFactory_(std::move(caFactory))
@@ -835,16 +837,30 @@ public:
     }
 
     void AcquireMvccSnapshot() {
+        auto now = AppData()->MonotonicTimeProvider->Now();
+        auto [lastSnapshot, lastSnapshotTs] = SharedMvccSnapshot->Get(now);
+        if (lastSnapshot.IsValid() && lastSnapshotTs) {
+            auto delta = now - lastSnapshotTs;
+            if (delta <= TDuration::MilliSeconds(5)) {
+                LOG_T("read snapshot result from cache: " << ", step: " << lastSnapshot.Step
+                    << ", tx id: " << lastSnapshot.TxId);
+                HandleSnapshotResponse(lastSnapshot, true);
+                return;
+            }
+        }
+
         AcquireSnapshotSpan = NWilson::TSpan(TWilsonKqp::SessionAcquireSnapshot, QueryState->KqpSessionSpan.GetTraceId(),
             "SessionActor.AcquireMvccSnapshot");
         LOG_D("acquire mvcc snapshot");
         auto timeout = QueryState->QueryDeadlines.TimeoutAt - TAppData::TimeProvider->Now();
 
         auto* snapMgr = CreateKqpSnapshotManager(Settings.Database, timeout);
+
+        // TODO: tail register
         auto snapMgrActorId = RegisterWithSameMailbox(snapMgr);
 
         auto ev = std::make_unique<TEvKqpSnapshot::TEvCreateSnapshotRequest>(QueryId, std::move(QueryState->Orbit));
-        Send(snapMgrActorId, ev.release());
+        Send<ESendingType::Tail>(snapMgrActorId, ev.release());
     }
 
     Ydb::StatusIds::StatusCode StatusForSnapshotError(NKikimrIssues::TStatusIds::EStatusCode status) {
@@ -883,7 +899,16 @@ public:
             return;
         }
         AcquireSnapshotSpan.EndOk();
-        QueryState->TxCtx->SnapshotHandle.Snapshot = response->Snapshot;
+
+        HandleSnapshotResponse(response->Snapshot, false);
+    }
+
+    void HandleSnapshotResponse(const IKqpGateway::TKqpSnapshot& snapshot, bool fromCache) {
+        QueryState->TxCtx->SnapshotHandle.Snapshot = snapshot;
+
+        if (!fromCache) {
+            SharedMvccSnapshot->Set(snapshot, AppData()->MonotonicTimeProvider->Now());
+        }
 
         // Can reply inside (in case of deferred-only transactions) and become ReadyState
         ExecuteOrDefer();
@@ -2190,6 +2215,8 @@ public:
             TlsActivationContext->AsActorContext()
         );
 
+        QueryResponse->Orbit = std::move(QueryState->Orbit);
+
         Send<ESendingType::Tail>(QueryState->Sender, QueryResponse.release(), 0, QueryState->ProxyRequestId);
         LOG_D("Sent query response back to proxy, proxyRequestId: " << QueryState->ProxyRequestId
             << ", proxyId: " << QueryState->Sender.ToString());
@@ -2814,6 +2841,7 @@ private:
     TActorId Owner;
     TKqpQueryCachePtr QueryCache;
     TMultiTimerMtSafePtr SharedMultitimer;
+    TSharedMvccSnapshotPtr SharedMvccSnapshot;
     TString SessionId;
 
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> ResourceManager_;
@@ -2858,6 +2886,7 @@ private:
 IActor* CreateKqpSessionActor(const TActorId& owner,
     TKqpQueryCachePtr queryCache,
     TMultiTimerMtSafePtr multitimer,
+    TSharedMvccSnapshotPtr sharedMvccSnapshot,
     std::shared_ptr<NKikimr::NKqp::NRm::IKqpResourceManager> resourceManager,
     std::shared_ptr<NKikimr::NKqp::NComputeActor::IKqpNodeComputeActorFactory> caFactory, const TString& sessionId,
     const TKqpSettings::TConstPtr& kqpSettings, const TKqpWorkerSettings& workerSettings,
@@ -2870,6 +2899,7 @@ IActor* CreateKqpSessionActor(const TActorId& owner,
 {
     return new TKqpSessionActor(
         owner, std::move(queryCache), std::move(multitimer),
+        std::move(sharedMvccSnapshot),
         std::move(resourceManager), std::move(caFactory), sessionId, kqpSettings, workerSettings, federatedQuerySetup,
                                 std::move(asyncIoFactory),  std::move(moduleResolverState), counters,
                                 tableServiceConfig, queryServiceConfig, kqpTempTablesAgentActor);
