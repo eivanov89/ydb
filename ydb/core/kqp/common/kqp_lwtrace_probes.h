@@ -26,6 +26,12 @@ struct TQueryAction {
     PROBE(KqpRpcActor, GROUPS("KQP"), \
         TYPES(), \
         NAMES()) \
+    PROBE(KqpRpcCommitActor, GROUPS("KQP"), \
+        TYPES(), \
+        NAMES()) \
+    PROBE(KqpRpcActorEnd, GROUPS("KQP"), \
+        TYPES(), \
+        NAMES()) \
     PROBE(KqpProxy, GROUPS("KQP"), \
         TYPES(), \
         NAMES()) \

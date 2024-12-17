@@ -392,6 +392,10 @@ private:
     }
 
     void Handle(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev, const TActorContext& ctx) {
+        if (ev->Get()->Orbit) {
+            LWTRACK(KqpRpcActorEnd, *ev->Get()->Orbit);
+        }
+
         NDataIntegrity::LogIntegrityTrails(Request_->GetTraceId(), *Request_->GetProtoRequest(), ev, ctx);
 
         auto& record = ev->Get()->Record;

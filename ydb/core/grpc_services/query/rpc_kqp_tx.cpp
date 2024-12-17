@@ -5,10 +5,13 @@
 #include <ydb/core/grpc_services/rpc_common/rpc_common.h>
 #include <ydb/core/grpc_services/audit_dml_operations.h>
 
+#include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
 #include <ydb/core/kqp/common/events/events.h>
 #include <ydb/core/kqp/common/simple/services.h>
 
 #include <ydb/public/api/protos/ydb_query.pb.h>
+
+LWTRACE_USING(KQP_PROVIDER);
 
 namespace NKikimr::NGRpcService {
 
@@ -106,11 +109,17 @@ private:
                 break;
         }
 
+        LWTRACK(KqpRpcCommitActor, ev->Orbit);
+
         ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_BEGIN_TX);
         Send(NKqp::MakeKqpProxyID(SelfId().NodeId()), ev.Release());
     }
 
     void Handle(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev) {
+        if (ev->Get()->Orbit) {
+            LWTRACK(KqpRpcActorEnd, *ev->Get()->Orbit);
+        }
+
         const auto& record = ev->Get()->Record;
         FillCommonKqpRespFields(record, Request.get());
 
