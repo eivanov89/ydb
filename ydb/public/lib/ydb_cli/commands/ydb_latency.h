@@ -22,6 +22,7 @@ public:
 
 public:
     TCommandLatency();
+    ~TCommandLatency();
 
     virtual void Config(TConfig& config) override;
     virtual void Parse(TConfig& config) override;
@@ -33,6 +34,8 @@ private:
     EFormat Format;
     TCommandPing::EPingKind RunKind;
     double Percentile;
+
+    NDebug::TActorChainPingSettings* ChainConfig;
 };
 
 } // NYdb::NConsoleClient

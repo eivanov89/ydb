@@ -14,6 +14,7 @@ namespace NQuery {
 
 namespace NDebug {
     class TDebugClient;
+    struct TActorChainPingSettings;
 };
 
 namespace NConsoleClient {
@@ -29,6 +30,7 @@ public:
         Select1,
         SchemeCache,
         TxProxy,
+        ActorChain,
         AllKinds,
     };
 
@@ -43,6 +45,7 @@ public:
     static bool PingGrpcProxy(NDebug::TDebugClient& client);
     static bool PingSchemeCache(NDebug::TDebugClient& client);
     static bool PingTxProxy(NDebug::TDebugClient& client);
+    static bool PingActorChain(NDebug::TDebugClient& client, const NDebug::TActorChainPingSettings& settings);
 
     static bool PingKqpSelect1(NQuery::TQueryClient& client, const TString& query);
     static bool PingKqpSelect1(NQuery::TSession& session, const TString& query);
