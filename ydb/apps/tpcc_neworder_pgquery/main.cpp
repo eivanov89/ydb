@@ -8,10 +8,12 @@
 
 #include <util/string/printf.h>
 
-#include <iostream>
-#include <iomanip>
 #include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <regex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace NLastGetopt;
@@ -919,9 +921,76 @@ void Run(const TDriver& driver, const TString& path, int warehouses, int count, 
     std::cout << std::left << std::setw(70) << std::setfill('-') << "" << std::setfill(' ') << std::endl;
 }
 
+// gpt generated
+std::pair<std::string, std::unordered_map<std::string, int>> transformSQL(const std::string& sql) {
+    // Regular expressions to match DECLARE statements and variable placeholders
+    std::regex declareRegex(R"(DECLARE\s+\$(\w+)\s+AS\s+\w+;)", std::regex::icase);
+    std::regex placeholderRegex(R"(\$(\w+))");
+
+    // Map to store variable-to-positional mapping
+    std::unordered_map<std::string, int> variableMap;
+
+    // Remove DECLARE statements and collect variable names
+    std::string transformedSQL = sql;
+    std::smatch match;
+    int paramIndex = 1;
+
+    // Iterate through DECLARE statements and remove them
+    while (std::regex_search(transformedSQL, match, declareRegex)) {
+        std::string variableName = match[1]; // Capture the variable name
+        variableMap[variableName] = paramIndex++; // Assign positional index
+        // Remove the DECLARE statement from the SQL string
+        transformedSQL = transformedSQL.substr(0, match.position()) + transformedSQL.substr(match.position() + match.length());
+    }
+
+    // Replace variable placeholders with positional parameters
+    std::string resultSQL;
+    auto placeholderBegin = std::sregex_iterator(transformedSQL.begin(), transformedSQL.end(), placeholderRegex);
+    auto placeholderEnd = std::sregex_iterator();
+
+    size_t currentPos = 0;
+    for (auto it = placeholderBegin; it != placeholderEnd; ++it) {
+        std::smatch placeholderMatch = *it;
+        std::string variableName = placeholderMatch[1];
+
+        // Check if this variable was declared (exists in the map)
+        auto mapEntry = variableMap.find(variableName);
+        if (mapEntry != variableMap.end()) {
+            resultSQL.append(transformedSQL, currentPos, placeholderMatch.position() - currentPos);
+            resultSQL += "$" + std::to_string(mapEntry->second); // Replace with positional parameter
+            currentPos = placeholderMatch.position() + placeholderMatch.length();
+        }
+    }
+
+    // Append the rest of the string
+    resultSQL.append(transformedSQL, currentPos, std::string::npos);
+
+    return {resultSQL, variableMap};
+}
+
 int main(int argc, char** argv) {
+    TString query = Sprintf(R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id AS Int32;
+        DECLARE $c_d_id AS Int32;
+        DECLARE $c_id AS Int32;
+
+        SELECT C_DISCOUNT, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $1
+           AND C_D_ID = $2
+           AND C_ID = $3
+    )");
+
+    auto [pQuery, tmap] = transformSQL(query);
+    Cout << pQuery << Endl;
+    for (const auto& [key, value]: tmap) {
+        Cout << key << ": " << value << Endl;
+    }
+
     PgQueryParseResult result;
-    result = pg_query_parse("SELECT 1");
+    result = pg_query_parse(pQuery.c_str());
 
     printf("%s\n", result.parse_tree);
     pg_query_free_parse_result(result);
