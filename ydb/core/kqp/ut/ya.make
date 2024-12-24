@@ -4,6 +4,7 @@ RECURSE_FOR_TESTS(
     data
     data_integrity
     effects
+    fast_query
     federated_query
     indexes
     idx_test
