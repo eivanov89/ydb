@@ -15,6 +15,7 @@
 #include <ydb/core/kqp/common/kqp_user_request_context.h>
 #include <ydb/core/kqp/common/kqp.h>
 #include <ydb/core/kqp/common/simple/temp_tables.h>
+#include <ydb/core/kqp/compile_service/kqp_fast_query.h>
 
 #include <ydb/library/actors/core/monotonic_provider.h>
 
@@ -133,6 +134,7 @@ public:
     TIntrusiveConstPtr<NACLib::TUserToken> UserToken;
     TString ClientAddress;
     NActors::TMonotonic StartedAt;
+    TFastQueryPtr FastQuery;
     bool CompilationRunning = false;
 
     THashMap<NKikimr::TTableId, ui64> TableVersions;

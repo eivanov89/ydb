@@ -2,7 +2,7 @@
 
 #include <library/cpp/json/json_reader.h>
 
-#include <contrib/libs/libpg_query/pg_query.h>
+#include <yql/essentials/parser/pg_wrapper/interface/raw_parser.h>
 
 #include <util/generic/hash.h>
 #include <util/string/printf.h>
@@ -16,7 +16,156 @@ namespace {
 const std::regex PragmaRegex(R"([ \t]*PRAGMA\s+TablePathPrefix\(\"([^\"]+)\"\);[ \t]*(\r?\n)?)", std::regex::icase);
 const std::regex DeclareRegex(R"([ \t]*DECLARE\s+\$(\w+)\s+AS\s+(\w+);[ \t]*(\r?\n)?)", std::regex::icase);
 const std::regex PlaceholderRegex(R"(\$(\w+))");
+const std::regex LimitRegex(R"(\bLIMIT\b)", std::regex::icase);
 
+void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
+    NJson::TJsonValue jsonValue;
+    try {
+        TString pgJson = NYql::PrintPGTreeJson(raw);
+        NJson::ReadJsonTree(pgJson, &jsonValue, true);
+        const auto& statements = jsonValue["stmts"].GetArray();
+        if (statements.size() != 1) {
+            return;
+        }
+        const auto& statement = statements[0]["stmt"];
+        if (!statement.Has("SelectStmt")) {
+            return;
+        }
+
+        const auto& selectStatement = statement["SelectStmt"];
+        if (!selectStatement.Has("whereClause") ||
+                !selectStatement.Has("fromClause") || !selectStatement.Has("targetList")) {
+            return;
+        }
+
+        if (selectStatement["op"] != "SETOP_NONE") {
+            return;
+        }
+
+        if (selectStatement.Has("sortClause")) {
+            return;
+        }
+
+        /* we handle it separately, becayse parser seems to be buggy
+        if (selectStatement["limitOption"] != "LIMIT_OPTION_DEFAULT") {
+            return;
+        }
+        */
+
+        // handle WHERE
+
+        const auto& whereEpr = selectStatement["whereClause"]["BoolExpr"];
+        if (!whereEpr.IsDefined()) {
+            return;
+        }
+        if (whereEpr["boolop"] != "AND_EXPR") {
+            return;
+        }
+
+        for (const auto& arg: whereEpr["args"].GetArray()) {
+            if (arg["A_Expr"]["name"][0]["String"]["sval"] != "=") {
+                return;
+            }
+            TString colName = arg["A_Expr"]["lexpr"]["ColumnRef"]["fields"][0]["String"]["sval"].GetString();
+            int colParamNum = arg["A_Expr"]["rexpr"]["ParamRef"]["number"].GetInteger();
+            if (colParamNum == 0 || colName.empty()) {
+                return;
+            }
+            result->WhereColumnsToPos.emplace(std::move(colName), colParamNum);
+        }
+
+        // handle FROM
+
+        const auto& fromClause = selectStatement["fromClause"];
+        if (!fromClause.IsDefined()) {
+            return;
+        }
+
+        const auto& fromArray = fromClause.GetArray();
+        if (fromArray.size() != 1) {
+            return;
+        }
+
+        TString tableName = fromArray[0]["RangeVar"]["relname"].GetString();
+        if (tableName.empty()) {
+            return;
+        }
+        result->TableName = tableName;
+
+        // SELECT <WHAT>
+
+        const auto& targets = selectStatement["targetList"].GetArray();
+        if (targets.empty()) {
+            return;
+        }
+
+        for (const auto& target: targets) {
+            const auto& fieldsArray = target["ResTarget"]["val"]["ColumnRef"]["fields"].GetArray();
+            if (fieldsArray.size() != 1) {
+                return;
+            }
+
+            TString column = fieldsArray[0]["String"]["sval"].GetString();
+            if (column.empty()) {
+                return;
+            }
+            result->ColumnsToSelect.emplace_back(std::move(column));
+        }
+
+        if (result->WhereColumnsToPos.empty() || result->ColumnsToSelect.empty()) {
+            return;
+        }
+
+        result->ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
+        return;
+    } catch (...) {
+        //pg_query_free_parse_result(parseResult);
+        return;
+    }
+    //pg_query_free_parse_result(parseResult);
+
+    return;
+}
+
+class TEvents : public NYql::IPGParseEvents {
+public:
+    TEvents(TFastQueryPtr& fastQuery)
+        : FastQuery(fastQuery)
+    {
+    }
+
+    void OnResult(const List* raw) override {
+        ProcessPostgresTree(raw, FastQuery);
+    }
+
+    void OnError(const NYql::TIssue& issue) override {
+        Issue = issue;
+    }
+
+    TMaybe<NYql::TIssue> Issue;
+
+    TFastQueryPtr& FastQuery;
+};
+
+} // anonymous
+
+TString TFastQuery::ToString() const {
+    TStringStream ss;
+    ss << "FastQuery of type " << ExecutionType << " with postgres query '"
+       << PostgresQuery.Query << ", and " << PostgresQuery.PositionalNames.size()
+       << " params, in DB " << Database << " with id " << DatabaseId;
+    return ss.Str();
+}
+
+TFastQueryPtr TFastQueryHelper::HandleYQL(const TString& yqlQuery) {
+    if (auto it = Queries.find(yqlQuery); it != Queries.end()) {
+        return it->second;
+    }
+
+    auto queryPtr = CompileToFastQuery(yqlQuery);
+    Queries.emplace(yqlQuery, queryPtr);
+
+    return queryPtr;
 }
 
 // very quick and very dirty
@@ -69,121 +218,24 @@ TPostgresQuery YQL2Postgres(const TString& yqlQuery) {
     return result;
 }
 
-TFastQuery CompileToFastQuery(const TString& yqlQuery) {
-    TFastQuery result;
+TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
+    TFastQueryPtr result = std::make_shared<TFastQuery>();
 
-    result.OriginalQueryHash = THash<TString>()(yqlQuery);
+    result->OriginalQueryHash = THash<TString>()(yqlQuery);
 
-    result.PostgresQuery = YQL2Postgres(yqlQuery);
-    if (result.PostgresQuery.Query.empty()) {
+    // for some dumb reason our parser returns "limitOption": "LIMIT_OPTION_COUNT", when there is
+    // no limit. So we have to check it here manually
+    if (std::regex_search(yqlQuery.c_str(), LimitRegex)) {
         return result;
     }
 
-    PgQueryParseResult parseResult;
-    parseResult = pg_query_parse(result.PostgresQuery.Query.c_str());
-    NJson::TJsonValue jsonValue;
-    try {
-        NJson::ReadJsonTree(parseResult.parse_tree, &jsonValue, true);
-        const auto& statements = jsonValue["stmts"].GetArray();
-        if (statements.size() != 1) {
-            return result;
-        }
-        const auto& statement = statements[0]["stmt"];
-        if (!statement.Has("SelectStmt")) {
-            return result;
-        }
-
-        const auto& selectStatement = statement["SelectStmt"];
-        if (!selectStatement.Has("whereClause") ||
-                !selectStatement.Has("fromClause") || !selectStatement.Has("targetList")) {
-            return result;
-        }
-
-        if (selectStatement["op"] != "SETOP_NONE") {
-            return result;
-        }
-
-        if (selectStatement.Has("sortClause")) {
-            return result;
-        }
-
-        if (selectStatement["limitOption"] != "LIMIT_OPTION_DEFAULT") {
-            return result;
-        }
-
-        // handle WHERE
-
-        const auto& whereEpr = selectStatement["whereClause"]["BoolExpr"];
-        if (!whereEpr.IsDefined()) {
-            return result;
-        }
-        if (whereEpr["boolop"] != "AND_EXPR") {
-            return result;
-        }
-
-        for (const auto& arg: whereEpr["args"].GetArray()) {
-            if (arg["A_Expr"]["name"][0]["String"]["sval"] != "=") {
-                return result;
-            }
-            TString colName = arg["A_Expr"]["lexpr"]["ColumnRef"]["fields"][0]["String"]["sval"].GetString();
-            int colParamNum = arg["A_Expr"]["rexpr"]["ParamRef"]["number"].GetInteger();
-            if (colParamNum == 0 || colName.empty()) {
-                return result;
-            }
-            result.WhereColumnsWithPos.emplace_back(std::move(colName), colParamNum);
-        }
-
-        // handle FROM
-
-        const auto& fromClause = selectStatement["fromClause"];
-        if (!fromClause.IsDefined()) {
-            return result;
-        }
-
-        const auto& fromArray = fromClause.GetArray();
-        if (fromArray.size() != 1) {
-            return result;
-        }
-
-        TString tableName = fromArray[0]["RangeVar"]["relname"].GetString();
-        if (tableName.empty()) {
-            return result;
-        }
-        result.TableName = tableName;
-
-        // SELECT <WHAT>
-
-        const auto& targets = selectStatement["targetList"].GetArray();
-        if (targets.empty()) {
-            return result;
-        }
-
-        for (const auto& target: targets) {
-            const auto& fieldsArray = target["ResTarget"]["val"]["ColumnRef"]["fields"].GetArray();
-            if (fieldsArray.size() != 1) {
-                return result;
-            }
-
-            TString column = fieldsArray[0]["String"]["sval"].GetString();
-            if (column.empty()) {
-                return result;
-            }
-            result.ColumnsToSelect.emplace_back(std::move(column));
-        }
-
-        if (result.WhereColumnsWithPos.empty() || result.ColumnsToSelect.empty()) {
-            return result;
-        }
-
-        result.ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
-        return result;
-    } catch (...) {
-        pg_query_free_parse_result(parseResult);
+    result->PostgresQuery = YQL2Postgres(yqlQuery);
+    if (result->PostgresQuery.Query.empty()) {
         return result;
     }
-    pg_query_free_parse_result(parseResult);
 
-
+    TEvents events(result);
+    NYql::PGParse(result->PostgresQuery.Query, events);
     return result;
 }
 

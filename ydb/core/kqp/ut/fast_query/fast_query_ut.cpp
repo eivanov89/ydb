@@ -1,4 +1,7 @@
 #include <ydb/core/kqp/compile_service/kqp_fast_query.h>
+
+#include <ydb/core/kqp/ut/common/kqp_ut_common.h>
+#include <ydb/core/testlib/common_helper.h>
 #include <ydb/core/testlib/test_client.h>
 
 #include <library/cpp/testing/unittest/tests_data.h>
@@ -7,11 +10,12 @@
 namespace NKikimr::NKqp {
 
 using namespace NYdb;
+using namespace NYdb::NTable;
 
 namespace {
 } // anonymous
 
-Y_UNIT_TEST_SUITE(KqpFastQuery) {
+Y_UNIT_TEST_SUITE(KqpFastQueryHelpers) {
 
 Y_UNIT_TEST(ShouldTransformToPostgresSyntax1) {
     TString query = R"(
@@ -225,20 +229,19 @@ Y_UNIT_TEST(FastSelectBasic) {
     size_t goldHash = THash<TString>()(query);
 
     std::vector<TString> columnsToSelect = {
-        "c_discount", "c_last", "c_credit"
+        "C_DISCOUNT", "C_LAST", "C_CREDIT"
     };
 
-    std::vector<std::pair<TString, size_t>> whereColumnsWithPos = {
-        {"c_w_id", 1}, {"c_d_id", 2}, {"c_id", 3}
-    };
-
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.OriginalQueryHash, goldHash);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::SELECT_QUERY);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.PostgresQuery.TablePathPrefix, "/Root/db1");
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.TableName, "customer");
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ColumnsToSelect, columnsToSelect);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.WhereColumnsWithPos, whereColumnsWithPos);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->OriginalQueryHash, goldHash);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::SELECT_QUERY);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->PostgresQuery.TablePathPrefix, "/Root/db1");
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->TableName, "customer");
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ColumnsToSelect, columnsToSelect);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos.size(), 3UL);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos["C_W_ID"], 1);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos["C_D_ID"], 2);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos["C_ID"], 3);
 }
 
 Y_UNIT_TEST(ShouldNotNonInt) {
@@ -256,8 +259,8 @@ Y_UNIT_TEST(ShouldNotNonInt) {
            AND C_ID = $c_id;
     )";
 
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
 }
 
 Y_UNIT_TEST(ShouldNotFastOrderBy) {
@@ -277,8 +280,8 @@ Y_UNIT_TEST(ShouldNotFastOrderBy) {
         ORDER BY C_DISCOUNT;
     )";
 
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
 }
 
 Y_UNIT_TEST(ShouldNotFastLimit) {
@@ -298,8 +301,8 @@ Y_UNIT_TEST(ShouldNotFastLimit) {
         LIMIT 1;
     )";
 
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
 }
 
 Y_UNIT_TEST(ShouldNotFastNotEqualWhere) {
@@ -319,8 +322,8 @@ Y_UNIT_TEST(ShouldNotFastNotEqualWhere) {
         LIMIT 1;
     )";
 
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
 }
 
 Y_UNIT_TEST(ShouldNotFastOrWhere) {
@@ -333,15 +336,15 @@ Y_UNIT_TEST(ShouldNotFastOrWhere) {
 
         SELECT C_DISCOUNT, C_LAST, C_CREDIT
           FROM customer
-         WHERE C_W_ID == $c_w_id
+         WHERE C_W_ID = $c_w_id
            OR C_D_ID = $c_d_id
            OR C_ID = $c_id
 
         LIMIT 1;
     )";
 
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
 }
 
 Y_UNIT_TEST(ShouldNotQueriesWithIndex) {
@@ -358,8 +361,210 @@ Y_UNIT_TEST(ShouldNotQueriesWithIndex) {
          ORDER BY idx.C_FIRST;
     )";
 
-    TFastQuery fastQuery = CompileToFastQuery(query);
-    UNIT_ASSERT_VALUES_EQUAL(fastQuery.ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::UNSUPPORTED);
+}
+}
+
+Y_UNIT_TEST_SUITE(KqpFastQueryExecution) {
+
+Y_UNIT_TEST(ShouldSelect) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_D_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST) VALUES
+            (1, 1, 1, 0, "credit1", "last1"),
+            (13, 11, 17, 7, "credit2", "last2");
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query = R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id AS Int32;
+        DECLARE $c_d_id AS Int32;
+        DECLARE $c_id AS Int32;
+
+        SELECT C_DISCOUNT, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $c_w_id
+           AND C_D_ID = $c_d_id
+           AND C_ID = $c_id;
+    )";
+
+    auto txControl = TTxControl::BeginTx().CommitTx();
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_w_id").Int32(13).Build()
+        .AddParam("$c_d_id").Int32(11).Build()
+        .AddParam("$c_id").Int32(17).Build()
+        .Build();
+
+    auto result = session.ExecuteDataQuery(query, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser(result.GetResultSet(0));
+    UNIT_ASSERT(resultParser.TryNextRow());
+
+    auto discount = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount, 7.0);
+}
+
+Y_UNIT_TEST(ShouldSelectWhenCustomParamNames) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_D_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST) VALUES
+            (1, 1, 1, 0, "credit1", "last1"),
+            (13, 11, 17, 7, "credit2", "last2");
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query = R"(
+        --!syntax_v1
+
+        DECLARE $c_d_id_var AS Int32;
+        DECLARE $c_w_id_var AS Int32;
+        DECLARE $c_id_var AS Int32;
+
+        SELECT C_DISCOUNT, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $c_w_id_var
+           AND C_ID = $c_id_var
+           AND C_D_ID = $c_d_id_var;
+    )";
+
+    auto txControl = TTxControl::BeginTx().CommitTx();
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_id_var").Int32(17).Build()
+        .AddParam("$c_w_id_var").Int32(13).Build()
+        .AddParam("$c_d_id_var").Int32(11).Build()
+        .Build();
+
+    auto result = session.ExecuteDataQuery(query, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser(result.GetResultSet(0));
+    UNIT_ASSERT(resultParser.TryNextRow());
+
+    auto discount = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount, 7.0);
+}
+
+Y_UNIT_TEST(ShouldSelectInTransaction) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_D_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST) VALUES
+            (1, 1, 1, 3, "credit1", "last1"),
+            (13, 11, 17, 7, "credit2", "last2");
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query = R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id AS Int32;
+        DECLARE $c_d_id AS Int32;
+        DECLARE $c_id AS Int32;
+
+        SELECT C_DISCOUNT, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $c_w_id
+           AND C_D_ID = $c_d_id
+           AND C_ID = $c_id;
+    )";
+
+    auto txControl = TTxControl::BeginTx(TTxSettings::SerializableRW());
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_w_id").Int32(13).Build()
+        .AddParam("$c_d_id").Int32(11).Build()
+        .AddParam("$c_id").Int32(17).Build()
+        .Build();
+
+    auto result = session.ExecuteDataQuery(query, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser(result.GetResultSet(0));
+    UNIT_ASSERT(resultParser.TryNextRow());
+
+    auto discount = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount, 7.0);
+
+    UNIT_ASSERT(result.GetTransaction());
+
+    auto tx = *result.GetTransaction();
+    params = session.GetParamsBuilder()
+            .AddParam("$c_w_id").Int32(1).Build()
+            .AddParam("$c_d_id").Int32(1).Build()
+            .AddParam("$c_id").Int32(1).Build()
+            .Build();
+
+    auto result2 = session.ExecuteDataQuery(query, TTxControl::Tx(tx), params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result2.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result2.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser2(result2.GetResultSet(0));
+    UNIT_ASSERT(resultParser2.TryNextRow());
+
+    auto discount2 = *resultParser2.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount2, 3.0);
+
+    auto commitResult = tx.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult.GetStatus(), EStatus::SUCCESS);
 }
 
 }

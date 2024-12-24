@@ -14,7 +14,12 @@ PEERDIR(
     ydb/core/kqp/federated_query
     ydb/core/kqp/host
     ydb/core/ydb_convert
-    contrib/libs/libpg_query
+    yql/essentials/parser/pg_wrapper
+    yql/essentials/sql/pg
+)
+
+ADDINCL(
+    yql/essentials/parser/pg_wrapper/postgresql/src/include
 )
 
 YQL_LAST_ABI_VERSION()

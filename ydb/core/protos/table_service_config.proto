@@ -381,4 +381,6 @@ message TTableServiceConfig {
     }
 
     optional TBatchOperationSettings BatchOperationSettings = 81;
+
+    optional bool EnableFastQuery = 90 [default = true];
 };

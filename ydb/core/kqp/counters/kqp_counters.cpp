@@ -250,6 +250,9 @@ void TKqpCountersBase::Init() {
     CompileErrors = YdbGroup->GetNamedCounter("name", "table.query.compilation.error_count", true);
     CompileActive = YdbGroup->GetNamedCounter("name", "table.query.compilation.active_count", false);
 
+    FastQuery = YdbGroup->GetNamedCounter("name", "table.query.compilation.fast_query", true);
+    RegularQuery = YdbGroup->GetNamedCounter("name", "table.query.compilation.regular_query", true);
+
     YdbCompileDuration = YdbGroup->GetNamedHistogram("name",
         "table.query.compilation.latency_milliseconds", NMonitoring::ExponentialHistogram(20, 2, 1));
 }
@@ -544,6 +547,14 @@ void TKqpCountersBase::ReportQueryCacheHit(bool hit) {
     } else {
         CompileQueryCacheMisses->Inc();
     }
+}
+
+void TKqpCountersBase::ReportFastQuery() {
+    FastQuery->Inc();
+}
+
+void TKqpCountersBase::ReportRegularQuery() {
+    RegularQuery->Inc();
 }
 
 void TKqpCountersBase::ReportCompileStart() {
@@ -1216,6 +1227,20 @@ void TKqpCounters::ReportTxAborted(TKqpDbCountersPtr dbCounters, ui32 abortedCou
     TKqpCountersBase::ReportTxAborted(abortedCount);
     if (dbCounters) {
         dbCounters->ReportTxAborted(abortedCount);
+    }
+}
+
+void TKqpCounters::ReportFastQuery(TKqpDbCountersPtr dbCounters) {
+    TKqpCountersBase::ReportFastQuery();
+    if (dbCounters) {
+        dbCounters->ReportFastQuery();
+    }
+}
+
+void TKqpCounters::ReportRegularQuery(TKqpDbCountersPtr dbCounters) {
+    TKqpCountersBase::ReportRegularQuery();
+    if (dbCounters) {
+        dbCounters->ReportRegularQuery();
     }
 }
 

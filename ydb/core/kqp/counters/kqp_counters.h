@@ -91,6 +91,9 @@ protected:
     void ReportTxCreated();
     void ReportTxAborted(ui32 abortedCount);
 
+    void ReportFastQuery();
+    void ReportRegularQuery();
+
     void ReportQueryCacheHit(bool hit);
     void ReportCompileStart();
     void ReportCompileFinish();
@@ -206,6 +209,8 @@ protected:
     ::NMonitoring::TDynamicCounters::TCounterPtr CompileTotal;
     ::NMonitoring::TDynamicCounters::TCounterPtr CompileErrors;
     ::NMonitoring::TDynamicCounters::TCounterPtr CompileActive;
+    ::NMonitoring::TDynamicCounters::TCounterPtr FastQuery;
+    ::NMonitoring::TDynamicCounters::TCounterPtr RegularQuery;
     NMonitoring::THistogramPtr CompileCpuTime;
     NMonitoring::THistogramPtr YdbCompileDuration;
 };
@@ -320,6 +325,9 @@ public:
 
     void ReportTxCreated(TKqpDbCountersPtr dbCounters);
     void ReportTxAborted(TKqpDbCountersPtr dbCounters, ui32 abortedCount);
+
+    void ReportFastQuery(TKqpDbCountersPtr dbCounters);
+    void ReportRegularQuery(TKqpDbCountersPtr dbCounters);
 
     void ReportQueryCacheHit(TKqpDbCountersPtr dbCounters, bool hit);
     void ReportCompileStart(TKqpDbCountersPtr dbCounters);
