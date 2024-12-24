@@ -250,6 +250,9 @@ void TKqpCountersBase::Init() {
     CompileErrors = YdbGroup->GetNamedCounter("name", "table.query.compilation.error_count", true);
     CompileActive = YdbGroup->GetNamedCounter("name", "table.query.compilation.active_count", false);
 
+    FastQuery = YdbGroup->GetNamedCounter("name", "table.query.compilation.fast_query", true);
+    RegularQuery = YdbGroup->GetNamedCounter("name", "table.query.compilation.regular_query", true);
+
     YdbCompileDuration = YdbGroup->GetNamedHistogram("name",
         "table.query.compilation.latency_milliseconds", NMonitoring::ExponentialHistogram(20, 2, 1));
 }
@@ -546,6 +549,14 @@ void TKqpCountersBase::ReportQueryCacheHit(bool hit) {
     }
 }
 
+void TKqpCountersBase::ReportFastQuery() {
+    FastQuery->Inc();
+}
+
+void TKqpCountersBase::ReportRegularQuery() {
+    RegularQuery->Inc();
+}
+
 void TKqpCountersBase::ReportCompileStart() {
     CompileTotal->Inc();
     CompileActive->Inc();
@@ -835,7 +846,7 @@ TKqpCounters::TKqpCounters(const ::NMonitoring::TDynamicCounterPtr& counters, co
         KqpGroup->GetHistogram("SinkWrites/WriteActorWritesOperations", NMonitoring::ExponentialHistogram(20, 2, 1));
     WriteActorWritesLatencyHistogram =
         KqpGroup->GetHistogram("SinkWrites/WriteActorWritesLatencyMs", NMonitoring::ExponentialHistogram(20, 2, 1));
-    
+
     ForwardActorWritesSizeHistogram =
         KqpGroup->GetHistogram("SinkWrites/ForwardActorWritesSize", NMonitoring::ExponentialHistogram(28, 2, 1));
     ForwardActorWritesLatencyHistogram =
@@ -1186,6 +1197,20 @@ void TKqpCounters::ReportTxAborted(TKqpDbCountersPtr dbCounters, ui32 abortedCou
     TKqpCountersBase::ReportTxAborted(abortedCount);
     if (dbCounters) {
         dbCounters->ReportTxAborted(abortedCount);
+    }
+}
+
+void TKqpCounters::ReportFastQuery(TKqpDbCountersPtr dbCounters) {
+    TKqpCountersBase::ReportFastQuery();
+    if (dbCounters) {
+        dbCounters->ReportFastQuery();
+    }
+}
+
+void TKqpCounters::ReportRegularQuery(TKqpDbCountersPtr dbCounters) {
+    TKqpCountersBase::ReportRegularQuery();
+    if (dbCounters) {
+        dbCounters->ReportRegularQuery();
     }
 }
 
