@@ -4,6 +4,7 @@ SRCS(
     kqp_compile_actor.cpp
     kqp_compile_service.cpp
     kqp_compile_computation_pattern_service.cpp
+    kqp_fast_query.cpp
 )
 
 PEERDIR(
@@ -13,8 +14,11 @@ PEERDIR(
     ydb/core/kqp/federated_query
     ydb/core/kqp/host
     ydb/core/ydb_convert
+    contrib/libs/libpg_query
 )
 
 YQL_LAST_ABI_VERSION()
+
+GENERATE_ENUM_SERIALIZATION(kqp_fast_query.h)
 
 END()
