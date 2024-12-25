@@ -73,6 +73,9 @@ extern void free_current_locale_conv();
 extern void RE_cleanup_cache();
 const char *progname;
 
+extern char *
+nodeToJson(const void *obj);
+
 #define STDERR_BUFFER_LEN 4096
 #define DEBUG
 
@@ -236,6 +239,15 @@ void PGParse(const TString& input, IPGParseEvents& events) {
 
 TString PrintPGTree(const List* raw) {
     auto str = nodeToString(raw);
+    Y_DEFER {
+       pfree(str);
+    };
+
+    return TString(str);
+}
+
+TString PrintPGTreeJson(const List* raw) {
+    auto str = nodeToJson(raw);
     Y_DEFER {
        pfree(str);
     };
