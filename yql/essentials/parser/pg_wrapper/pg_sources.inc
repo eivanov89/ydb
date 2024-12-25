@@ -347,6 +347,7 @@ SRCS(
     postgresql/src/backend/nodes/nodeFuncs.c
     postgresql/src/backend/nodes/nodes.c
     postgresql/src/backend/nodes/outfuncs.c
+    postgresql/src/backend/nodes/outfuncs_json.c
     postgresql/src/backend/nodes/params.c
     postgresql/src/backend/nodes/print.c
     postgresql/src/backend/nodes/queryjumblefuncs.c

@@ -17,6 +17,7 @@ public:
 };
 
 TString PrintPGTree(const List* raw);
+TString PrintPGTreeJson(const List* raw);
 
 TString GetCommandName(Node* node);
 
