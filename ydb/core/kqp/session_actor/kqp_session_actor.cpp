@@ -407,54 +407,57 @@ private:
         auto& queryResponse = *response->Record.MutableResponse();
         queryResponse.SetSessionId(SessionId);
         auto& resultSets = *queryResponse.AddYdbResults();
-        auto& row = *resultSets.Addrows();
-        const auto& resultRow = msg->GetCells(0);
-        for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
-            const auto& name = FastQuery->ColumnsToSelect[i];
-            auto it = FindCaseI(FastQuery->ResolvedColumns, name);
-            auto& column = *resultSets.Addcolumns();
-            column.set_name(ToUpper(name)); // XXX
 
-            const auto& cell = resultRow[i];
+        for (size_t rowNum = 0; rowNum < msg->GetRowsCount(); ++rowNum) {
+            auto& row = *resultSets.Addrows();
+            const auto& resultRow = msg->GetCells(rowNum);
+            for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
+                const auto& name = FastQuery->ColumnsToSelect[i];
+                auto it = FindCaseI(FastQuery->ResolvedColumns, name);
+                auto& column = *resultSets.Addcolumns();
+                column.set_name(ToUpper(name)); // XXX
 
-            // XXX: normally should not happen IIRC
-            if (cell.Size() == 0) {
-                *row.add_items() = it->second.DefaultFromLiteral.value();
-                continue;
-            }
+                const auto& cell = resultRow[i];
 
-            // XXX XXX XXX (only some of the types)
-            switch (it->second.PType.GetTypeId()) {
-            case NScheme::NTypeIds::Int32:
-                row.add_items()->set_int32_value(cell.AsValue<i32>());
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT32);
-                break;
-            case NScheme::NTypeIds::Uint32:
-                row.add_items()->set_uint32_value(cell.AsValue<ui32>());
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT32);
-                break;
-            case NScheme::NTypeIds::Int64:
-                row.add_items()->set_int64_value(cell.AsValue<i64>());
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT64);
-                break;
-            case NScheme::NTypeIds::Uint64:
-                row.add_items()->set_uint64_value(cell.AsValue<ui64>());
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT64);
-                break;
-            case NScheme::NTypeIds::Double:
-                row.add_items()->set_double_value(cell.AsValue<double>());
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::DOUBLE);
-                break;
-            case NScheme::NTypeIds::Float:
-                row.add_items()->set_float_value(cell.AsValue<float>());
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::FLOAT);
-                break;
-            case NScheme::NTypeIds::Utf8:
-                row.add_items()->set_text_value(""); // XXX
-                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
-                break;
-            default:
-                *row.add_items() = it->second.DefaultFromLiteral.value();
+                // XXX: normally should not happen IIRC
+                if (cell.Size() == 0) {
+                    *row.add_items() = it->second.DefaultFromLiteral.value();
+                    continue;
+                }
+
+                // XXX XXX XXX (only some of the types)
+                switch (it->second.PType.GetTypeId()) {
+                case NScheme::NTypeIds::Int32:
+                    row.add_items()->set_int32_value(cell.AsValue<i32>());
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT32);
+                    break;
+                case NScheme::NTypeIds::Uint32:
+                    row.add_items()->set_uint32_value(cell.AsValue<ui32>());
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT32);
+                    break;
+                case NScheme::NTypeIds::Int64:
+                    row.add_items()->set_int64_value(cell.AsValue<i64>());
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT64);
+                    break;
+                case NScheme::NTypeIds::Uint64:
+                    row.add_items()->set_uint64_value(cell.AsValue<ui64>());
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT64);
+                    break;
+                case NScheme::NTypeIds::Double:
+                    row.add_items()->set_double_value(cell.AsValue<double>());
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::DOUBLE);
+                    break;
+                case NScheme::NTypeIds::Float:
+                    row.add_items()->set_float_value(cell.AsValue<float>());
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::FLOAT);
+                    break;
+                case NScheme::NTypeIds::Utf8:
+                    row.add_items()->set_text_value(""); // XXX
+                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
+                    break;
+                default:
+                    *row.add_items() = it->second.DefaultFromLiteral.value();
+                }
             }
         }
 
