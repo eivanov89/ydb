@@ -54,24 +54,39 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
 
         // handle WHERE
 
-        const auto& whereEpr = selectStatement["whereClause"]["BoolExpr"];
-        if (!whereEpr.IsDefined()) {
-            return;
-        }
-        if (whereEpr["boolop"] != "AND_EXPR") {
+        const auto& whereExpr = selectStatement["whereClause"];
+        if (!whereExpr.IsDefined()) {
             return;
         }
 
-        for (const auto& arg: whereEpr["args"].GetArray()) {
-            if (arg["A_Expr"]["name"][0]["String"]["sval"] != "=") {
+        if (const auto& boolExpr = whereExpr["BoolExpr"]; boolExpr.IsDefined()) {
+            if (boolExpr["boolop"] != "AND_EXPR") {
                 return;
             }
-            TString colName = arg["A_Expr"]["lexpr"]["ColumnRef"]["fields"][0]["String"]["sval"].GetString();
-            int colParamNum = arg["A_Expr"]["rexpr"]["ParamRef"]["number"].GetInteger();
-            if (colParamNum == 0 || colName.empty()) {
-                return;
+
+            for (const auto& arg: boolExpr["args"].GetArray()) {
+                if (arg["A_Expr"]["name"][0]["String"]["sval"] != "=") {
+                    return;
+                }
+                TString colName = arg["A_Expr"]["lexpr"]["ColumnRef"]["fields"][0]["String"]["sval"].GetString();
+                int colParamNum = arg["A_Expr"]["rexpr"]["ParamRef"]["number"].GetInteger();
+                if (colParamNum == 0 || colName.empty()) {
+                    return;
+                }
+                result->WhereColumnsToPos.emplace(std::move(colName), colParamNum);
             }
-            result->WhereColumnsToPos.emplace(std::move(colName), colParamNum);
+        } else if (const auto& aexpr = whereExpr["A_Expr"]; aexpr.IsDefined()) {
+                if (aexpr["name"][0]["String"]["sval"] != "=") {
+                    return;
+                }
+                TString colName = aexpr["lexpr"]["ColumnRef"]["fields"][0]["String"]["sval"].GetString();
+                int colParamNum = aexpr["rexpr"]["ParamRef"]["number"].GetInteger();
+                if (colParamNum == 0 || colName.empty()) {
+                    return;
+                }
+                result->WhereColumnsToPos.emplace(std::move(colName), colParamNum);
+        } else {
+            return;
         }
 
         // handle FROM

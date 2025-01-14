@@ -244,6 +244,35 @@ Y_UNIT_TEST(FastSelectBasic) {
     UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos["C_ID"], 3);
 }
 
+Y_UNIT_TEST(FastSelectBasic2) {
+    TString query = R"(
+        --!syntax_v1
+
+        PRAGMA TablePathPrefix("/Root/db1");
+
+        DECLARE $w_id AS Int32;
+
+        SELECT W_TAX
+        FROM warehouse
+        WHERE W_ID = $w_id;
+    )";
+
+    size_t goldHash = THash<TString>()(query);
+
+    std::vector<TString> columnsToSelect = {
+        "W_TAX",
+    };
+
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->OriginalQueryHash, goldHash);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::SELECT_QUERY);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->PostgresQuery.TablePathPrefix, "/Root/db1");
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->TableName, "warehouse");
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ColumnsToSelect, columnsToSelect);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos.size(), 1UL);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->WhereColumnsToPos["W_ID"], 1);
+}
+
 Y_UNIT_TEST(ShouldNotNonInt) {
     TString query = R"(
         --!syntax_v1
