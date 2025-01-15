@@ -427,6 +427,12 @@ private:
             case NScheme::NTypeIds::Utf8:
                 column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
                 break;
+            case NScheme::NTypeIds::Timestamp:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::TIMESTAMP);
+                break;
+            case NScheme::NTypeIds::Timestamp64:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::TIMESTAMP64);
+                break;
             default:
                 ;
             }
@@ -455,9 +461,11 @@ private:
                 case NScheme::NTypeIds::Uint32:
                     row.add_items()->set_uint32_value(cell.AsValue<ui32>());
                     break;
+                case NScheme::NTypeIds::Timestamp64:
                 case NScheme::NTypeIds::Int64:
                     row.add_items()->set_int64_value(cell.AsValue<i64>());
                     break;
+                case NScheme::NTypeIds::Timestamp:
                 case NScheme::NTypeIds::Uint64:
                     row.add_items()->set_uint64_value(cell.AsValue<ui64>());
                     break;
