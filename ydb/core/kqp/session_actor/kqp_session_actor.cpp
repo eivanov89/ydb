@@ -103,6 +103,20 @@ TString ToUpper(const TString& s) {
     return upperS;
 }
 
+bool IsEqual(const TString& left, const TString& right) {
+    if (left == right) {
+        return true;
+    }
+
+    auto upperLeft = ToUpper(left);
+    if (upperLeft == right) {
+        return true;
+    }
+
+    auto lowerLeft = ToLower(left);
+    return lowerLeft == right;
+}
+
 // XXX
 template <typename TMap>
 TMap::iterator FindCaseI(TMap& m, const TString& name) {
@@ -182,14 +196,14 @@ struct TKqpCleanupCtx {
     }
 };
 
-class TFastQueryExecutorActor : public TActorBootstrapped<TFastQueryExecutorActor> {
+class TFastSelectExecutorActor : public TActorBootstrapped<TFastSelectExecutorActor> {
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::KQP_FAST_QUERY_ACTOR;
     }
 
 public:
-    TFastQueryExecutorActor(const TActorId& replyTo,
+    TFastSelectExecutorActor(const TActorId& replyTo,
             const TString& sessionId,
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
@@ -547,6 +561,413 @@ private:
     std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
     ui64 ResolvedShardId = 0;
 
+};
+
+class TFastSelectInExecutorActor : public TActorBootstrapped<TFastSelectInExecutorActor> {
+public:
+    static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+        return NKikimrServices::TActivity::KQP_FAST_QUERY_ACTOR;
+    }
+
+public:
+    TFastSelectInExecutorActor(const TActorId& replyTo,
+            const TString& sessionId,
+            TFastQueryPtr fastQuery,
+            const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
+            const IKqpGateway::TKqpSnapshot& snapshot,
+            const TKqpQueryState::TQueryTxId& txId)
+        : ReplyTo(replyTo)
+        , SessionId(sessionId)
+        , FastQuery(std::move(fastQuery))
+        , Parameters(params)
+        , Snapshot(snapshot)
+        , TxId(txId)
+    {
+    }
+
+    void Bootstrap() {
+        LOG_T("bootstrapped for query " << FastQuery->PostgresQuery.Query);
+        Become(&TThis::ExecuteState);
+
+        if (FastQuery->ResolvedColumns.empty()) {
+            return ResolveSchema(TlsActivationContext->AsActorContext());
+        }
+
+        ResolveShards(TlsActivationContext->AsActorContext());
+    }
+
+private:
+    STATEFN(ExecuteState) {
+        try {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvents::TEvUndelivered, Handle);
+                HFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
+                HFunc(TEvTxProxySchemeCache::TEvResolveKeySetResult, Handle);
+                HFunc(TEvDataShard::TEvReadResult, HandleRead);
+            default:
+                UnexpectedEvent("ExecuteState", ev);
+            }
+        } catch (const TRequestFail& ex) {
+            ReplyQueryError(ex.Status, ex.what(), ex.Issues);
+        } catch (const yexception& ex) {
+            InternalError(ex.what());
+        }
+    }
+
+    void ResolveSchema(const TActorContext &ctx) {
+        TString path;
+        if (FastQuery->PostgresQuery.TablePathPrefix) {
+            path = FastQuery->PostgresQuery.TablePathPrefix;
+        } else {
+            path = FastQuery->Database;
+        }
+        path += "/" + FastQuery->TableName;
+        LOG_T("Resolving " << path);
+
+        auto request = std::make_unique<NSchemeCache::TSchemeCacheNavigate>();
+        NSchemeCache::TSchemeCacheNavigate::TEntry entry;
+        entry.Path = ::NKikimr::SplitPath(path);
+        if (entry.Path.empty()) {
+            return ReplyQueryError(Ydb::StatusIds::NOT_FOUND, "Invalid table path specified");
+        }
+        entry.Operation = NSchemeCache::TSchemeCacheNavigate::OpTable;
+        request->ResultSet.emplace_back(entry);
+        Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(request.release()));
+    }
+
+    void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext &ctx) {
+        const auto* response = ev->Get();
+        Y_ABORT_UNLESS(response->Request != nullptr);
+
+        Y_ABORT_UNLESS(response->Request->ResultSet.size() == 1);
+        const auto& entry = response->Request->ResultSet.front();
+
+        FastQuery->TableId = entry.TableId;
+
+        if (entry.Status != NSchemeCache::TSchemeCacheNavigate::EStatus::Ok) {
+            return ReplyQueryError(Ydb::StatusIds::SCHEME_ERROR, ToString(entry.Status));
+        }
+
+        FastQuery->ResolvedColumns.reserve(entry.Columns.size());
+        FastQuery->Columns.reserve(entry.Columns.size());
+        FastQuery->KeyColumns.reserve(entry.Columns.size());
+        FastQuery->KeyColumnTypes.reserve(entry.Columns.size());
+        for (const auto& [_, info] : entry.Columns) {
+            FastQuery->ResolvedColumns[info.Name] = info;
+            FastQuery->Columns.emplace_back(info.Id, TKeyDesc::EColumnOperation::Read, info.PType, 0, 0);
+            if (info.KeyOrder != -1) {
+                FastQuery->KeyColumns.emplace_back(info);
+                FastQuery->KeyColumnTypes.emplace_back(info.PType);
+            }
+        }
+
+        for (const auto& keyColumn: FastQuery->KeyColumns) {
+            for (size_t i = 0; i < FastQuery->WhereSelectInColumns.size(); ++i) {
+                if (IsEqual(keyColumn.Name, FastQuery->WhereSelectInColumns[i])) {
+                    FastQuery->OrderedWhereSelectInColumns.push_back(i);
+                }
+            }
+        }
+
+        LOG_T("Resolved to tableId " << FastQuery->TableId << " with key columns size " << FastQuery->KeyColumns.size()
+            << " and total columns size " << FastQuery->ResolvedColumns.size()
+            << ", OrderedWhereColumns size " << FastQuery->OrderedWhereSelectInColumns.size()
+            << ", WhereSelectInColumns size " << FastQuery->WhereSelectInColumns.size());
+
+        ResolveShards(ctx);
+    }
+
+    void ResolveShards(const TActorContext &) {
+        LOG_T("Resolving " << FastQuery->WhereSelectInPos.size() << " points");
+        ResolvedPoints.resize(FastQuery->WhereSelectInPos.size());
+        auto request = std::make_unique<NSchemeCache::TSchemeCacheRequest>();
+
+
+        for (size_t i = 0; i < FastQuery->WhereSelectInPos.size(); ++i) {
+            const auto& pointToResolve = FastQuery->WhereSelectInPos[i];
+            auto& resolvedData = ResolvedPoints[i];
+
+            resolvedData.KeyCells.reserve(FastQuery->WhereSelectInColumns.size());
+
+            // needed
+            for (size_t keyColumnIndex: FastQuery->OrderedWhereSelectInColumns) {
+                const auto& keyColumnName = FastQuery->WhereSelectInColumns[keyColumnIndex];
+                auto position = pointToResolve[keyColumnIndex];
+
+                LOG_T("Key column '" << keyColumnName << "' with position " << position);
+                TString varName = "$" + FastQuery->PostgresQuery.PositionalNames[position - 1];
+                auto it = FindCaseI(Parameters, varName);
+                if (it == Parameters.end()) {
+                    TStringStream ss;
+                    ss << "Parameter " << varName << " not found, params are: ";
+                    for (const auto& param: Parameters) {
+                        ss << param.first << ",";
+                    }
+                    return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
+                }
+
+                const auto& typedValue = it->second;
+                resolvedData.KeyCells.emplace_back(TCell::Make<i32>(typedValue.Getvalue().Getint32_value()));
+            }
+
+            TTableRange range(resolvedData.KeyCells);
+
+            // XXX: for simplicity request all columns
+            THolder<NKikimr::TKeyDesc> keyDesc(
+                new TKeyDesc(
+                    FastQuery->TableId,
+                    range,
+                    TKeyDesc::ERowOperation::Read,
+                    FastQuery->KeyColumnTypes,
+                    FastQuery->Columns));
+
+            request->ResultSet.emplace_back(std::move(keyDesc));
+        }
+
+        auto resolveRequest = std::make_unique<TEvTxProxySchemeCache::TEvResolveKeySet>(request.release());
+        Send(MakeSchemeCacheID(), resolveRequest.release());
+    }
+
+    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+        TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
+        Y_ABORT_UNLESS(msg->Request->ResultSet.size() == FastQuery->WhereSelectInPos.size());
+
+        for (size_t i = 0; i < msg->Request->ResultSet.size(); ++i) {
+            auto& resolvedData = ResolvedPoints[i];
+            auto& result = msg->Request->ResultSet[i];
+            resolvedData.ResolvedKeys.reset(result.KeyDescription.Release());
+
+            const auto& partitions = resolvedData.ResolvedKeys->GetPartitions();
+            if (partitions.size() == 0) {
+                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Failed to resolve shards");
+            }
+            // just a sanity check
+            if (partitions.size() != 1) {
+                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Key resolved to multiple shards");
+            }
+
+            resolvedData.ResolvedShardId = partitions[0].ShardId;
+
+            LOG_T("Table [" << FastQuery->TableId << "] point" << i << " shard: " << resolvedData.ResolvedShardId);
+        }
+
+        Execute();
+    }
+
+    void Execute() {
+        Response = std::make_unique<TEvKqp::TEvQueryResponse>();
+        auto& queryResponse = *Response->Record.MutableResponse();
+        queryResponse.SetSessionId(SessionId);
+        auto& resultSets = *queryResponse.AddYdbResults();
+        queryResponse.MutableTxMeta()->set_id(TxId.GetValue().GetHumanStr());
+        for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
+            const auto& name = FastQuery->ColumnsToSelect[i];
+            auto it = FindCaseI(FastQuery->ResolvedColumns, name);
+            auto& column = *resultSets.Addcolumns();
+            column.set_name(ToUpper(name)); // XXX
+
+            // XXX XXX XXX (only some of the types)
+            switch (it->second.PType.GetTypeId()) {
+            case NScheme::NTypeIds::Int32:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT32);
+                break;
+            case NScheme::NTypeIds::Uint32:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT32);
+                break;
+            case NScheme::NTypeIds::Int64:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT64);
+                break;
+            case NScheme::NTypeIds::Uint64:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT64);
+                break;
+            case NScheme::NTypeIds::Double:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::DOUBLE);
+                break;
+            case NScheme::NTypeIds::Float:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::FLOAT);
+                break;
+            case NScheme::NTypeIds::Utf8:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
+                break;
+            case NScheme::NTypeIds::Timestamp:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::TIMESTAMP);
+                break;
+            case NScheme::NTypeIds::Timestamp64:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::TIMESTAMP64);
+                break;
+            default:
+                ;
+            }
+        }
+
+        for (size_t i = 0; i < FastQuery->WhereSelectInPos.size(); ++i) {
+            auto& resolvedData = ResolvedPoints[i];
+
+            auto request = std::make_unique<NKikimr::TEvDataShard::TEvRead>();
+            auto& record = request->Record;
+            record.SetReadId(i + 1);
+            record.SetResultFormat(NKikimrDataEvents::FORMAT_CELLVEC);
+            record.MutableTableId()->SetOwnerId(FastQuery->TableId.PathId.OwnerId);
+            record.MutableTableId()->SetTableId(FastQuery->TableId.PathId.LocalPathId);
+            record.MutableTableId()->SetSchemaVersion(FastQuery->TableId.SchemaVersion);
+
+            // TODO
+            Y_UNUSED(TxId);
+
+            for (const auto& name: FastQuery->ColumnsToSelect) {
+                auto it = FindCaseI(FastQuery->ResolvedColumns, name);
+                if (it == FastQuery->ResolvedColumns.end()) {
+                    TStringStream ss;
+                    ss << "Column " << name << " not found";
+                    return ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, ss.Str());
+                }
+                record.AddColumns(it->second.Id);
+            }
+
+            request->Keys.emplace_back(resolvedData.KeyCells);
+
+            TRowVersion readVersion(Snapshot.Step, Snapshot.TxId);
+            readVersion.Serialize(*record.MutableSnapshot());
+
+            LOG_T("sending read request to " << FastQuery->TableName << "(" << resolvedData.ResolvedShardId << "): "
+                << request->ToString());
+
+            Send<ESendingType::Tail>(
+                NKikimr::MakePipePerNodeCacheID(false),
+                new TEvPipeCache::TEvForward(request.release(), resolvedData.ResolvedShardId, true),
+                IEventHandle::FlagTrackDelivery,
+                0,
+                0);
+
+            ++WaitingRepliesCount;
+        }
+    }
+
+    void HandleRead(TEvDataShard::TEvReadResult::TPtr ev, const TActorContext &ctx) {
+        --WaitingRepliesCount;
+
+        const auto* msg = ev->Get();
+        LOG_T("received read result from shard " << ev->Sender << ": " << msg->ToString()
+            << ", left results " << WaitingRepliesCount);
+
+        auto& queryResponse = *Response->Record.MutableResponse();
+        auto& resultSets = *queryResponse.MutableYdbResults(0);
+
+        for (size_t rowNum = 0; rowNum < msg->GetRowsCount(); ++rowNum) {
+            auto& row = *resultSets.Addrows();
+            const auto& resultRow = msg->GetCells(rowNum);
+            for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
+                const auto& name = FastQuery->ColumnsToSelect[i];
+                auto it = FindCaseI(FastQuery->ResolvedColumns, name);
+
+                const auto& cell = resultRow[i];
+
+                // XXX: normally should not happen IIRC
+                if (cell.Size() == 0) {
+                    *row.add_items() = it->second.DefaultFromLiteral.value();
+                    continue;
+                }
+
+                // XXX XXX XXX (only some of the types)
+                switch (it->second.PType.GetTypeId()) {
+                case NScheme::NTypeIds::Int32:
+                    row.add_items()->set_int32_value(cell.AsValue<i32>());
+                    break;
+                case NScheme::NTypeIds::Uint32:
+                    row.add_items()->set_uint32_value(cell.AsValue<ui32>());
+                    break;
+                case NScheme::NTypeIds::Timestamp64:
+                case NScheme::NTypeIds::Int64:
+                    row.add_items()->set_int64_value(cell.AsValue<i64>());
+                    break;
+                case NScheme::NTypeIds::Timestamp:
+                case NScheme::NTypeIds::Uint64:
+                    row.add_items()->set_uint64_value(cell.AsValue<ui64>());
+                    break;
+                case NScheme::NTypeIds::Double:
+                    row.add_items()->set_double_value(cell.AsValue<double>());
+                    break;
+                case NScheme::NTypeIds::Float:
+                    row.add_items()->set_float_value(cell.AsValue<float>());
+                    break;
+                case NScheme::NTypeIds::Utf8:
+                    row.add_items()->set_text_value(""); // XXX
+                    break;
+                default:
+                    *row.add_items() = it->second.DefaultFromLiteral.value();
+                }
+            }
+        }
+
+        if (WaitingRepliesCount == 0) {
+            Response->Record.SetYdbStatus(Ydb::StatusIds::SUCCESS);
+            LOG_T("Replying: " << Response->ToString());
+
+            Send<ESendingType::Tail>(ReplyTo, Response.release());
+            PassAway();
+        }
+    }
+
+    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+        // assume, that it's from DS, because other messages are to local services
+        Execute();
+    }
+
+    void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+        InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
+            << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
+            << " sender: " << ev->Sender);
+    }
+
+    void InternalError(const TString& message) {
+        LOG_E("Internal error, message: " << message);
+        ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, message);
+    }
+
+    void ReplyQueryError(Ydb::StatusIds::StatusCode ydbStatus,
+        const TString& message,
+        std::optional<google::protobuf::RepeatedPtrField<Ydb::Issue::IssueMessage>> issues = {})
+    {
+        LOG_W(" error:" << message);
+
+        auto queryResponse = std::make_unique<TEvKqp::TEvQueryResponse>();
+        queryResponse->Record.SetYdbStatus(ydbStatus);
+
+        if (issues) {
+            auto* response = queryResponse->Record.MutableResponse();
+            for (auto& i : *issues) {
+                response->AddQueryIssues()->Swap(&i);
+            }
+        }
+
+        Send<ESendingType::Tail>(ReplyTo, queryResponse.release());
+        PassAway();
+    }
+
+    TString LogPrefix() const {
+        TStringBuilder result = TStringBuilder()
+            << "Fast executor SessionId: " << SessionId << ", "
+            << "ActorId: " << SelfId() << ", ";
+        return result;
+    }
+
+private:
+    TActorId ReplyTo;
+    TString SessionId;
+    TFastQueryPtr FastQuery;
+    ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
+    IKqpGateway::TKqpSnapshot Snapshot;
+    TKqpQueryState::TQueryTxId TxId;
+
+    struct TResolvedData {
+        TVector<TCell> KeyCells;
+        std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
+        ui64 ResolvedShardId = 0;
+    };
+    TVector<TResolvedData> ResolvedPoints;
+
+    size_t WaitingRepliesCount = 0;
+    std::unique_ptr<TEvKqp::TEvQueryResponse> Response;
 };
 
 class TKqpSessionActor : public TActorBootstrapped<TKqpSessionActor> {
@@ -1260,15 +1681,31 @@ public:
     void ExecuteFastQuery() {
         Counters->ReportFastQuery(Settings.DbCounters);
 
-        // same mailbox + tail
-        auto* actor = new TFastQueryExecutorActor(
-            SelfId(),
-            SessionId,
-            QueryState->FastQuery,
-            QueryState->GetYdbParameters(),
-            QueryState->TxCtx->SnapshotHandle.Snapshot,
-            QueryState->TxId);
+        IActor* actor = nullptr;
+        switch (QueryState->FastQuery->ExecutionType) {
+        case TFastQuery::EExecutionType::SELECT_QUERY:
+            actor = new TFastSelectExecutorActor(
+                SelfId(),
+                SessionId,
+                QueryState->FastQuery,
+                QueryState->GetYdbParameters(),
+                QueryState->TxCtx->SnapshotHandle.Snapshot,
+                QueryState->TxId);
+            break;
+        case TFastQuery::EExecutionType::SELECT_IN_QUERY:
+            actor = new TFastSelectInExecutorActor(
+                SelfId(),
+                SessionId,
+                QueryState->FastQuery,
+                QueryState->GetYdbParameters(),
+                QueryState->TxCtx->SnapshotHandle.Snapshot,
+                QueryState->TxId);
+            break;
+        default:
+            Y_VERIFY(actor);
+        }
 
+        // same mailbox + tail
         FastQueryExecutor = TlsActivationContext->ExecutorThread.RegisterActor<ESendingType::Tail>(
             actor,
             &TlsActivationContext->Mailbox,

@@ -26,6 +26,7 @@ struct TFastQuery {
     enum class EExecutionType {
         UNSUPPORTED = 0,
         SELECT_QUERY,
+        SELECT_IN_QUERY,
     };
 
     EExecutionType ExecutionType = EExecutionType::UNSUPPORTED;
@@ -40,12 +41,17 @@ struct TFastQuery {
 
     THashMap<TString, size_t> WhereColumnsToPos;
 
+    TVector<TString> WhereSelectInColumns; // column names
+    TVector<TVector<size_t>> WhereSelectInPos; // points
+
     // resolved items
     THashMap<TString, TSysTables::TTableColumnInfo> ResolvedColumns;
     TVector<TKeyDesc::TColumnOp> Columns;
     TVector<TSysTables::TTableColumnInfo> KeyColumns;
     TVector<NScheme::TTypeInfo> KeyColumnTypes;
     TTableId TableId = {};
+
+    TVector<size_t> OrderedWhereSelectInColumns;
 
     TPostgresQuery PostgresQuery;
 

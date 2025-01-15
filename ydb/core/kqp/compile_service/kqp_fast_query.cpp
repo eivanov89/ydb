@@ -54,10 +54,14 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
 
         // handle WHERE
 
+        //Cerr << Endl << pgJson << Endl;
+
         const auto& whereExpr = selectStatement["whereClause"];
         if (!whereExpr.IsDefined()) {
             return;
         }
+
+        bool isSelectIn = false;
 
         if (const auto& boolExpr = whereExpr["BoolExpr"]; boolExpr.IsDefined()) {
             if (boolExpr["boolop"] != "AND_EXPR") {
@@ -76,6 +80,7 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
                 result->WhereColumnsToPos.emplace(std::move(colName), colParamNum);
             }
         } else if (const auto& aexpr = whereExpr["A_Expr"]; aexpr.IsDefined()) {
+            if (aexpr["kind"] == "AEXPR_OP") {
                 if (aexpr["name"][0]["String"]["sval"] != "=") {
                     return;
                 }
@@ -85,6 +90,72 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
                     return;
                 }
                 result->WhereColumnsToPos.emplace(std::move(colName), colParamNum);
+            } else if (aexpr["kind"] == "AEXPR_IN") {
+                isSelectIn = true;
+
+                if (const auto& columnRefFields = aexpr["lexpr"]["ColumnRef"]["fields"]; columnRefFields.IsDefined()) {
+                    // WHERE COL IN (1, 2, 3)
+                    for (const auto& field: columnRefFields.GetArray()) {
+                        const auto& column = field["String"]["sval"];
+                        if (!column.IsDefined()) {
+                            return;
+                        }
+                        result->WhereSelectInColumns.emplace_back(column.GetString());
+                    }
+
+                    if (result->WhereSelectInColumns.empty()) {
+                        return;
+                    }
+
+                    const auto& posArgs = aexpr["rexpr"]["List"]["items"];
+                    for (const auto& pos: posArgs.GetArray()) {
+                        result->WhereSelectInPos.push_back({});
+                        auto& posVector = result->WhereSelectInPos.back();
+                        const auto& posValue = pos["ParamRef"]["number"];
+                        if (!posValue.IsDefined()) {
+                            return;
+                        }
+                        posVector.push_back(posValue.GetInteger());
+                    }
+                } else if (const auto& rowRefArgs = aexpr["lexpr"]["RowExpr"]["args"]; rowRefArgs.IsDefined()) {
+                    // WHERE (COL1, COL2) IN ((1,1), (2,2), )
+                    for (const auto& arg: rowRefArgs.GetArray()) {
+                        const auto& column = arg["ColumnRef"]["fields"][0]["String"]["sval"];
+                        if (!column.IsDefined()) {
+                            return;
+                        }
+                        result->WhereSelectInColumns.emplace_back(column.GetString());
+                    }
+                    if (result->WhereSelectInColumns.empty()) {
+                        return;
+                    }
+
+                    const auto& posArgs = aexpr["rexpr"]["List"]["items"];
+                    if (!posArgs.IsDefined()) {
+                        return;
+                    }
+                    for (const auto& pos: posArgs.GetArray()) {
+                        result->WhereSelectInPos.push_back({});
+                        auto& posVector = result->WhereSelectInPos.back();
+
+                        const auto& columns = pos["RowExpr"]["args"];
+                        if (!columns.IsDefined()) {
+                            return;
+                        }
+                        for (const auto& column: columns.GetArray()) {
+                            const auto& colPosition = column["ParamRef"]["number"];
+                            if (!colPosition.IsDefined()) {
+                                return;
+                            }
+                            posVector.emplace_back(colPosition.GetInteger());
+                        }
+                    }
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
         } else {
             return;
         }
@@ -127,11 +198,19 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
             result->ColumnsToSelect.emplace_back(std::move(column));
         }
 
-        if (result->WhereColumnsToPos.empty() || result->ColumnsToSelect.empty()) {
+        if (result->WhereColumnsToPos.empty() && result->WhereSelectInColumns.empty()) {
             return;
         }
 
-        result->ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
+        if (result->ColumnsToSelect.empty()) {
+            return;
+        }
+
+        if (isSelectIn) {
+            result->ExecutionType = TFastQuery::EExecutionType::SELECT_IN_QUERY;
+        } else {
+            result->ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
+        }
         return;
     } catch (...) {
         //pg_query_free_parse_result(parseResult);
