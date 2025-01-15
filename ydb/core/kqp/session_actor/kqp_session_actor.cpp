@@ -283,14 +283,6 @@ private:
         LOG_T("Resolved to tableId " << FastQuery->TableId << " with key columns size " << FastQuery->KeyColumns.size()
             << " and total columns size " << FastQuery->ResolvedColumns.size());
 
-        // quick and approximate check, TODO
-        if (Parameters.size() != FastQuery->KeyColumns.size()) {
-            TStringStream ss;
-            ss << "Parameters size is " << Parameters.size()
-               << ", while key columns size is " << FastQuery->KeyColumns.size();
-            return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
-        }
-
         ResolveShards(ctx);
     }
 
@@ -299,9 +291,7 @@ private:
         for (const auto& keyColumn: FastQuery->KeyColumns) {
             auto whereIt = FindCaseI(FastQuery->WhereColumnsToPos, keyColumn.Name);
             if (whereIt == FastQuery->WhereColumnsToPos.end()) {
-                TStringStream ss;
-                ss << "Failed to find " << keyColumn.Name << " in WhereColumnsToPos";
-                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
+                continue; // key prefix
             }
             auto position = whereIt->second;
             TString varName = "$" + FastQuery->PostgresQuery.PositionalNames[position - 1];
@@ -408,14 +398,46 @@ private:
         queryResponse.SetSessionId(SessionId);
         auto& resultSets = *queryResponse.AddYdbResults();
 
+        for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
+            const auto& name = FastQuery->ColumnsToSelect[i];
+            auto it = FindCaseI(FastQuery->ResolvedColumns, name);
+            auto& column = *resultSets.Addcolumns();
+            column.set_name(ToUpper(name)); // XXX
+
+            // XXX XXX XXX (only some of the types)
+            switch (it->second.PType.GetTypeId()) {
+            case NScheme::NTypeIds::Int32:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT32);
+                break;
+            case NScheme::NTypeIds::Uint32:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT32);
+                break;
+            case NScheme::NTypeIds::Int64:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT64);
+                break;
+            case NScheme::NTypeIds::Uint64:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT64);
+                break;
+            case NScheme::NTypeIds::Double:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::DOUBLE);
+                break;
+            case NScheme::NTypeIds::Float:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::FLOAT);
+                break;
+            case NScheme::NTypeIds::Utf8:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
+                break;
+            default:
+                ;
+            }
+        }
+
         for (size_t rowNum = 0; rowNum < msg->GetRowsCount(); ++rowNum) {
             auto& row = *resultSets.Addrows();
             const auto& resultRow = msg->GetCells(rowNum);
             for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
                 const auto& name = FastQuery->ColumnsToSelect[i];
                 auto it = FindCaseI(FastQuery->ResolvedColumns, name);
-                auto& column = *resultSets.Addcolumns();
-                column.set_name(ToUpper(name)); // XXX
 
                 const auto& cell = resultRow[i];
 
@@ -429,31 +451,24 @@ private:
                 switch (it->second.PType.GetTypeId()) {
                 case NScheme::NTypeIds::Int32:
                     row.add_items()->set_int32_value(cell.AsValue<i32>());
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT32);
                     break;
                 case NScheme::NTypeIds::Uint32:
                     row.add_items()->set_uint32_value(cell.AsValue<ui32>());
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT32);
                     break;
                 case NScheme::NTypeIds::Int64:
                     row.add_items()->set_int64_value(cell.AsValue<i64>());
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::INT64);
                     break;
                 case NScheme::NTypeIds::Uint64:
                     row.add_items()->set_uint64_value(cell.AsValue<ui64>());
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UINT64);
                     break;
                 case NScheme::NTypeIds::Double:
                     row.add_items()->set_double_value(cell.AsValue<double>());
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::DOUBLE);
                     break;
                 case NScheme::NTypeIds::Float:
                     row.add_items()->set_float_value(cell.AsValue<float>());
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::FLOAT);
                     break;
                 case NScheme::NTypeIds::Utf8:
                     row.add_items()->set_text_value(""); // XXX
-                    column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
                     break;
                 default:
                     *row.add_items() = it->second.DefaultFromLiteral.value();
