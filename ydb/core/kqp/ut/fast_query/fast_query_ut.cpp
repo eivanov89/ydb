@@ -456,6 +456,67 @@ Y_UNIT_TEST(ShouldSelect) {
     UNIT_ASSERT_VALUES_EQUAL(discount, 7.0);
 }
 
+Y_UNIT_TEST(ShouldSelectKeyPrefix) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_D_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST) VALUES
+            (1, 1, 1, 0, "credit1", "last1"),
+            (1, 1, 2, 123, "credit1-2", "last1-2"),
+            (13, 11, 17, 7, "credit2", "last2");
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query = R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id AS Int32;
+        DECLARE $c_d_id AS Int32;
+
+        SELECT C_DISCOUNT, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $c_w_id
+           AND C_D_ID = $c_d_id;
+    )";
+
+    auto txControl = TTxControl::BeginTx().CommitTx();
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_w_id").Int32(1).Build()
+        .AddParam("$c_d_id").Int32(1).Build()
+        .Build();
+
+    auto result = session.ExecuteDataQuery(query, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser(result.GetResultSet(0));
+    UNIT_ASSERT(resultParser.TryNextRow());
+
+    auto discount = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount, 0.0);
+
+    UNIT_ASSERT(resultParser.TryNextRow());
+    auto discount2 = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount2, 123.0);
+}
+
 Y_UNIT_TEST(ShouldSelectWhenCustomParamNames) {
     TKikimrRunner kikimr;
     kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
