@@ -27,9 +27,11 @@ struct TFastQuery {
         UNSUPPORTED = 0,
         SELECT_QUERY,
         SELECT_IN_QUERY,
+        UPSERT,
     };
 
     EExecutionType ExecutionType = EExecutionType::UNSUPPORTED;
+    TString OriginalQuery;
     size_t OriginalQueryHash = 0;
 
     TString Database;
@@ -54,6 +56,33 @@ struct TFastQuery {
     TVector<size_t> OrderedWhereSelectInColumns;
 
     TPostgresQuery PostgresQuery;
+
+    // upsert stuff
+
+    enum class EParamType {
+        UNKNOWN = 0,
+        INT32,
+        INT64,
+        DOUBLE,
+        TIMESTAMP,
+        TEXT,
+    };
+
+    struct TUpsertParam {
+        TString Name;
+        EParamType Type;
+        TString ColumnName;
+        bool IsOptional = false;
+
+        bool operator==(const TUpsertParam& other) const {
+            return Name == other.Name && Type == other.Type
+                && ColumnName == other.ColumnName && IsOptional == other.IsOptional;
+        }
+    };
+
+    TVector<TString> ColumnsToUpsert;
+    TVector<TUpsertParam> UpsertParams;
+    TVector<size_t> OrderedKeyParams; // e.g. indices for p5, p1, p2
 
     TString ToString() const;
 };
