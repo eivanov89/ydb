@@ -241,6 +241,89 @@ public:
     TFastQueryPtr& FastQuery;
 };
 
+TFastQuery::EParamType GetParamType(const std::string& typeStr) {
+    static const std::unordered_map<std::string, TFastQuery::EParamType> typeMap = {
+        {"Int32", TFastQuery::EParamType::INT32},
+        {"Int64", TFastQuery::EParamType::INT64},
+        {"Double", TFastQuery::EParamType::DOUBLE},
+        {"Timestamp", TFastQuery::EParamType::TIMESTAMP},
+        {"Text", TFastQuery::EParamType::TEXT}
+    };
+
+    auto it = typeMap.find(typeStr);
+    return (it != typeMap.end()) ? it->second : TFastQuery::EParamType::UNKNOWN;
+}
+
+void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
+    // Only upserts like this one for now:
+    //  DECLARE $batch AS List<Struct<p1:Int32?, p2:Int32, p3:Int32, p4:Int32>>;
+    //  UPSERT INTO `oorder` SELECT p1 AS `O_CARRIER_ID`, p2 AS `O_ID`, p3 AS `O_D_ID`, p4 AS `O_W_ID`
+    //         FROM AS_TABLE($batch);
+    //
+
+    // XXX avoid multiline issues
+    TString query;
+    query.reserve(yqlQuery.size());
+    for (auto ch: yqlQuery) {
+        if (ch != '\n') {
+            query.append(ch);
+        } else {
+            query.append(' ');
+        }
+    }
+
+    const std::regex upsertPattern(R"(DECLARE\s+\$batch\s+AS\s+List.*?;[ \t]*UPSERT\s+INTO\s+`?([\w\d_]+)`?\s+SELECT\s+.*?\s+FROM\s+AS_TABLE\(\s*\$batch\s*\))", std::regex::icase);
+    std::smatch match;
+    if (std::regex_search(query.begin(), query.end(), match, upsertPattern)) {
+        result->TableName = match[1].str();
+    } else {
+        return;
+    }
+
+    std::string::const_iterator searchStart(query.cbegin());
+
+    // find param types
+    const std::regex declarePattern(R"(\s*p(\d+):\s*([A-Za-z0-9?]+))", std::regex::icase);
+    std::unordered_map<TString, TFastQuery::EParamType> paramTypeMap;
+    std::unordered_set<TString> optionalSet;
+    while (std::regex_search(searchStart, query.cend(), match, declarePattern)) {
+        if (match.size() == 3) {
+            TString paramName = "p" + match[1].str();  // "p1", "p2", etc.
+            std::string typeStr = match[2].str();          // "Int32", "Double?", etc.
+
+            if (typeStr.back() == '?') {
+                typeStr.pop_back();
+                optionalSet.insert(paramName);
+            }
+
+            paramTypeMap[paramName] = GetParamType(typeStr);
+        }
+        searchStart = match.suffix().first;
+    }
+
+    // params and columns
+    const std::regex columnPattern(R"(\s*([\w\d_]+)\s+AS\s+`?([\w\d_]+)`?)", std::regex::icase);
+    while (std::regex_search(searchStart, query.cend(), match, columnPattern)) {
+        if (match.size() == 3) {
+            TString paramName = match[1].str();   // "p1", "p2", etc.
+            TString columnName = match[2].str();  // "C_W_ID", "C_D_ID", etc.
+
+            result->UpsertParams.push_back({
+                paramName,
+                paramTypeMap[paramName],
+                columnName,
+                optionalSet.find(paramName) != optionalSet.end()
+            });
+            result->ColumnsToUpsert.push_back(columnName);
+        }
+        searchStart = match.suffix().first;
+    }
+
+    if (!result->UpsertParams.empty() && !result->ColumnsToUpsert.empty()) {
+        result->ExecutionType = TFastQuery::EExecutionType::UPSERT;
+    }
+}
+
 } // anonymous
 
 TString TFastQuery::ToString() const {
@@ -315,11 +398,18 @@ TPostgresQuery YQL2Postgres(const TString& yqlQuery) {
 TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
     TFastQueryPtr result = std::make_shared<TFastQuery>();
 
+    result->OriginalQuery = yqlQuery;
     result->OriginalQueryHash = THash<TString>()(yqlQuery);
 
     // for some dumb reason our parser returns "limitOption": "LIMIT_OPTION_COUNT", when there is
     // no limit. So we have to check it here manually
     if (std::regex_search(yqlQuery.c_str(), LimitRegex)) {
+        return result;
+    }
+
+    // check if this is upsert
+    TryCompileUpsert(yqlQuery, result);
+    if (result->ExecutionType != TFastQuery::EExecutionType::UNSUPPORTED) {
         return result;
     }
 

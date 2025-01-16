@@ -26,6 +26,8 @@
 #include <ydb/core/kqp/provider/yql_kikimr_results.h>
 #include <ydb/core/kqp/rm_service/kqp_snapshot_manager.h>
 #include <ydb/core/ydb_convert/ydb_convert.h>
+#include <ydb/core/tx/data_events/events.h>
+#include <ydb/core/tx/data_events/payload_helper.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/schemeshard/schemeshard.h>
 #include <ydb/core/kqp/rm_service/kqp_rm_service.h>
@@ -196,7 +198,7 @@ struct TKqpCleanupCtx {
     }
 };
 
-class TFastSelectExecutorActor : public TActorBootstrapped<TFastSelectExecutorActor> {
+class TFastSelectExecutorActor : public TActor<TFastSelectExecutorActor> {
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::KQP_FAST_QUERY_ACTOR;
@@ -208,31 +210,22 @@ public:
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
             const IKqpGateway::TKqpSnapshot& snapshot,
-            const TKqpQueryState::TQueryTxId& txId)
-        : ReplyTo(replyTo)
+            const TKqpQueryState::TQueryTxId& userTxId)
+        : TActor(&TThis::ExecuteState)
+        , ReplyTo(replyTo)
         , SessionId(sessionId)
         , FastQuery(std::move(fastQuery))
         , Parameters(params)
         , Snapshot(snapshot)
-        , TxId(txId)
+        , UserTxId(userTxId)
     {
     }
 
-    void Bootstrap() {
-        LOG_T("bootstrapped for query " << FastQuery->PostgresQuery.Query);
-        Become(&TThis::ExecuteState);
-
-        if (FastQuery->ResolvedColumns.empty()) {
-            return ResolveSchema(TlsActivationContext->AsActorContext());
-        }
-
-        ResolveShards(TlsActivationContext->AsActorContext());
-    }
-
-private:
     STATEFN(ExecuteState) {
         try {
             switch (ev->GetTypeRewrite()) {
+                hFunc(TEvKqpExecuter::TEvTxRequest, Handle);
+                hFunc(TEvTxUserProxy::TEvAllocateTxIdResult, Handle);
                 hFunc(TEvents::TEvUndelivered, Handle);
                 HFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
                 HFunc(TEvTxProxySchemeCache::TEvResolveKeySetResult, Handle);
@@ -245,6 +238,26 @@ private:
         } catch (const yexception& ex) {
             InternalError(ex.what());
         }
+    }
+
+private:
+    void Handle(TEvKqpExecuter::TEvTxRequest::TPtr& ev) {
+        OnTxId(ev->Get()->Record.GetRequest().GetTxId());
+    }
+
+    void Handle(TEvTxUserProxy::TEvAllocateTxIdResult::TPtr& ev) {
+        OnTxId(ev->Get()->TxId);
+    }
+
+    void OnTxId(ui64 txId) {
+        LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
+        TxId = txId;
+
+        if (FastQuery->ResolvedColumns.empty()) {
+            return ResolveSchema(TlsActivationContext->AsActorContext());
+        }
+
+        ResolveShards(TlsActivationContext->AsActorContext());
     }
 
     void ResolveSchema(const TActorContext &ctx) {
@@ -498,7 +511,7 @@ private:
             }
         }
 
-        queryResponse.MutableTxMeta()->set_id(TxId.GetValue().GetHumanStr());
+        queryResponse.MutableTxMeta()->set_id(UserTxId.GetValue().GetHumanStr());
 
         LOG_T("received read result from shard " << ResolvedShardId << ", replying: " << response->ToString());
 
@@ -555,7 +568,9 @@ private:
     TFastQueryPtr FastQuery;
     ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
     IKqpGateway::TKqpSnapshot Snapshot;
-    TKqpQueryState::TQueryTxId TxId;
+    TKqpQueryState::TQueryTxId UserTxId;
+
+    ui64 TxId = 0;
 
     TVector<TCell> KeyCells;
     std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
@@ -563,7 +578,7 @@ private:
 
 };
 
-class TFastSelectInExecutorActor : public TActorBootstrapped<TFastSelectInExecutorActor> {
+class TFastSelectInExecutorActor : public TActor<TFastSelectInExecutorActor> {
     struct TVecHash {
         size_t operator()(const TVector<int32_t> vec) const {
             if (vec.empty()) {
@@ -590,31 +605,22 @@ public:
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
             const IKqpGateway::TKqpSnapshot& snapshot,
-            const TKqpQueryState::TQueryTxId& txId)
-        : ReplyTo(replyTo)
+            const TKqpQueryState::TQueryTxId& userTxId)
+        : TActor(&TThis::ExecuteState)
+        , ReplyTo(replyTo)
         , SessionId(sessionId)
         , FastQuery(std::move(fastQuery))
         , Parameters(params)
         , Snapshot(snapshot)
-        , TxId(txId)
+        , UserTxId(userTxId)
     {
     }
 
-    void Bootstrap() {
-        LOG_T("bootstrapped for query " << FastQuery->PostgresQuery.Query);
-        Become(&TThis::ExecuteState);
-
-        if (FastQuery->ResolvedColumns.empty()) {
-            return ResolveSchema(TlsActivationContext->AsActorContext());
-        }
-
-        ResolveShards(TlsActivationContext->AsActorContext());
-    }
-
-private:
     STATEFN(ExecuteState) {
         try {
             switch (ev->GetTypeRewrite()) {
+                hFunc(TEvKqpExecuter::TEvTxRequest, Handle);
+                hFunc(TEvTxUserProxy::TEvAllocateTxIdResult, Handle);
                 hFunc(TEvents::TEvUndelivered, Handle);
                 HFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
                 HFunc(TEvTxProxySchemeCache::TEvResolveKeySetResult, Handle);
@@ -627,6 +633,26 @@ private:
         } catch (const yexception& ex) {
             InternalError(ex.what());
         }
+    }
+
+private:
+    void Handle(TEvKqpExecuter::TEvTxRequest::TPtr& ev) {
+        OnTxId(ev->Get()->Record.GetRequest().GetTxId());
+    }
+
+    void Handle(TEvTxUserProxy::TEvAllocateTxIdResult::TPtr& ev) {
+        OnTxId(ev->Get()->TxId);
+    }
+
+    void OnTxId(ui64 txId) {
+        LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
+        TxId = txId;
+
+        if (FastQuery->ResolvedColumns.empty()) {
+            return ResolveSchema(TlsActivationContext->AsActorContext());
+        }
+
+        ResolveShards(TlsActivationContext->AsActorContext());
     }
 
     void ResolveSchema(const TActorContext &ctx) {
@@ -774,7 +800,7 @@ private:
         auto& queryResponse = *Response->Record.MutableResponse();
         queryResponse.SetSessionId(SessionId);
         auto& resultSets = *queryResponse.AddYdbResults();
-        queryResponse.MutableTxMeta()->set_id(TxId.GetValue().GetHumanStr());
+        queryResponse.MutableTxMeta()->set_id(UserTxId.GetValue().GetHumanStr());
         for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
             const auto& name = FastQuery->ColumnsToSelect[i];
             auto it = FindCaseI(FastQuery->ResolvedColumns, name);
@@ -833,7 +859,7 @@ private:
             record.MutableTableId()->SetSchemaVersion(FastQuery->TableId.SchemaVersion);
 
             // TODO
-            Y_UNUSED(TxId);
+            Y_UNUSED(UserTxId);
 
             for (const auto& name: FastQuery->ColumnsToSelect) {
                 auto it = FindCaseI(FastQuery->ResolvedColumns, name);
@@ -983,7 +1009,383 @@ private:
     TFastQueryPtr FastQuery;
     ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
     IKqpGateway::TKqpSnapshot Snapshot;
-    TKqpQueryState::TQueryTxId TxId;
+    TKqpQueryState::TQueryTxId UserTxId;
+
+    ui64 TxId = 0;
+
+    struct TResolvedData {
+        TVector<TCell> KeyCells;
+        TVector<int32_t> KeyInts;
+        std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
+        ui64 ResolvedShardId = 0;
+    };
+    TVector<TResolvedData> ResolvedPoints;
+
+    size_t WaitingRepliesCount = 0;
+    std::unique_ptr<TEvKqp::TEvQueryResponse> Response;
+};
+
+class TFastUpsertActor : public TActor<TFastUpsertActor> {
+public:
+    static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+        return NKikimrServices::TActivity::KQP_FAST_QUERY_ACTOR;
+    }
+
+public:
+    TFastUpsertActor(const TActorId& replyTo,
+            const TString& sessionId,
+            TFastQueryPtr fastQuery,
+            const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
+            const IKqpGateway::TKqpSnapshot& snapshot,
+            const TKqpQueryState::TQueryTxId& userTxId)
+        : TActor(&TThis::ExecuteState)
+        , ReplyTo(replyTo)
+        , SessionId(sessionId)
+        , FastQuery(std::move(fastQuery))
+        , Parameters(params)
+        , Snapshot(snapshot)
+        , UserTxId(userTxId)
+    {
+    }
+
+    STATEFN(ExecuteState) {
+        try {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvKqpExecuter::TEvTxRequest, Handle);
+                hFunc(TEvTxUserProxy::TEvAllocateTxIdResult, Handle);
+                hFunc(TEvents::TEvUndelivered, Handle);
+                HFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
+                HFunc(TEvTxProxySchemeCache::TEvResolveKeySetResult, Handle);
+                HFunc(NKikimr::NEvents::TDataEvents::TEvWriteResult, HandleWrite);
+            default:
+                UnexpectedEvent("ExecuteState", ev);
+            }
+        } catch (const TRequestFail& ex) {
+            ReplyQueryError(ex.Status, ex.what(), ex.Issues);
+        } catch (const yexception& ex) {
+            InternalError(ex.what());
+        }
+    }
+
+private:
+    void Handle(TEvKqpExecuter::TEvTxRequest::TPtr& ev) {
+        OnTxId(ev->Get()->Record.GetRequest().GetTxId());
+    }
+
+    void Handle(TEvTxUserProxy::TEvAllocateTxIdResult::TPtr& ev) {
+        OnTxId(ev->Get()->TxId);
+    }
+
+    void OnTxId(ui64 txId) {
+        LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
+        TxId = txId;
+
+        if (FastQuery->ResolvedColumns.empty()) {
+            return ResolveSchema(TlsActivationContext->AsActorContext());
+        }
+
+        ResolveShards(TlsActivationContext->AsActorContext());
+    }
+
+    void ResolveSchema(const TActorContext &ctx) {
+        TString path = FastQuery->Database + "/" + FastQuery->TableName;
+        LOG_T("Resolving " << path);
+
+        auto request = std::make_unique<NSchemeCache::TSchemeCacheNavigate>();
+        NSchemeCache::TSchemeCacheNavigate::TEntry entry;
+        entry.Path = ::NKikimr::SplitPath(path);
+        if (entry.Path.empty()) {
+            return ReplyQueryError(Ydb::StatusIds::NOT_FOUND, "Invalid table path specified");
+        }
+        entry.Operation = NSchemeCache::TSchemeCacheNavigate::OpTable;
+        request->ResultSet.emplace_back(entry);
+        Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(request.release()));
+    }
+
+    void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext &ctx) {
+        const auto* response = ev->Get();
+        Y_ABORT_UNLESS(response->Request != nullptr);
+
+        Y_ABORT_UNLESS(response->Request->ResultSet.size() == 1);
+        const auto& entry = response->Request->ResultSet.front();
+
+        FastQuery->TableId = entry.TableId;
+
+        if (entry.Status != NSchemeCache::TSchemeCacheNavigate::EStatus::Ok) {
+            return ReplyQueryError(Ydb::StatusIds::SCHEME_ERROR, ToString(entry.Status));
+        }
+
+        FastQuery->ResolvedColumns.reserve(entry.Columns.size());
+        FastQuery->Columns.reserve(entry.Columns.size());
+        FastQuery->KeyColumns.reserve(entry.Columns.size());
+        FastQuery->KeyColumnTypes.reserve(entry.Columns.size());
+        for (const auto& [_, info] : entry.Columns) {
+            FastQuery->ResolvedColumns[info.Name] = info;
+            FastQuery->Columns.emplace_back(info.Id, TKeyDesc::EColumnOperation::Read, info.PType, 0, 0);
+            if (info.KeyOrder != -1) {
+                FastQuery->KeyColumns.emplace_back(info);
+                FastQuery->KeyColumnTypes.emplace_back(info.PType);
+            }
+        }
+
+        for (const auto& keyColumn: FastQuery->KeyColumns) {
+            for (size_t i = 0; i < FastQuery->UpsertParams.size(); ++i) {
+                if (IsEqual(keyColumn.Name, FastQuery->UpsertParams[i].ColumnName)) {
+                    FastQuery->OrderedKeyParams.push_back(i);
+                }
+            }
+        }
+
+        LOG_T("Resolved to tableId " << FastQuery->TableId << " with key columns size " << FastQuery->KeyColumns.size()
+            << " and total columns size " << FastQuery->ResolvedColumns.size()
+            << ", OrderedKeyParams size " << FastQuery->OrderedKeyParams.size());
+
+        ResolveShards(ctx);
+    }
+
+    void ResolveShards(const TActorContext &) {
+        auto it = FindCaseI(Parameters, "$batch");
+        if (it == Parameters.end()) {
+            TStringStream ss;
+            ss << "Parameter $batch not found, params are: ";
+            for (const auto& param: Parameters) {
+                ss << param.first << ",";
+            }
+            return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
+        }
+
+        const auto& batchParam = it->second;
+        const auto& batchValue = batchParam.Getvalue();
+        if (batchValue.items_size() == 0) {
+            return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "empty batch");
+        }
+
+        LOG_T("l " << batchValue.items_size() << ": " << batchParam.AsJSON());
+
+        ResolvedPoints.resize(batchValue.items_size());
+        auto request = std::make_unique<NSchemeCache::TSchemeCacheRequest>();
+
+        for (int i = 0; i < batchValue.items_size(); ++i) {
+            auto& resolvedData = ResolvedPoints[i];
+            resolvedData.KeyCells.reserve(FastQuery->OrderedKeyParams.size());
+            const auto& listItems = batchValue.Getitems(i);
+            for (size_t j = 0; j < FastQuery->OrderedKeyParams.size(); ++j) {
+                const auto& item = listItems.Getitems(j);
+                LOG_T("Key column " << i << " with value " << item.Getint32_value());
+                resolvedData.KeyCells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+            }
+
+            TTableRange range(resolvedData.KeyCells);
+
+            // XXX: for simplicity request all columns
+            THolder<NKikimr::TKeyDesc> keyDesc(
+                new TKeyDesc(
+                    FastQuery->TableId,
+                    range,
+                    TKeyDesc::ERowOperation::Read,
+                    FastQuery->KeyColumnTypes,
+                    FastQuery->Columns));
+
+            request->ResultSet.emplace_back(std::move(keyDesc));
+        }
+
+        auto resolveRequest = std::make_unique<TEvTxProxySchemeCache::TEvResolveKeySet>(request.release());
+        Send(MakeSchemeCacheID(), resolveRequest.release());
+    }
+
+    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+        TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
+
+        for (size_t i = 0; i < msg->Request->ResultSet.size(); ++i) {
+            auto& resolvedData = ResolvedPoints[i];
+            auto& result = msg->Request->ResultSet[i];
+            resolvedData.ResolvedKeys.reset(result.KeyDescription.Release());
+
+            const auto& partitions = resolvedData.ResolvedKeys->GetPartitions();
+            if (partitions.size() == 0) {
+                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Failed to resolve shards");
+            }
+            // just a sanity check
+            if (partitions.size() != 1) {
+                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Key resolved to multiple shards");
+            }
+
+            resolvedData.ResolvedShardId = partitions[0].ShardId;
+
+            LOG_T("Table [" << FastQuery->TableId << "] point" << i << " shard: " << resolvedData.ResolvedShardId);
+        }
+
+        Execute();
+    }
+
+    void Execute() {
+        Response = std::make_unique<TEvKqp::TEvQueryResponse>();
+        auto& queryResponse = *Response->Record.MutableResponse();
+        queryResponse.SetSessionId(SessionId);
+
+        auto it = FindCaseI(Parameters, "$batch");
+        const auto& batchParam = it->second;
+        const auto& batchValue = batchParam.Getvalue();
+        if (batchValue.items_size() == 0) {
+            return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "empty batch");
+        }
+
+        // we suppose that here the order of items is the same as
+        // UpsertParams and corresponding ColumnsToUpsert
+        std::vector<ui32> columnIds;
+        columnIds.reserve(FastQuery->ColumnsToUpsert.size());
+        for (const auto& columnName: FastQuery->ColumnsToUpsert) {
+            auto it = FastQuery->ResolvedColumns.find(columnName);
+            if (it == FastQuery->ResolvedColumns.end()) {
+                TStringStream ss;
+                ss << "Failed to resolve column '" << columnName << "'";
+                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
+            }
+            const auto& info = it->second;
+            columnIds.emplace_back(info.Id);
+        }
+
+        // naive impl: we don't gether rows into batches
+        // also we suppose that optional fields are at the end, TODO
+        for (int i = 0; i < batchValue.items_size(); ++i) {
+            TVector<TCell> cells;
+            const auto& listItems = batchValue.Getitems(i);
+            for (size_t j = 0; j < FastQuery->ColumnsToUpsert.size(); ++j) {
+                const auto& item = listItems.Getitems(j);
+                const auto& colInfo = FastQuery->ResolvedColumns[FastQuery->ColumnsToUpsert[j]];
+                switch (colInfo.PType.GetTypeId()) {
+                case NYql::NProto::Int32:
+                case NYql::NProto::Timestamp:
+                    cells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+                    break;
+                case NYql::NProto::Uint32:
+                    cells.emplace_back(TCell::Make<ui32>(item.Getuint32_value()));
+                    break;
+                case NYql::NProto::Int64:
+                case NYql::NProto::Timestamp64:
+                    cells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
+                    break;
+                case NYql::NProto::Uint64:
+                    cells.emplace_back(TCell::Make<ui64>(item.Getuint64_value()));
+                    break;
+                case NYql::NProto::Double:
+                    cells.emplace_back(TCell::Make<double>(item.Getdouble_value()));
+                    break;
+                case NYql::NProto::Float:
+                    cells.emplace_back(TCell::Make<double>(item.Getfloat_value()));
+                    break;
+                default: {
+                    TStringStream ss;
+                    ss << "unknown type " << colInfo.PType.GetTypeId() << " of column '"
+                       << FastQuery->ColumnsToUpsert[j] << "'";
+                    LOG_T(ss.Str());
+                    return ReplyQueryError(Ydb::StatusIds::UNSUPPORTED, ss.Str());
+                }
+                }
+            }
+
+            TSerializedCellMatrix matrix(cells, 1, cells.size());
+            auto evWrite = std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
+                TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE);
+            ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
+                .AddDataToPayload(matrix.ReleaseBuffer());
+            evWrite->AddOperation(
+                NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
+                FastQuery->TableId,
+                columnIds,
+                payloadIndex,
+                NKikimrDataEvents::FORMAT_CELLVEC);
+
+            const auto& resolvedData = ResolvedPoints[i];
+            LOG_T("Sending write to " << resolvedData.ResolvedShardId);
+            Send<ESendingType::Tail>(
+                NKikimr::MakePipePerNodeCacheID(false),
+                new TEvPipeCache::TEvForward(evWrite.release(), resolvedData.ResolvedShardId, true),
+                IEventHandle::FlagTrackDelivery,
+                0,
+                0);
+            ++WaitingRepliesCount;
+        }
+    }
+
+    void HandleWrite(NKikimr::NEvents::TDataEvents::TEvWriteResult::TPtr ev, const TActorContext &ctx) {
+        Y_UNUSED(ev);
+        Y_UNUSED(ctx);
+        --WaitingRepliesCount;
+
+        const auto* msg = ev->Get();
+        if (msg->Record.GetStatus() != NKikimrDataEvents::TEvWriteResult::STATUS_COMPLETED) {
+            LOG_T("received failed write result from shard " << ev->Sender << ": "
+                << msg->ToString()
+                << ", left results " << WaitingRepliesCount);
+            return ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, "TEvWrite failed");
+        }
+
+        LOG_T("received successfull write result from shard " << ev->Sender << ": "
+            << msg->ToString()
+            << ", left results " << WaitingRepliesCount);
+
+        if (WaitingRepliesCount == 0) {
+            Response->Record.SetYdbStatus(Ydb::StatusIds::SUCCESS);
+            LOG_T("Replying: " << Response->ToString());
+
+            Send<ESendingType::Tail>(ReplyTo, Response.release());
+            PassAway();
+        }
+    }
+
+    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+        // assume, that it's from DS, because other messages are to local services
+        Execute();
+    }
+
+    void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+        InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
+            << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
+            << " sender: " << ev->Sender);
+    }
+
+    void InternalError(const TString& message) {
+        LOG_E("Internal error, message: " << message);
+        ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, message);
+    }
+
+    void ReplyQueryError(Ydb::StatusIds::StatusCode ydbStatus,
+        const TString& message,
+        std::optional<google::protobuf::RepeatedPtrField<Ydb::Issue::IssueMessage>> issues = {})
+    {
+        LOG_W(" error:" << message);
+
+        auto queryResponse = std::make_unique<TEvKqp::TEvQueryResponse>();
+        queryResponse->Record.SetYdbStatus(ydbStatus);
+
+        if (issues) {
+            auto* response = queryResponse->Record.MutableResponse();
+            for (auto& i : *issues) {
+                response->AddQueryIssues()->Swap(&i);
+            }
+        }
+
+        Send<ESendingType::Tail>(ReplyTo, queryResponse.release());
+        PassAway();
+    }
+
+    TString LogPrefix() const {
+        TStringBuilder result = TStringBuilder()
+            << "Fast executor SessionId: " << SessionId << ", "
+            << "ActorId: " << SelfId() << ", ";
+        return result;
+    }
+
+private:
+    TActorId ReplyTo;
+    TString SessionId;
+    TFastQueryPtr FastQuery;
+    ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
+    IKqpGateway::TKqpSnapshot Snapshot;
+    TKqpQueryState::TQueryTxId UserTxId;
+
+    ui64 TxId = 0;
 
     struct TResolvedData {
         TVector<TCell> KeyCells;
@@ -1728,15 +2130,26 @@ public:
                 QueryState->TxCtx->SnapshotHandle.Snapshot,
                 QueryState->TxId);
             break;
+        case TFastQuery::EExecutionType::UPSERT:
+            actor = new TFastUpsertActor(
+                SelfId(),
+                SessionId,
+                QueryState->FastQuery,
+                QueryState->GetYdbParameters(),
+                QueryState->TxCtx->SnapshotHandle.Snapshot,
+                QueryState->TxId);
         default:
             Y_VERIFY(actor);
         }
 
-        // same mailbox + tail
-        FastQueryExecutor = TlsActivationContext->ExecutorThread.RegisterActor<ESendingType::Tail>(
+        // same mailbox
+        FastQueryExecutor = TlsActivationContext->ExecutorThread.RegisterActor(
             actor,
             &TlsActivationContext->Mailbox,
             this->SelfId());
+
+        auto ev = std::make_unique<TEvTxUserProxy::TEvProposeKqpTransaction>(FastQueryExecutor);
+        Send<ESendingType::Tail>(MakeTxProxyID(), ev.release());
     }
 
     void BeginTx(const Ydb::Table::TransactionSettings& settings) {
