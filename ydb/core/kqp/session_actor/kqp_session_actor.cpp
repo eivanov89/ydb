@@ -564,6 +564,21 @@ private:
 };
 
 class TFastSelectInExecutorActor : public TActorBootstrapped<TFastSelectInExecutorActor> {
+    struct TVecHash {
+        size_t operator()(const TVector<int32_t> vec) const {
+            if (vec.empty()) {
+                return 0;
+            }
+            size_t sum = 0;
+            for (auto item: vec) {
+                sum += item;
+            }
+            return sum % vec.size();
+        }
+    };
+
+    using TRequestedKeysSet = THashSet<TVector<int32_t>, TVecHash>;
+
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::KQP_FAST_QUERY_ACTOR;
@@ -689,12 +704,10 @@ private:
 
             resolvedData.KeyCells.reserve(FastQuery->WhereSelectInColumns.size());
 
-            // needed
             for (size_t keyColumnIndex: FastQuery->OrderedWhereSelectInColumns) {
                 const auto& keyColumnName = FastQuery->WhereSelectInColumns[keyColumnIndex];
                 auto position = pointToResolve[keyColumnIndex];
 
-                LOG_T("Key column '" << keyColumnName << "' with position " << position);
                 TString varName = "$" + FastQuery->PostgresQuery.PositionalNames[position - 1];
                 auto it = FindCaseI(Parameters, varName);
                 if (it == Parameters.end()) {
@@ -707,7 +720,9 @@ private:
                 }
 
                 const auto& typedValue = it->second;
+                LOG_T("Key column '" << keyColumnName << "' with value " << typedValue.Getvalue().Getint32_value());
                 resolvedData.KeyCells.emplace_back(TCell::Make<i32>(typedValue.Getvalue().Getint32_value()));
+                resolvedData.KeyInts.push_back(typedValue.Getvalue().Getint32_value());
             }
 
             TTableRange range(resolvedData.KeyCells);
@@ -800,8 +815,14 @@ private:
             }
         }
 
+        TRequestedKeysSet requested;
         for (size_t i = 0; i < FastQuery->WhereSelectInPos.size(); ++i) {
             auto& resolvedData = ResolvedPoints[i];
+
+            // IN (1, 2, 1) might have duplicated which we must eliminate
+            if (!requested.insert(resolvedData.KeyInts).second) {
+                continue;
+            }
 
             auto request = std::make_unique<NKikimr::TEvDataShard::TEvRead>();
             auto& record = request->Record;
@@ -847,7 +868,8 @@ private:
         --WaitingRepliesCount;
 
         const auto* msg = ev->Get();
-        LOG_T("received read result from shard " << ev->Sender << ": " << msg->ToString()
+        LOG_T("received read result from shard " << ev->Sender << " with " << msg->GetRowsCount() << " rows: "
+            << msg->ToString()
             << ", left results " << WaitingRepliesCount);
 
         auto& queryResponse = *Response->Record.MutableResponse();
@@ -856,6 +878,8 @@ private:
         for (size_t rowNum = 0; rowNum < msg->GetRowsCount(); ++rowNum) {
             auto& row = *resultSets.Addrows();
             const auto& resultRow = msg->GetCells(rowNum);
+            LOG_T("adding result row of size " << resultRow.size() << ", requested cols size "
+                << FastQuery->ColumnsToSelect.size());
             for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
                 const auto& name = FastQuery->ColumnsToSelect[i];
                 auto it = FindCaseI(FastQuery->ResolvedColumns, name);
@@ -870,9 +894,11 @@ private:
 
                 // XXX XXX XXX (only some of the types)
                 switch (it->second.PType.GetTypeId()) {
-                case NScheme::NTypeIds::Int32:
+                case NScheme::NTypeIds::Int32: {
+                    LOG_T("Value of " << name << " is " << cell.AsValue<i32>());
                     row.add_items()->set_int32_value(cell.AsValue<i32>());
                     break;
+                }
                 case NScheme::NTypeIds::Uint32:
                     row.add_items()->set_uint32_value(cell.AsValue<ui32>());
                     break;
@@ -961,6 +987,7 @@ private:
 
     struct TResolvedData {
         TVector<TCell> KeyCells;
+        TVector<int32_t> KeyInts;
         std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
         ui64 ResolvedShardId = 0;
     };

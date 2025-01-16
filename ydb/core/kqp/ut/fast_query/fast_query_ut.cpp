@@ -730,6 +730,80 @@ Y_UNIT_TEST(ShouldSelectWithInMultiArg) {
     UNIT_ASSERT(!resultParser.TryNextRow());
 }
 
+Y_UNIT_TEST(ShouldSelectWithInMultiArgWithDuplicates) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+
+            PRIMARY KEY (C_W_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST) VALUES
+            (1, 1, 3, "credit1", "last1"),
+            (1, 2, 123, "credit1-2", "last1-2"),
+            (2, 1, 71, "credit21", "last21"),
+            (2, 17, 7, "credit2", "last2"),
+            (2, 11, 222, "c", "l"),
+            (3, 1, 111, "c", "l");
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query = R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id1 AS Int32;
+        DECLARE $c_id1 AS Int32;
+
+        DECLARE $c_w_id2 AS Int32;
+        DECLARE $c_id2 AS Int32;
+
+        DECLARE $c_w_id3 AS Int32;
+        DECLARE $c_id3 AS Int32;
+
+        SELECT C_DISCOUNT, C_LAST, C_CREDIT
+          FROM customer
+         WHERE (C_W_ID, C_ID) IN (($c_w_id1, $c_id1), ($c_w_id2, $c_id2), ($c_w_id3, $c_id3));
+    )";
+
+    auto txControl = TTxControl::BeginTx().CommitTx();
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_w_id1").Int32(1).Build()
+        .AddParam("$c_id1").Int32(1).Build()
+        .AddParam("$c_w_id2").Int32(2).Build()
+        .AddParam("$c_id2").Int32(17).Build()
+        .AddParam("$c_w_id3").Int32(1).Build()
+        .AddParam("$c_id3").Int32(1).Build()
+        .Build();
+
+    auto result = session.ExecuteDataQuery(query, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser(result.GetResultSet(0));
+    UNIT_ASSERT(resultParser.TryNextRow());
+
+    auto discount = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount, 3.0);
+
+    UNIT_ASSERT(resultParser.TryNextRow());
+    auto discount2 = *resultParser.ColumnParser("C_DISCOUNT").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(discount2, 7.0);
+
+    UNIT_ASSERT(!resultParser.TryNextRow());
+}
+
 Y_UNIT_TEST(ShouldSelectWithInMultiArgReversedWhere) {
     TKikimrRunner kikimr;
     kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
