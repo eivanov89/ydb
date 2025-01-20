@@ -80,9 +80,13 @@ struct TFastQuery {
         }
     };
 
+    // original order
     TVector<TString> ColumnsToUpsert;
     TVector<TUpsertParam> UpsertParams;
-    TVector<size_t> OrderedKeyParams; // e.g. indices for p5, p1, p2
+
+    // e.g. indices for p5, p1, p2 - index within ColumnsToUpsert / UpsertParams
+    TVector<size_t> OrderedKeyParams;
+    TVector<size_t> AllOrderedParams;
 
     TString ToString() const;
 };
