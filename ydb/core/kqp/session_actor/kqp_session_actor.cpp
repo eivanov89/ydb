@@ -1119,26 +1119,39 @@ private:
         FastQuery->Columns.reserve(entry.Columns.size());
         FastQuery->KeyColumns.reserve(entry.Columns.size());
         FastQuery->KeyColumnTypes.reserve(entry.Columns.size());
+
+        TVector<size_t> nonKeyColumnsOrder;
+        nonKeyColumnsOrder.reserve(entry.Columns.size());
         for (const auto& [_, info] : entry.Columns) {
             FastQuery->ResolvedColumns[info.Name] = info;
             FastQuery->Columns.emplace_back(info.Id, TKeyDesc::EColumnOperation::Read, info.PType, 0, 0);
             if (info.KeyOrder != -1) {
                 FastQuery->KeyColumns.emplace_back(info);
                 FastQuery->KeyColumnTypes.emplace_back(info.PType);
-            }
-        }
-
-        for (const auto& keyColumn: FastQuery->KeyColumns) {
-            for (size_t i = 0; i < FastQuery->UpsertParams.size(); ++i) {
-                if (IsEqual(keyColumn.Name, FastQuery->UpsertParams[i].ColumnName)) {
-                    FastQuery->OrderedKeyParams.push_back(i);
+                for (size_t i = 0; i < FastQuery->UpsertParams.size(); ++i) {
+                    if (IsEqual(info.Name, FastQuery->UpsertParams[i].ColumnName)) {
+                        FastQuery->OrderedKeyParams.push_back(i);
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < FastQuery->UpsertParams.size(); ++i) {
+                    if (IsEqual(info.Name, FastQuery->UpsertParams[i].ColumnName)) {
+                        nonKeyColumnsOrder.push_back(i);
+                    }
                 }
             }
         }
 
+        FastQuery->AllOrderedParams = FastQuery->OrderedKeyParams;
+        FastQuery->AllOrderedParams.insert(
+            FastQuery->AllOrderedParams.end(),
+            nonKeyColumnsOrder.begin(),
+            nonKeyColumnsOrder.end());
+
         LOG_T("Resolved to tableId " << FastQuery->TableId << " with key columns size " << FastQuery->KeyColumns.size()
             << " and total columns size " << FastQuery->ResolvedColumns.size()
-            << ", OrderedKeyParams size " << FastQuery->OrderedKeyParams.size());
+            << ", OrderedKeyParams size " << FastQuery->OrderedKeyParams.size()
+            << ", AllOrderedParams size " << FastQuery->AllOrderedParams.size());
 
         ResolveShards(ctx);
     }
@@ -1155,6 +1168,7 @@ private:
         }
 
         const auto& batchParam = it->second;
+        const auto& batchType = batchParam.Gettype().Getlist_type().Getitem().Getstruct_type();
         const auto& batchValue = batchParam.Getvalue();
         if (batchValue.items_size() == 0) {
             return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "empty batch");
@@ -1170,9 +1184,26 @@ private:
             resolvedData.KeyCells.reserve(FastQuery->OrderedKeyParams.size());
             const auto& listItems = batchValue.Getitems(i);
             for (size_t j = 0; j < FastQuery->OrderedKeyParams.size(); ++j) {
-                const auto& item = listItems.Getitems(j);
-                LOG_T("Key column " << i << " with value " << item.Getint32_value());
-                resolvedData.KeyCells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+                size_t itemIndex = FastQuery->OrderedKeyParams[j];
+                const auto& item = listItems.Getitems(itemIndex);
+                const auto& listType = batchType.Getmembers(itemIndex).Gettype();
+
+                ::Ydb::Type::PrimitiveTypeId itemType = Ydb::Type::INT32;
+                if (listType.has_optional_type()) {
+                    itemType = listType.Getoptional_type().Getitem().Gettype_id();
+                } else {
+                    itemType = listType.Gettype_id();
+                }
+                if (itemType == Ydb::Type::INT64) {
+                    LOG_T("Request key column " << j << " mapped to int64 item " << itemIndex
+                        << "  with value " << item.Getint64_value() << ": " << listType.AsJSON());
+                    resolvedData.KeyCells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
+                } else {
+                    // XXX: we don't check all possible types
+                    LOG_T("Request key column " << j << " mapped to item " << itemIndex
+                        << "  with value " << item.Getint32_value()  << ": " << listType.AsJSON());
+                    resolvedData.KeyCells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+                }
             }
 
             TTableRange range(resolvedData.KeyCells);
@@ -1234,7 +1265,8 @@ private:
         // UpsertParams and corresponding ColumnsToUpsert
         std::vector<ui32> columnIds;
         columnIds.reserve(FastQuery->ColumnsToUpsert.size());
-        for (const auto& columnName: FastQuery->ColumnsToUpsert) {
+        for (auto paramIndex: FastQuery->AllOrderedParams) {
+            const auto& columnName = FastQuery->ColumnsToUpsert[paramIndex];
             auto it = FastQuery->ResolvedColumns.find(columnName);
             if (it == FastQuery->ResolvedColumns.end()) {
                 TStringStream ss;
@@ -1242,25 +1274,27 @@ private:
                 return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
             }
             const auto& info = it->second;
+            LOG_T("Added column " << info.Id);
             columnIds.emplace_back(info.Id);
         }
 
-        // naive impl: we don't gether rows into batches
+        // naive impl: we don't gather rows into batches
         // also we suppose that optional fields are at the end, TODO
         for (int i = 0; i < batchValue.items_size(); ++i) {
             TVector<TCell> cells;
             const auto& listItems = batchValue.Getitems(i);
-            for (size_t j = 0; j < FastQuery->ColumnsToUpsert.size(); ++j) {
-                const auto& item = listItems.Getitems(j);
-                const auto& colInfo = FastQuery->ResolvedColumns[FastQuery->ColumnsToUpsert[j]];
+            for (auto paramIndex: FastQuery->AllOrderedParams) {
+                const auto& columnName = FastQuery->ColumnsToUpsert[paramIndex];
+                const auto& item = listItems.Getitems(paramIndex);
+                const auto& colInfo = FastQuery->ResolvedColumns[columnName];
                 switch (colInfo.PType.GetTypeId()) {
                 case NYql::NProto::Int32:
-                case NYql::NProto::Timestamp:
                     cells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
                     break;
                 case NYql::NProto::Uint32:
                     cells.emplace_back(TCell::Make<ui32>(item.Getuint32_value()));
                     break;
+                case NYql::NProto::Timestamp:
                 case NYql::NProto::Int64:
                 case NYql::NProto::Timestamp64:
                     cells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
@@ -1274,10 +1308,13 @@ private:
                 case NYql::NProto::Float:
                     cells.emplace_back(TCell::Make<double>(item.Getfloat_value()));
                     break;
+                case NYql::NProto::Utf8:
+                    cells.emplace_back(TCell::Make(item.Gettext_value()));
+                    break;
                 default: {
                     TStringStream ss;
                     ss << "unknown type " << colInfo.PType.GetTypeId() << " of column '"
-                       << FastQuery->ColumnsToUpsert[j] << "'";
+                       << FastQuery->ColumnsToUpsert[paramIndex] << "'";
                     LOG_T(ss.Str());
                     return ReplyQueryError(Ydb::StatusIds::UNSUPPORTED, ss.Str());
                 }

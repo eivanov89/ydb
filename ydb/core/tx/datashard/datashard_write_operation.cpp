@@ -131,7 +131,8 @@ std::tuple<NKikimrTxDataShard::TError::EKind, TString> TValidatedWriteTxOperatio
 
     for (size_t i = 0; i < tableInfo.KeyColumnIds.size(); ++i) {
         if (ColumnIds[i] != tableInfo.KeyColumnIds[i])
-            return {NKikimrTxDataShard::TError::SCHEME_ERROR, TStringBuilder() << "Key column schema at position " << i};
+            return {NKikimrTxDataShard::TError::SCHEME_ERROR,
+                TStringBuilder() << "Key column schema at position " << i << ", " << ColumnIds[i] << " != " << tableInfo.KeyColumnIds[i]};
     }
 
     for (ui32 columnTag : ColumnIds) {
@@ -207,7 +208,7 @@ ui32 TValidatedWriteTx::ExtractKeys(const NTable::TScheme& scheme, bool allowErr
     } else {
         Y_ENSURE(isValid, "Validation errors: " << ErrStr);
     }
-    
+
     return KeysCount();
 }
 
@@ -273,7 +274,7 @@ TWriteOperation* TWriteOperation::TryCastWriteOperation(TOperation::TPtr op)
 {
     if (!op->IsWriteTx())
         return nullptr;
-    
+
     TWriteOperation* writeOp = dynamic_cast<TWriteOperation*>(op.Get());
     Y_ENSURE(writeOp);
     return writeOp;
@@ -532,7 +533,7 @@ void TWriteOperation::BuildExecutionPlan(bool loaded)
 
     TVector<EExecutionUnitKind> plan;
 
-    if (IsImmediate()) 
+    if (IsImmediate())
     {
         Y_ENSURE(!loaded);
         plan.push_back(EExecutionUnitKind::CheckWrite);
