@@ -385,9 +385,6 @@ private:
         record.MutableTableId()->SetTableId(FastQuery->TableId.PathId.LocalPathId);
         record.MutableTableId()->SetSchemaVersion(FastQuery->TableId.SchemaVersion);
 
-        // TODO
-        Y_UNUSED(TxId);
-
         for (const auto& name: FastQuery->ColumnsToSelect) {
             auto it = FindCaseI(FastQuery->ResolvedColumns, name);
             if (it == FastQuery->ResolvedColumns.end()) {
@@ -1364,6 +1361,10 @@ private:
 
         if (WaitingRepliesCount == 0) {
             Response->Record.SetYdbStatus(Ydb::StatusIds::SUCCESS);
+            auto& queryResponse = *Response->Record.MutableResponse();
+            queryResponse.SetSessionId(SessionId);
+            queryResponse.MutableTxMeta()->set_id(UserTxId.GetValue().GetHumanStr());
+
             LOG_T("Replying: " << Response->ToString());
 
             Send<ESendingType::Tail>(ReplyTo, Response.release());
@@ -1393,17 +1394,20 @@ private:
     {
         LOG_W(" error:" << message);
 
-        auto queryResponse = std::make_unique<TEvKqp::TEvQueryResponse>();
-        queryResponse->Record.SetYdbStatus(ydbStatus);
+        auto response = std::make_unique<TEvKqp::TEvQueryResponse>();
+        response->Record.SetYdbStatus(ydbStatus);
+
+        auto& queryResponse = *response->Record.MutableResponse();
+        queryResponse.SetSessionId(SessionId);
+        queryResponse.MutableTxMeta()->set_id(UserTxId.GetValue().GetHumanStr());
 
         if (issues) {
-            auto* response = queryResponse->Record.MutableResponse();
             for (auto& i : *issues) {
-                response->AddQueryIssues()->Swap(&i);
+                queryResponse.AddQueryIssues()->Swap(&i);
             }
         }
 
-        Send<ESendingType::Tail>(ReplyTo, queryResponse.release());
+        Send<ESendingType::Tail>(ReplyTo, response.release());
         PassAway();
     }
 

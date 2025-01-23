@@ -1467,6 +1467,359 @@ Y_UNIT_TEST(ShouldUpsertUnorderedColumns) {
     UNIT_ASSERT_VALUES_EQUAL(pcount2, 18);
 }
 
+Y_UNIT_TEST(ShouldSelectUpsertInTransaction) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+            C_BALANCE      Double,
+            C_YTD_PAYMENT  Double,
+            C_PAYMENT_CNT  Int32,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_D_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST, C_BALANCE) VALUES
+            (1, 1, 1, 3, "credit1", "last1", 10),
+            (13, 11, 17, 7, "credit2", "last2", 11);
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query1 = R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id AS Int32;
+        DECLARE $c_d_id AS Int32;
+        DECLARE $c_id AS Int32;
+
+        SELECT C_BALANCE, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $c_w_id
+           AND C_D_ID = $c_d_id
+           AND C_ID = $c_id;
+    )";
+
+    auto txControl = TTxControl::BeginTx(TTxSettings::SerializableRW());
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_w_id").Int32(13).Build()
+        .AddParam("$c_d_id").Int32(11).Build()
+        .AddParam("$c_id").Int32(17).Build()
+        .Build();
+
+    auto result1 = session.ExecuteDataQuery(query1, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result1.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result1.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser1(result1.GetResultSet(0));
+    UNIT_ASSERT(resultParser1.TryNextRow());
+
+    auto balance = *resultParser1.ColumnParser("C_BALANCE").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(balance, 11.0);
+
+    UNIT_ASSERT(result1.GetTransaction());
+    auto tx = *result1.GetTransaction();
+
+    TString upsertQuery = R"(
+        DECLARE $batch AS List<Struct<p1:Int32, p2:Int32, p3:Int32, p4:Double?, p5:Double?, p6:Int32?>>;
+        UPSERT INTO `customer` SELECT p1 AS `C_D_ID`, p2 AS `C_W_ID`, p3 AS `C_ID`,
+            p4 AS `C_BALANCE`, p5 AS `C_YTD_PAYMENT`, p6 AS `C_PAYMENT_CNT` FROM AS_TABLE($batch);
+    )";
+
+    auto params2 = session.GetParamsBuilder()
+        .AddParam("$batch")
+            .BeginList()
+            .AddListItem()
+                .BeginStruct()
+                .AddMember("p1").Int32(11)
+                .AddMember("p2").Int32(13)
+                .AddMember("p3").Int32(17)
+                .AddMember("p4").OptionalDouble(5.0)
+                .AddMember("p5").OptionalDouble(2.0)
+                .AddMember("p6").OptionalInt32(17)
+                .EndStruct()
+            .EndList()
+            .Build()
+        .Build();
+
+    auto upsertResult = session.ExecuteDataQuery(upsertQuery, TTxControl::Tx(tx), params2).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(upsertResult.GetStatus(), EStatus::SUCCESS);
+
+    auto commitResult = tx.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult.GetStatus(), EStatus::SUCCESS);
+}
+
+Y_UNIT_TEST(ShouldSelectUpsertInTransaction2) {
+    // SELECT query with limit to avoid fast query
+
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+            C_BALANCE      Double,
+            C_YTD_PAYMENT  Double,
+            C_PAYMENT_CNT  Int32,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/customer` (C_W_ID, C_D_ID, C_ID, C_DISCOUNT, C_CREDIT, C_LAST, C_BALANCE) VALUES
+            (1, 1, 1, 3, "credit1", "last1", 10),
+            (13, 11, 17, 7, "credit2", "last2", 11);
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query1 = R"(
+        --!syntax_v1
+
+        DECLARE $c_w_id AS Int32;
+        DECLARE $c_d_id AS Int32;
+        DECLARE $c_id AS Int32;
+
+        SELECT C_BALANCE, C_LAST, C_CREDIT
+          FROM customer
+         WHERE C_W_ID = $c_w_id
+           AND C_D_ID = $c_d_id
+           AND C_ID = $c_id
+        LIMIT 1;
+    )";
+
+    auto txControl = TTxControl::BeginTx(TTxSettings::SerializableRW());
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$c_w_id").Int32(13).Build()
+        .AddParam("$c_d_id").Int32(11).Build()
+        .AddParam("$c_id").Int32(17).Build()
+        .Build();
+
+    auto result1 = session.ExecuteDataQuery(query1, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result1.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result1.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser1(result1.GetResultSet(0));
+    UNIT_ASSERT(resultParser1.TryNextRow());
+
+    auto balance = *resultParser1.ColumnParser("C_BALANCE").GetOptionalDouble();
+    UNIT_ASSERT_VALUES_EQUAL(balance, 11.0);
+
+    UNIT_ASSERT(result1.GetTransaction());
+    auto tx = *result1.GetTransaction();
+
+    TString upsertQuery = R"(
+        DECLARE $batch AS List<Struct<p1:Int32, p2:Int32, p3:Int32, p4:Double?, p5:Double?, p6:Int32?>>;
+        UPSERT INTO `customer` SELECT p1 AS `C_D_ID`, p2 AS `C_W_ID`, p3 AS `C_ID`,
+            p4 AS `C_BALANCE`, p5 AS `C_YTD_PAYMENT`, p6 AS `C_PAYMENT_CNT` FROM AS_TABLE($batch);
+    )";
+
+    auto params2 = session.GetParamsBuilder()
+        .AddParam("$batch")
+            .BeginList()
+            .AddListItem()
+                .BeginStruct()
+                .AddMember("p1").Int32(11)
+                .AddMember("p2").Int32(13)
+                .AddMember("p3").Int32(17)
+                .AddMember("p4").OptionalDouble(5.0)
+                .AddMember("p5").OptionalDouble(2.0)
+                .AddMember("p6").OptionalInt32(17)
+                .EndStruct()
+            .EndList()
+            .Build()
+        .Build();
+
+    auto upsertResult = session.ExecuteDataQuery(upsertQuery, TTxControl::Tx(tx), params2).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(upsertResult.GetStatus(), EStatus::SUCCESS);
+
+    auto commitResult = tx.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult.GetStatus(), EStatus::SUCCESS);
+}
+
+Y_UNIT_TEST(ParallelUpsertsShouldCommit) {
+    // 2 upserts in parallel, but different rows
+
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+            C_BALANCE      Double,
+            C_YTD_PAYMENT  Double,
+            C_PAYMENT_CNT  Int32,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    TString query = R"(
+        DECLARE $batch AS List<Struct<p1:Int32, p2:Int32, p3:Int32, p4:Double?, p5:Double?, p6:Int32?>>;
+        UPSERT INTO `customer` SELECT p1 AS `C_W_ID`, p2 AS `C_D_ID`, p3 AS `C_ID`,
+            p4 AS `C_BALANCE`, p5 AS `C_YTD_PAYMENT`, p6 AS `C_PAYMENT_CNT` FROM AS_TABLE($batch);
+    )";
+
+    auto params1 = session.GetParamsBuilder()
+        .AddParam("$batch")
+            .BeginList()
+            .AddListItem()
+                .BeginStruct()
+                .AddMember("p1").Int32(1)
+                .AddMember("p2").Int32(2)
+                .AddMember("p3").Int32(1013)
+                .AddMember("p4").OptionalDouble(132.10)
+                .AddMember("p5").OptionalDouble(2.0)
+                .AddMember("p6").OptionalInt32(17)
+                .EndStruct()
+            .EndList()
+            .Build()
+        .Build();
+
+    auto params2 = session.GetParamsBuilder()
+        .AddParam("$batch")
+            .BeginList()
+            .AddListItem()
+                .BeginStruct()
+                .AddMember("p1").Int32(1)
+                .AddMember("p2").Int32(2)
+                .AddMember("p3").Int32(999)
+                .AddMember("p4").OptionalDouble(12.10)
+                .AddMember("p5").OptionalDouble(1.0)
+                .AddMember("p6").OptionalInt32(18)
+                .EndStruct()
+            .EndList()
+            .Build()
+        .Build();
+
+    auto txControl1 = TTxControl::BeginTx(TTxSettings::SerializableRW());
+    auto result1 = session.ExecuteDataQuery(query, txControl1, params1).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result1.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT(result1.GetTransaction());
+
+    auto txControl2 = TTxControl::BeginTx(TTxSettings::SerializableRW());
+    auto result2 = session.ExecuteDataQuery(query, txControl2, params2).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result2.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT(result2.GetTransaction());
+
+    auto tx2 = *result2.GetTransaction();
+    auto commitResult2 = tx2.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult2.GetStatus(), EStatus::SUCCESS);
+
+    auto tx1 = *result1.GetTransaction();
+    auto commitResult1 = tx1.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult1.GetStatus(), EStatus::SUCCESS);
+}
+
+Y_UNIT_TEST(ParallelUpsertsShouldAbort) {
+    // 2 upserts in parallel, same rows
+
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+            C_BALANCE      Double,
+            C_YTD_PAYMENT  Double,
+            C_PAYMENT_CNT  Int32,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    TString query = R"(
+        DECLARE $batch AS List<Struct<p1:Int32, p2:Int32, p3:Int32, p4:Double?, p5:Double?, p6:Int32?>>;
+        UPSERT INTO `customer` SELECT p1 AS `C_W_ID`, p2 AS `C_D_ID`, p3 AS `C_ID`,
+            p4 AS `C_BALANCE`, p5 AS `C_YTD_PAYMENT`, p6 AS `C_PAYMENT_CNT` FROM AS_TABLE($batch);
+    )";
+
+    auto params1 = session.GetParamsBuilder()
+        .AddParam("$batch")
+            .BeginList()
+            .AddListItem()
+                .BeginStruct()
+                .AddMember("p1").Int32(1)
+                .AddMember("p2").Int32(2)
+                .AddMember("p3").Int32(1013)
+                .AddMember("p4").OptionalDouble(132.10)
+                .AddMember("p5").OptionalDouble(2.0)
+                .AddMember("p6").OptionalInt32(17)
+                .EndStruct()
+            .EndList()
+            .Build()
+        .Build();
+
+    auto params2 = session.GetParamsBuilder()
+        .AddParam("$batch")
+            .BeginList()
+            .AddListItem()
+                .BeginStruct()
+                .AddMember("p1").Int32(1)
+                .AddMember("p2").Int32(2)
+                .AddMember("p3").Int32(999)
+                .AddMember("p4").OptionalDouble(12.10)
+                .AddMember("p5").OptionalDouble(1.0)
+                .AddMember("p6").OptionalInt32(18)
+                .EndStruct()
+            .EndList()
+            .Build()
+        .Build();
+
+    auto txControl1 = TTxControl::BeginTx(TTxSettings::SerializableRW());
+    auto result1 = session.ExecuteDataQuery(query, txControl1, params1).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result1.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT(result1.GetTransaction());
+
+    auto txControl2 = TTxControl::BeginTx(TTxSettings::SerializableRW());
+    auto result2 = session.ExecuteDataQuery(query, txControl2, params2).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result2.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT(result2.GetTransaction());
+
+    auto tx2 = *result2.GetTransaction();
+    auto commitResult2 = tx2.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult2.GetStatus(), EStatus::SUCCESS);
+
+    auto tx1 = *result1.GetTransaction();
+    auto commitResult1 = tx1.Commit().GetValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(commitResult1.GetStatus(), EStatus::SUCCESS); // XXX
+}
+
 }
 
 } // namespace NKikimr::NKqp
