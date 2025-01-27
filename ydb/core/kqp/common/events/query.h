@@ -1,11 +1,13 @@
 #pragma once
 #include <ydb/core/resource_pools/resource_pool_settings.h>
+#include <ydb/core/protos/data_events.pb.h>
 #include <ydb/core/protos/kqp.pb.h>
 #include <ydb/core/kqp/common/simple/kqp_event_ids.h>
 #include <ydb/core/kqp/common/kqp_user_request_context.h>
 #include <ydb/core/grpc_services/base/iface.h>
 #include <ydb/core/grpc_services/cancelation/cancelation_event.h>
 #include <ydb/core/grpc_services/cancelation/cancelation.h>
+#include <ydb/core/tx/long_tx_service/public/lock_handle.h>
 
 #include <ydb/public/api/protos/ydb_query.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
@@ -419,6 +421,9 @@ struct TEvQueryResponse: public TEventPBWithArena<TEvQueryResponse, NKikimrKqp::
     explicit TEvQueryResponse(TIntrusivePtr<NActors::TProtoArenaHolder> arena)
         : TEventPBBase(arena ? std::move(arena) : MakeIntrusive<NActors::TProtoArenaHolder>())
     {}
+
+    TVector<NKikimrDataEvents::TLock> Locks;
+    NLongTxService::TLockHandle LockHandle;
 };
 
 } // namespace NKikimr::NKqp

@@ -1594,6 +1594,10 @@ private:
 
 private:
     bool IsReadOnlyTx() const {
+        if (Request.HasFastWrites) {
+            return false;
+        }
+
         if (BufferActorId && TxManager->GetTopicOperations().HasOperations()) {
             YQL_ENSURE(!Request.UseImmediateEffects);
             return false;
@@ -2426,10 +2430,12 @@ private:
 
         // Materialize (possibly empty) txs for all shards with locks (either commit or rollback)
         for (auto& [shardId, locksList] : locksMap) {
+            LOG_D("Locks for shard " << shardId);
             YQL_ENSURE(!locksList.empty(), "unexpected empty locks list in DataShardLocks");
             NKikimrDataEvents::TKqpLocks* locks = nullptr;
 
-            if (TxManager || ShardIdToTableInfo->Get(shardId).IsOlap) {
+            // XXX: in our prototype there are only datashards
+            if (TxManager /* || ShardIdToTableInfo->Get(shardId).IsOlap */) {
                 if (auto it = evWriteTxs.find(shardId); it != evWriteTxs.end()) {
                     locks = it->second->MutableLocks();
                 } else {
@@ -2823,6 +2829,7 @@ private:
 
         LOG_I("Total tasks: " << TasksGraph.GetTasks().size()
             << ", readonly: " << ReadOnlyTx
+            << ", hasfastwrites: " << Request.HasFastWrites
             << ", datashardTxs: " << DatashardTxs.size()
             << ", evWriteTxs: " << EvWriteTxs.size()
             << ", topicTxs: " << Request.TopicOperations.GetSize()
