@@ -183,7 +183,8 @@ public:
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
             const IKqpGateway::TKqpSnapshot& snapshot,
-            const TKqpQueryState::TQueryTxId& userTxId)
+            const TKqpQueryState::TQueryTxId& userTxId,
+            ui64 lockId)
         : TActor(&TThis::ExecuteState)
         , ReplyTo(replyTo)
         , SessionId(sessionId)
@@ -191,6 +192,7 @@ public:
         , Parameters(params)
         , Snapshot(snapshot)
         , UserTxId(userTxId)
+        , LockId(lockId)
     {
     }
 
@@ -225,6 +227,10 @@ private:
     void OnTxId(ui64 txId) {
         LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
         TxId = txId;
+        if (LockId == 0) {
+            LockId = TxId;
+            LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
+        }
 
         if (FastQuery->ResolvedColumns.empty()) {
             return ResolveSchema(TlsActivationContext->AsActorContext());
@@ -353,6 +359,7 @@ private:
         auto request = std::make_unique<NKikimr::TEvDataShard::TEvRead>();
         auto& record = request->Record;
         record.SetReadId(1); // we read once, so doesn't matter
+        record.SetLockTxId(LockId);
         record.SetResultFormat(NKikimrDataEvents::FORMAT_CELLVEC);
         record.MutableTableId()->SetOwnerId(FastQuery->TableId.PathId.OwnerId);
         record.MutableTableId()->SetTableId(FastQuery->TableId.PathId.LocalPathId);
@@ -391,9 +398,15 @@ private:
         auto response = std::make_unique<TEvKqp::TEvQueryResponse>();
         response->Record.SetYdbStatus(Ydb::StatusIds::SUCCESS);
 
+        for (const auto& lock: msg->Record.GetTxLocks()) {
+            response->Locks.emplace_back(lock);
+        }
+        response->LockHandle = std::move(LockHandle);
+
         auto& queryResponse = *response->Record.MutableResponse();
         queryResponse.SetSessionId(SessionId);
         auto& resultSets = *queryResponse.AddYdbResults();
+
 
         for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
             const auto& name = FastQuery->ColumnsToSelect[i];
@@ -539,8 +552,10 @@ private:
     ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
     IKqpGateway::TKqpSnapshot Snapshot;
     TKqpQueryState::TQueryTxId UserTxId;
+    ui64 LockId;
 
     ui64 TxId = 0;
+    NLongTxService::TLockHandle LockHandle;
 
     TVector<TCell> KeyCells;
     std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
@@ -575,7 +590,8 @@ public:
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
             const IKqpGateway::TKqpSnapshot& snapshot,
-            const TKqpQueryState::TQueryTxId& userTxId)
+            const TKqpQueryState::TQueryTxId& userTxId,
+            ui64 lockId)
         : TActor(&TThis::ExecuteState)
         , ReplyTo(replyTo)
         , SessionId(sessionId)
@@ -583,6 +599,7 @@ public:
         , Parameters(params)
         , Snapshot(snapshot)
         , UserTxId(userTxId)
+        , LockId(lockId)
     {
     }
 
@@ -617,6 +634,10 @@ private:
     void OnTxId(ui64 txId) {
         LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
         TxId = txId;
+        if (LockId == 0) {
+            LockId = TxId;
+            LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
+        }
 
         if (FastQuery->ResolvedColumns.empty()) {
             return ResolveSchema(TlsActivationContext->AsActorContext());
@@ -823,6 +844,7 @@ private:
             auto request = std::make_unique<NKikimr::TEvDataShard::TEvRead>();
             auto& record = request->Record;
             record.SetReadId(i + 1);
+            record.SetLockTxId(LockId);
             record.SetResultFormat(NKikimrDataEvents::FORMAT_CELLVEC);
             record.MutableTableId()->SetOwnerId(FastQuery->TableId.PathId.OwnerId);
             record.MutableTableId()->SetTableId(FastQuery->TableId.PathId.LocalPathId);
@@ -867,6 +889,11 @@ private:
         LOG_T("received read result from shard " << ev->Sender << " with " << msg->GetRowsCount() << " rows: "
             << msg->ToString()
             << ", left results " << WaitingRepliesCount);
+
+        for (const auto& lock: msg->Record.GetTxLocks()) {
+            Response->Locks.emplace_back(lock);
+        }
+        Response->LockHandle = std::move(LockHandle);
 
         auto& queryResponse = *Response->Record.MutableResponse();
         auto& resultSets = *queryResponse.MutableYdbResults(0);
@@ -980,8 +1007,10 @@ private:
     ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
     IKqpGateway::TKqpSnapshot Snapshot;
     TKqpQueryState::TQueryTxId UserTxId;
+    ui64 LockId;
 
     ui64 TxId = 0;
+    NLongTxService::TLockHandle LockHandle;
 
     struct TResolvedData {
         TVector<TCell> KeyCells;
@@ -1007,7 +1036,8 @@ public:
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
             const IKqpGateway::TKqpSnapshot& snapshot,
-            const TKqpQueryState::TQueryTxId& userTxId)
+            const TKqpQueryState::TQueryTxId& userTxId,
+            ui64 lockId)
         : TActor(&TThis::ExecuteState)
         , ReplyTo(replyTo)
         , SessionId(sessionId)
@@ -1015,6 +1045,7 @@ public:
         , Parameters(params)
         , Snapshot(snapshot)
         , UserTxId(userTxId)
+        , LockId(lockId)
     {
     }
 
@@ -1049,6 +1080,10 @@ private:
     void OnTxId(ui64 txId) {
         LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
         TxId = txId;
+        if (LockId == 0) {
+            LockId = TxId;
+            LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
+        }
 
         if (FastQuery->ResolvedColumns.empty()) {
             return ResolveSchema(TlsActivationContext->AsActorContext());
@@ -1294,6 +1329,7 @@ private:
             TSerializedCellMatrix matrix(cells, 1, cells.size());
             auto evWrite = std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
                 TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE);
+            evWrite->SetLockId(LockId, SelfId().NodeId());
             ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
                 .AddDataToPayload(matrix.ReleaseBuffer());
             evWrite->AddOperation(
@@ -1331,6 +1367,12 @@ private:
         LOG_T("received successfull write result from shard " << ev->Sender << ": "
             << msg->ToString()
             << ", left results " << WaitingRepliesCount);
+
+        for (const auto& lock: msg->Record.GetTxLocks()) {
+            Response->Locks.emplace_back(lock);
+        }
+
+        Response->LockHandle = std::move(LockHandle);
 
         if (WaitingRepliesCount == 0) {
             Response->Record.SetYdbStatus(Ydb::StatusIds::SUCCESS);
@@ -1398,8 +1440,10 @@ private:
     ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue> Parameters;
     IKqpGateway::TKqpSnapshot Snapshot;
     TKqpQueryState::TQueryTxId UserTxId;
+    ui64 LockId;
 
     ui64 TxId = 0;
+    NLongTxService::TLockHandle LockHandle;
 
     struct TResolvedData {
         TVector<TCell> KeyCells;
@@ -1555,6 +1599,18 @@ public:
     }
 
     void ForwardResponse(TEvKqp::TEvQueryResponse::TPtr& ev) {
+        // fast query locks
+        NKikimrMiniKQL::TResult lockResult;
+        if (!ev->Get()->Locks.empty()) {
+            MergeLocksWithFastQuery(ev->Get()->Locks);
+            LOG_T("Fast query acquired " << ev->Get()->Locks.size() << " locks");
+
+            if (ev->Get()->LockHandle) {
+                QueryState->TxCtx->Locks.LockHandle = std::move(ev->Get()->LockHandle);
+                LOG_T("Fast query created lock handle");
+            }
+        }
+
         QueryResponse = std::unique_ptr<TEvKqp::TEvQueryResponse>(ev->Release().Release());
         Cleanup();
     }
@@ -2118,6 +2174,8 @@ public:
     }
 
     void ExecuteFastQuery() {
+        ui64 lockId = QueryState->TxCtx->Locks.GetLockTxId();
+
         Counters->ReportFastQuery(Settings.DbCounters);
 
         IActor* actor = nullptr;
@@ -2129,7 +2187,8 @@ public:
                 QueryState->FastQuery,
                 QueryState->GetYdbParameters(),
                 QueryState->TxCtx->SnapshotHandle.Snapshot,
-                QueryState->TxId);
+                QueryState->TxId,
+                lockId);
             break;
         case TFastQuery::EExecutionType::SELECT_IN_QUERY:
             actor = new TFastSelectInExecutorActor(
@@ -2138,16 +2197,20 @@ public:
                 QueryState->FastQuery,
                 QueryState->GetYdbParameters(),
                 QueryState->TxCtx->SnapshotHandle.Snapshot,
-                QueryState->TxId);
+                QueryState->TxId,
+                lockId);
             break;
         case TFastQuery::EExecutionType::UPSERT:
+            QueryState->TxCtx->SetHasFastWrites();
             actor = new TFastUpsertActor(
                 SelfId(),
                 SessionId,
                 QueryState->FastQuery,
                 QueryState->GetYdbParameters(),
                 QueryState->TxCtx->SnapshotHandle.Snapshot,
-                QueryState->TxId);
+                QueryState->TxId,
+                lockId);
+            break;
         default:
             Y_VERIFY(actor);
         }
@@ -2581,7 +2644,7 @@ public:
         auto request = PrepareRequest(tx, literal, QueryState.get());
 
         LOG_D("ExecutePhyTx, tx: " << (void*)tx.get() << " literal: " << literal << " commit: " << commit
-                << " txCtx.DeferredEffects.size(): " << txCtx.DeferredEffects.Size());
+                << " txCtx.DeferredEffects.size(): " << txCtx.DeferredEffects.Size() << ", hasLocks: " << hasLocks);
 
         if (!CheckTopicOperations()) {
             return true;
@@ -2632,6 +2695,8 @@ public:
                 request.PerShardKeysSizeLimitBytes = Config->_CommitPerShardKeysSizeLimitBytes.Get().GetRef();
             }
 
+            request.HasFastWrites = txCtx.TxHasFastWrites();
+
             if (Settings.TableService.GetEnableOltpSink()) {
                 if (txCtx.TxHasEffects() || hasLocks || txCtx.TopicOperations.HasOperations()) {
                     request.AcquireLocksTxId = txCtx.Locks.GetLockTxId();
@@ -2648,6 +2713,11 @@ public:
                 } else if (txCtx.TxHasEffects()) {
                     LOG_D("TExecPhysicalRequest, need commit locks");
                     request.LocksOp = ELocksOp::Commit;
+                }
+
+                for (auto& [lockId, lock] : txCtx.Locks.LocksMap) {
+                    auto dsLock = ExtractLock(lock.GetValueRef(txCtx.Locks.LockType));
+                    request.DataShardLocks[dsLock.GetDataShard()].emplace_back(dsLock);
                 }
             } else {
                 if (hasLocks || txCtx.TopicOperations.HasOperations()) {
@@ -2787,6 +2857,31 @@ public:
                 if (txCtx->GetSnapshot().IsValid()) {
                     txCtx->Locks.MarkBroken(issues.back());
                 }
+            }
+        }
+
+        return true;
+    }
+
+    bool MergeLocksWithFastQuery(const TVector<NKikimrDataEvents::TLock>& locks) {
+        if (locks.empty()) {
+            return true;
+        }
+
+        NKikimrMiniKQL::TResult result;
+        BuildLocks(result, locks);
+
+        auto& txCtx = QueryState->TxCtx;
+        auto [success, issues] = MergeLocks(result.GetType(), result.GetValue(), *txCtx);
+        if (!success) {
+            if (!txCtx->GetSnapshot().IsValid() || txCtx->TxHasEffects()) {
+                ReplyQueryError(Ydb::StatusIds::ABORTED,  "Error while locks merge",
+                    MessageFromIssues(issues));
+                return false;
+            }
+
+            if (txCtx->GetSnapshot().IsValid()) {
+                txCtx->Locks.MarkBroken(issues.back());
             }
         }
 

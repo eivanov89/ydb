@@ -189,7 +189,15 @@ public:
     }
 
     bool TxHasEffects() const {
-        return HasImmediateEffects || !DeferredEffects.Empty();
+        return HasImmediateEffects || !DeferredEffects.Empty() || HasFastWrites;
+    }
+
+    void SetHasFastWrites() {
+        HasFastWrites = true;
+    }
+
+    bool TxHasFastWrites() const {
+        return HasFastWrites;
     }
 
     const IKqpGateway::TKqpSnapshot& GetSnapshot() const {
@@ -310,7 +318,7 @@ public:
     void ApplyPhysicalQuery(const NKqpProto::TKqpPhyQuery& phyQuery) {
         NeedUncommittedChangesFlush = HasUncommittedChangesRead(ModifiedTablesSinceLastFlush, phyQuery);
         if (NeedUncommittedChangesFlush) {
-            ModifiedTablesSinceLastFlush.clear();   
+            ModifiedTablesSinceLastFlush.clear();
         }
     }
 
@@ -334,6 +342,7 @@ public:
 
     TDeferredEffects DeferredEffects;
     bool HasImmediateEffects = false;
+    bool HasFastWrites = false;
     NTopic::TTopicOperations TopicOperations;
     TIntrusivePtr<TParamsState> ParamsState;
     TTxAllocatorState::TPtr TxAlloc;
