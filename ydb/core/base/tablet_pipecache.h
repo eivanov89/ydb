@@ -111,7 +111,7 @@ struct TEvPipeCache {
     struct TEvForcePipeReconnect : public TEventLocal<TEvForcePipeReconnect, EvForcePipeReconnect> {
         const ui64 TabletId;
 
-        explicit TEvForcePipeReconnect(ui64 tabletId) 
+        explicit TEvForcePipeReconnect(ui64 tabletId)
             : TabletId(tabletId)
         {
         }
@@ -149,8 +149,10 @@ enum class EPipePerNodeCache {
     Persistent,
 };
 
+constexpr size_t LEADER_PIPECACHE_COUNT = 10;
+
 IActor* CreatePipePerNodeCache(const TIntrusivePtr<TPipePerNodeCacheConfig> &config);
-TActorId MakePipePerNodeCacheID(EPipePerNodeCache kind);
-TActorId MakePipePerNodeCacheID(bool allowFollower);
+TActorId MakePipePerNodeCacheID(EPipePerNodeCache kind, size_t index = 0);
+TActorId MakePipePerNodeCacheID(bool allowFollower, size_t index = 0);
 
 }

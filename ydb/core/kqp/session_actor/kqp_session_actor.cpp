@@ -383,8 +383,10 @@ private:
         LOG_T("sending read request to " << FastQuery->TableName << "(" << ResolvedShardId << "): "
             << request->ToString());
 
+        size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+        pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
         Send<ESendingType::Tail>(
-            NKikimr::MakePipePerNodeCacheID(false),
+            NKikimr::MakePipePerNodeCacheID(false, pipeIndex),
             new TEvPipeCache::TEvForward(request.release(), ResolvedShardId, true),
             IEventHandle::FlagTrackDelivery,
             0,
@@ -871,8 +873,10 @@ private:
             LOG_T("sending read request to " << FastQuery->TableName << "(" << resolvedData.ResolvedShardId << "): "
                 << request->ToString());
 
+            size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+            pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
             Send<ESendingType::Tail>(
-                NKikimr::MakePipePerNodeCacheID(false),
+                NKikimr::MakePipePerNodeCacheID(false, pipeIndex),
                 new TEvPipeCache::TEvForward(request.release(), resolvedData.ResolvedShardId, true),
                 IEventHandle::FlagTrackDelivery,
                 0,
@@ -1341,8 +1345,10 @@ private:
 
             const auto& resolvedData = ResolvedPoints[i];
             LOG_T("Sending write to " << resolvedData.ResolvedShardId);
+            size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+            pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
             Send<ESendingType::Tail>(
-                NKikimr::MakePipePerNodeCacheID(false),
+                NKikimr::MakePipePerNodeCacheID(false, pipeIndex),
                 new TEvPipeCache::TEvForward(evWrite.release(), resolvedData.ResolvedShardId, true),
                 IEventHandle::FlagTrackDelivery,
                 0,
@@ -2066,7 +2072,9 @@ public:
         }
 
         if (QueryState->FastQuery) {
-            PrepareQueryTransaction();
+            if (!PrepareQueryTransaction()) {
+                return;
+            }
         } else {
             if (!PrepareQueryContext()) {
                 return;
@@ -2074,6 +2082,12 @@ public:
         }
 
         Become(&TKqpSessionActor::ExecuteState);
+
+        if (QueryState == nullptr) {
+            LOG_W("QueryState is zero");
+            Y_VERIFY(QueryState);
+        }
+
         QueryState->TxCtx->OnBeginQuery();
 
         if (QueryState->FastQuery) {
@@ -3842,7 +3856,11 @@ public:
     void ReplyQueryError(Ydb::StatusIds::StatusCode ydbStatus,
         const TString& message, std::optional<google::protobuf::RepeatedPtrField<Ydb::Issue::IssueMessage>> issues = {})
     {
-        LOG_W("Create QueryResponse for error on request, msg: " << message);
+        LOG_W("Create QueryResponse for error on request, status: " << ydbStatus << ", msg: " << message);
+
+        if (QueryState && QueryState->FastQuery) {
+            LOG_W("FastQuery: " << QueryState->FastQuery->OriginalQuery);
+        }
 
         QueryResponse = std::make_unique<TEvKqp::TEvQueryResponse>();
         QueryResponse->Record.SetYdbStatus(ydbStatus);
@@ -3858,6 +3876,7 @@ public:
 
         if (issues) {
             for (auto& i : *issues) {
+                LOG_W("issue: " << i);
                 response->AddQueryIssues()->Swap(&i);
             }
         }

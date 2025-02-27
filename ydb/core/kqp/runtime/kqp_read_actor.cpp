@@ -30,7 +30,7 @@ bool IsDebugLogEnabled(const NActors::TActorSystem* actorSystem, NActors::NLog::
     return settings && settings->Satisfies(NActors::NLog::EPriority::PRI_DEBUG, component);
 }
 
-NActors::TActorId MainPipeCacheId = NKikimr::MakePipePerNodeCacheID(false);
+NActors::TActorId MainPipeCacheId = NKikimr::MakePipePerNodeCacheID(false, NKikimr::LEADER_PIPECACHE_COUNT - 1);
 NActors::TActorId FollowersPipeCacheId =  NKikimr::MakePipePerNodeCacheID(true);
 
 }
@@ -359,6 +359,11 @@ public:
             Settings->GetTable().GetSysViewInfo(),
             Settings->GetTable().GetTableId().GetSchemaVersion()
         );
+
+        size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+        pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+
+        PipeCacheId = NKikimr::MakePipePerNodeCacheID(false, pipeIndex);
 
         Snapshot = IKqpGateway::TKqpSnapshot(Settings->GetSnapshot().GetStep(), Settings->GetSnapshot().GetTxId());
 
@@ -1414,7 +1419,7 @@ public:
             for (size_t i = 0; i < Reads.size(); ++i) {
                 ResetRead(i);
             }
-            Send(::MainPipeCacheId, new TEvPipeCache::TEvUnlink(0));
+            Send(PipeCacheId, new TEvPipeCache::TEvUnlink(0));
             if (UseFollowers) {
                 Send(::FollowersPipeCacheId, new TEvPipeCache::TEvUnlink(0));
             }

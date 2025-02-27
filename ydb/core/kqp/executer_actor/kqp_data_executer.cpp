@@ -751,7 +751,9 @@ private:
                 YQL_ENSURE(state.DatashardState.Defined());
                 //nothing to cancel on follower
                 if (!state.DatashardState->Follower) {
-                    Send(MakePipePerNodeCacheID(/* allowFollowers */ false), new TEvPipeCache::TEvForward(
+                    size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+                    pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+                    Send(MakePipePerNodeCacheID(/* allowFollowers */ false, pipeIndex), new TEvPipeCache::TEvForward(
                         new TEvDataShard::TEvCancelTransactionProposal(TxId), shardId, /* subscribe */ false));
                 }
             }
@@ -1103,7 +1105,9 @@ private:
         NDataIntegrity::LogIntegrityTrails("PlannedTx", Request.UserTraceId, TxId, {}, TlsActivationContext->AsActorContext());
 
         LOG_D("Execute planned transaction, coordinator: " << TxCoordinator << " for " << affectedSet.size() << "shards");
-        Send(MakePipePerNodeCacheID(false), new TEvPipeCache::TEvForward(ev.Release(), TxCoordinator, /* subscribe */ true));
+        size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+        pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+        Send(MakePipePerNodeCacheID(false, pipeIndex), new TEvPipeCache::TEvForward(ev.Release(), TxCoordinator, /* subscribe */ true));
     }
 
 private:
@@ -1435,8 +1439,9 @@ private:
         YQL_ENSURE(shardState);
 
         LOG_I("Reattach to shard " << tabletId);
-
-        Send(MakePipePerNodeCacheID(false), new TEvPipeCache::TEvForward(
+        size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+        pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+        Send(MakePipePerNodeCacheID(false, pipeIndex), new TEvPipeCache::TEvForward(
             new TEvDataShard::TEvProposeTransactionAttach(tabletId, TxId),
             tabletId, /* subscribe */ true), 0, ++shardState->ReattachState.Cookie);
     }
@@ -1806,8 +1811,13 @@ private:
 
         LOG_D("ExecuteDatashardTransaction traceId.verbosity: " << std::to_string(traceId.GetVerbosity()));
 
-        Send(MakePipePerNodeCacheID(GetUseFollowers()), new TEvPipeCache::TEvForward(ev.release(), shardId, true), 0, 0, std::move(traceId));
-
+        if (GetUseFollowers()) {
+            Send(MakePipePerNodeCacheID(true), new TEvPipeCache::TEvForward(ev.release(), shardId, true), 0, 0, std::move(traceId));
+        } else {
+            size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+            pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+            Send(MakePipePerNodeCacheID(false, pipeIndex), new TEvPipeCache::TEvForward(ev.release(), shardId, true), 0, 0, std::move(traceId));
+        }
         auto result = ShardStates.emplace(shardId, std::move(shardState));
         YQL_ENSURE(result.second);
     }
@@ -1859,8 +1869,9 @@ private:
             }());
 
         LOG_D("ExecuteEvWriteTransaction traceId.verbosity: " << std::to_string(traceId.GetVerbosity()));
-
-        Send(MakePipePerNodeCacheID(false), new TEvPipeCache::TEvForward(evWriteTransaction.release(), shardId, true), 0, 0, std::move(traceId));
+        size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+        pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+        Send(MakePipePerNodeCacheID(false, pipeIndex), new TEvPipeCache::TEvForward(evWriteTransaction.release(), shardId, true), 0, 0, std::move(traceId));
 
         auto result = ShardStates.emplace(shardId, std::move(shardState));
         YQL_ENSURE(result.second);
@@ -2816,8 +2827,10 @@ private:
 
             LOG_D("Executing KQP transaction on topic tablet: " << tabletId
                   << ", writeId: " << writeId);
+            size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+            pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
 
-            Send(MakePipePerNodeCacheID(false),
+            Send(MakePipePerNodeCacheID(false, pipeIndex),
                  new TEvPipeCache::TEvForward(ev.release(), tabletId, true),
                  0,
                  0,
@@ -2859,8 +2872,9 @@ private:
         // TxProxyMon compatibility
         Counters->TxProxyMon->TxTotalTimeHgram->Collect(totalTime.MilliSeconds());
         Counters->TxProxyMon->TxExecuteTimeHgram->Collect(totalTime.MilliSeconds());
-
-        Send(MakePipePerNodeCacheID(false), new TEvPipeCache::TEvUnlink(0));
+        size_t pipeIndex = SelfId().Hash() % LEADER_PIPECACHE_COUNT;
+        pipeIndex = (pipeIndex + 1) % LEADER_PIPECACHE_COUNT;
+        Send(MakePipePerNodeCacheID(false, pipeIndex), new TEvPipeCache::TEvUnlink(0));
 
         if (GetUseFollowers()) {
             Send(MakePipePerNodeCacheID(true), new TEvPipeCache::TEvUnlink(0));

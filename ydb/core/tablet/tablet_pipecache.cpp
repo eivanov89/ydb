@@ -549,7 +549,7 @@ IActor* CreatePipePerNodeCache(const TIntrusivePtr<TPipePerNodeCacheConfig> &con
     return new TPipePerNodeCache(config);
 }
 
-TActorId MakePipePerNodeCacheID(EPipePerNodeCache kind) {
+TActorId MakePipePerNodeCacheID(EPipePerNodeCache kind, size_t index) {
     char x[12] = "PipeCache";
     switch (kind) {
         case EPipePerNodeCache::Leader:
@@ -562,11 +562,12 @@ TActorId MakePipePerNodeCacheID(EPipePerNodeCache kind) {
             x[9] = 'P';
             break;
     }
+    x[10] = '0' + index;
     return TActorId(0, TStringBuf(x, 12));
 }
 
-TActorId MakePipePerNodeCacheID(bool allowFollower) {
-    return MakePipePerNodeCacheID(allowFollower ? EPipePerNodeCache::Follower : EPipePerNodeCache::Leader);
+TActorId MakePipePerNodeCacheID(bool allowFollower, size_t index) {
+    return MakePipePerNodeCacheID(allowFollower ? EPipePerNodeCache::Follower : EPipePerNodeCache::Leader, index);
 }
 
 }

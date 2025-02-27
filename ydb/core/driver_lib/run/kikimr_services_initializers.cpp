@@ -1300,9 +1300,12 @@ void TTabletPipePerNodeCachesInitializer::InitializeServices(
     persistentPipeConfig->PipeConfig = TPipePerNodeCacheConfig::DefaultPersistentPipeConfig();
     persistentPipeConfig->Counters = counters->GetSubgroup("type", "PERSISTENT_PIPE_CACHE");
 
-    setup->LocalServices.emplace_back(
-        MakePipePerNodeCacheID(false),
-        TActorSetupCmd(CreatePipePerNodeCache(leaderPipeConfig), TMailboxType::ReadAsFilled, appData->UserPoolId));
+    for (size_t i = 0; i < LEADER_PIPECACHE_COUNT; ++i) {
+        setup->LocalServices.emplace_back(
+            MakePipePerNodeCacheID(false, i),
+            TActorSetupCmd(CreatePipePerNodeCache(leaderPipeConfig), TMailboxType::ReadAsFilled, appData->UserPoolId));
+    }
+
     setup->LocalServices.emplace_back(
         MakePipePerNodeCacheID(true),
         TActorSetupCmd(CreatePipePerNodeCache(followerPipeConfig), TMailboxType::ReadAsFilled, appData->UserPoolId));

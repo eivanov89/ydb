@@ -550,7 +550,7 @@ public:
                     << " ShardID=" << ev->Get()->Record.GetOrigin() << ","
                     << " Sink=" << this->SelfId() << "."
                     << getIssues().ToOneLineString());
-            
+
             if (InconsistentTx) {
                 ResetShardRetries(ev->Get()->Record.GetOrigin(), ev->Cookie);
                 RetryResolve();
@@ -1004,7 +1004,7 @@ public:
         tableStats->SetWriteBytes(tableStats->GetWriteBytes() + Stats.WriteBytes);
         tableStats->SetEraseRows(tableStats->GetEraseRows() + Stats.EraseRows);
         tableStats->SetEraseBytes(tableStats->GetEraseBytes() + Stats.EraseBytes);
-    
+
         Stats.ReadRows = 0;
         Stats.ReadBytes = 0;
         Stats.WriteRows = 0;
@@ -1017,7 +1017,7 @@ public:
         Stats.AffectedPartitions.clear();
     }
 
-    NActors::TActorId PipeCacheId = NKikimr::MakePipePerNodeCacheID(false);
+    NActors::TActorId PipeCacheId = NKikimr::MakePipePerNodeCacheID(false, 1);
 
     TString LogPrefix;
     TWriteActorSettings MessageSettings;
@@ -1480,7 +1480,7 @@ public:
         message.From = ev->Sender;
         message.Close = ev->Get()->Close;
         message.Data = ev->Get()->Data;
-        
+
         Process();
     }
 
@@ -1780,7 +1780,7 @@ public:
         CA_LOG_D("Execute planned transaction, coordinator: " << commitInfo.Coordinator
             << ", volitale: " << ((transaction.GetFlags() & TEvTxProxy::TEvProposeTransaction::FlagVolatile) != 0)
             << ", shards: " << affectedSet.size());
-        Send(MakePipePerNodeCacheID(false), new TEvPipeCache::TEvForward(ev.Release(), commitInfo.Coordinator, /* subscribe */ true));
+        Send(MakePipePerNodeCacheID(false, 1), new TEvPipeCache::TEvForward(ev.Release(), commitInfo.Coordinator, /* subscribe */ true));
     }
 
     void Close() {
@@ -1875,7 +1875,7 @@ public:
     void Handle(TEvPersQueue::TEvProposeTransactionResult::TPtr& ev) {
         auto& event = ev->Get()->Record;
         const ui64 tabletId = event.GetOrigin();
-        
+
         CA_LOG_D("Got ProposeTransactionResult" <<
               ", PQ tablet: " << tabletId <<
               ", status: " << NKikimrPQ::TEvProposeTransactionResult_EStatus_Name(event.GetStatus()));
