@@ -178,7 +178,8 @@ public:
     }
 
 public:
-    TFastSelectExecutorActor(const TActorId& replyTo,
+    TFastSelectExecutorActor(TIntrusivePtr<TKqpCounters>& counters,
+            const TActorId& replyTo,
             const TString& sessionId,
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
@@ -186,6 +187,7 @@ public:
             const TKqpQueryState::TQueryTxId& userTxId,
             ui64 lockId)
         : TActor(&TThis::ExecuteState)
+        , Counters(counters)
         , ReplyTo(replyTo)
         , SessionId(sessionId)
         , FastQuery(std::move(fastQuery))
@@ -193,6 +195,7 @@ public:
         , Snapshot(snapshot)
         , UserTxId(userTxId)
         , LockId(lockId)
+        , StartedTs(TlsActivationContext->AsActorContext().Monotonic().Now())
     {
     }
 
@@ -226,6 +229,7 @@ private:
 
     void OnTxId(ui64 txId) {
         LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
+        TxAllocatedTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TxId = txId;
         if (LockId == 0) {
             LockId = TxId;
@@ -240,6 +244,7 @@ private:
     }
 
     void ResolveSchema(const TActorContext &ctx) {
+        StartResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TString path;
         if (FastQuery->PostgresQuery.TablePathPrefix) {
             path = FastQuery->PostgresQuery.TablePathPrefix;
@@ -261,6 +266,7 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext &ctx) {
+        StopResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         const auto* response = ev->Get();
         Y_ABORT_UNLESS(response->Request != nullptr);
 
@@ -293,6 +299,7 @@ private:
     }
 
     void ResolveShards(const TActorContext &) {
+        StartResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         KeyCells.reserve(FastQuery->KeyColumns.size());
         for (const auto& keyColumn: FastQuery->KeyColumns) {
             auto whereIt = FindCaseI(FastQuery->WhereColumnsToPos, keyColumn.Name);
@@ -334,6 +341,7 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+        StopResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
         Y_ABORT_UNLESS(msg->Request->ResultSet.size() == 1);
 
@@ -356,6 +364,7 @@ private:
     }
 
     void Execute() {
+        StartReadingTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         auto request = std::make_unique<NKikimr::TEvDataShard::TEvRead>();
         auto& record = request->Record;
         record.SetReadId(1); // we read once, so doesn't matter
@@ -499,6 +508,10 @@ private:
         LOG_T("received read result from shard " << ResolvedShardId << ", replying: " << response->ToString());
 
         Send<ESendingType::Tail>(ReplyTo, response.release());
+
+        StopReadingTs = TlsActivationContext->AsActorContext().Monotonic().Now();
+
+        ReportMetrics();
         PassAway();
     }
 
@@ -545,7 +558,24 @@ private:
         return result;
     }
 
+    void ReportMetrics() {
+        auto totalTime = StopReadingTs - StartedTs;
+        auto timeToAllocateTx = TxAllocatedTs - StartedTs;
+        auto timeToResolveScheme = StopResolveSchemeTs - StartResolveSchemeTs;
+        auto timeToResolveShards = StopResolveShardsTs - StartResolveShardsTs;
+        auto timeToRead = StopReadingTs - StartReadingTs;
+
+        Counters->ReportFastSelect(
+            totalTime.MicroSeconds(),
+            timeToAllocateTx.MicroSeconds(),
+            timeToResolveScheme.MicroSeconds(),
+            timeToResolveShards.MicroSeconds(),
+            timeToRead.MicroSeconds()
+        );
+    }
+
 private:
+    TIntrusivePtr<TKqpCounters> Counters;
     TActorId ReplyTo;
     TString SessionId;
     TFastQueryPtr FastQuery;
@@ -561,6 +591,14 @@ private:
     std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
     ui64 ResolvedShardId = 0;
 
+    TMonotonic StartedTs;
+    TMonotonic TxAllocatedTs;
+    TMonotonic StartResolveSchemeTs;
+    TMonotonic StopResolveSchemeTs;
+    TMonotonic StartResolveShardsTs;
+    TMonotonic StopResolveShardsTs;
+    TMonotonic StartReadingTs;
+    TMonotonic StopReadingTs;
 };
 
 class TFastSelectInExecutorActor : public TActor<TFastSelectInExecutorActor> {
@@ -585,7 +623,8 @@ public:
     }
 
 public:
-    TFastSelectInExecutorActor(const TActorId& replyTo,
+    TFastSelectInExecutorActor(TIntrusivePtr<TKqpCounters>& counters,
+            const TActorId& replyTo,
             const TString& sessionId,
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
@@ -593,6 +632,7 @@ public:
             const TKqpQueryState::TQueryTxId& userTxId,
             ui64 lockId)
         : TActor(&TThis::ExecuteState)
+        , Counters(counters)
         , ReplyTo(replyTo)
         , SessionId(sessionId)
         , FastQuery(std::move(fastQuery))
@@ -600,6 +640,7 @@ public:
         , Snapshot(snapshot)
         , UserTxId(userTxId)
         , LockId(lockId)
+        , StartedTs(TlsActivationContext->AsActorContext().Monotonic().Now())
     {
     }
 
@@ -632,6 +673,7 @@ private:
     }
 
     void OnTxId(ui64 txId) {
+        TxAllocatedTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
         TxId = txId;
         if (LockId == 0) {
@@ -647,6 +689,7 @@ private:
     }
 
     void ResolveSchema(const TActorContext &ctx) {
+        StartResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TString path;
         if (FastQuery->PostgresQuery.TablePathPrefix) {
             path = FastQuery->PostgresQuery.TablePathPrefix;
@@ -668,6 +711,7 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext &ctx) {
+        StopResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         const auto* response = ev->Get();
         Y_ABORT_UNLESS(response->Request != nullptr);
 
@@ -710,10 +754,10 @@ private:
     }
 
     void ResolveShards(const TActorContext &) {
+        StartResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         LOG_T("Resolving " << FastQuery->WhereSelectInPos.size() << " points");
         ResolvedPoints.resize(FastQuery->WhereSelectInPos.size());
         auto request = std::make_unique<NSchemeCache::TSchemeCacheRequest>();
-
 
         for (size_t i = 0; i < FastQuery->WhereSelectInPos.size(); ++i) {
             const auto& pointToResolve = FastQuery->WhereSelectInPos[i];
@@ -761,6 +805,7 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+        StopResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
         Y_ABORT_UNLESS(msg->Request->ResultSet.size() == FastQuery->WhereSelectInPos.size());
 
@@ -787,6 +832,7 @@ private:
     }
 
     void Execute() {
+        StartReadingTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         Response = std::make_unique<TEvKqp::TEvQueryResponse>();
         auto& queryResponse = *Response->Record.MutableResponse();
         queryResponse.SetSessionId(SessionId);
@@ -953,6 +999,9 @@ private:
             LOG_T("Replying: " << Response->ToString());
 
             Send<ESendingType::Tail>(ReplyTo, Response.release());
+
+            StopReadingTs = TlsActivationContext->AsActorContext().Monotonic().Now();
+            ReportMetrics();
             PassAway();
         }
     }
@@ -1000,7 +1049,24 @@ private:
         return result;
     }
 
+    void ReportMetrics() {
+        auto totalTime = StopReadingTs - StartedTs;
+        auto timeToAllocateTx = TxAllocatedTs - StartedTs;
+        auto timeToResolveScheme = StopResolveSchemeTs - StartResolveSchemeTs;
+        auto timeToResolveShards = StopResolveShardsTs - StartResolveShardsTs;
+        auto timeToRead = StopReadingTs - StartReadingTs;
+
+        Counters->ReportFastSelectIn(
+            totalTime.MicroSeconds(),
+            timeToAllocateTx.MicroSeconds(),
+            timeToResolveScheme.MicroSeconds(),
+            timeToResolveShards.MicroSeconds(),
+            timeToRead.MicroSeconds()
+        );
+    }
+
 private:
+    TIntrusivePtr<TKqpCounters> Counters;
     TActorId ReplyTo;
     TString SessionId;
     TFastQueryPtr FastQuery;
@@ -1022,6 +1088,15 @@ private:
 
     size_t WaitingRepliesCount = 0;
     std::unique_ptr<TEvKqp::TEvQueryResponse> Response;
+
+    TMonotonic StartedTs;
+    TMonotonic TxAllocatedTs;
+    TMonotonic StartResolveSchemeTs;
+    TMonotonic StopResolveSchemeTs;
+    TMonotonic StartResolveShardsTs;
+    TMonotonic StopResolveShardsTs;
+    TMonotonic StartReadingTs;
+    TMonotonic StopReadingTs;
 };
 
 class TFastUpsertActor : public TActor<TFastUpsertActor> {
@@ -1031,7 +1106,8 @@ public:
     }
 
 public:
-    TFastUpsertActor(const TActorId& replyTo,
+    TFastUpsertActor(TIntrusivePtr<TKqpCounters>& counters,
+            const TActorId& replyTo,
             const TString& sessionId,
             TFastQueryPtr fastQuery,
             const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>& params,
@@ -1039,6 +1115,7 @@ public:
             const TKqpQueryState::TQueryTxId& userTxId,
             ui64 lockId)
         : TActor(&TThis::ExecuteState)
+        , Counters(counters)
         , ReplyTo(replyTo)
         , SessionId(sessionId)
         , FastQuery(std::move(fastQuery))
@@ -1046,6 +1123,7 @@ public:
         , Snapshot(snapshot)
         , UserTxId(userTxId)
         , LockId(lockId)
+        , StartedTs(TlsActivationContext->AsActorContext().Monotonic().Now())
     {
     }
 
@@ -1078,6 +1156,7 @@ private:
     }
 
     void OnTxId(ui64 txId) {
+        TxAllocatedTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
         TxId = txId;
         if (LockId == 0) {
@@ -1093,6 +1172,7 @@ private:
     }
 
     void ResolveSchema(const TActorContext &ctx) {
+        StartResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TString path = FastQuery->Database + "/" + FastQuery->TableName;
         LOG_T("Resolving " << path);
 
@@ -1108,6 +1188,7 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext &ctx) {
+        StopResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         const auto* response = ev->Get();
         Y_ABORT_UNLESS(response->Request != nullptr);
 
@@ -1162,6 +1243,7 @@ private:
     }
 
     void ResolveShards(const TActorContext &) {
+        StartResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         auto it = FindCaseI(Parameters, "$batch");
         if (it == Parameters.end()) {
             TStringStream ss;
@@ -1230,6 +1312,7 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+        StopResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
 
         for (size_t i = 0; i < msg->Request->ResultSet.size(); ++i) {
@@ -1255,6 +1338,7 @@ private:
     }
 
     void Execute() {
+        StartWritingTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         Response = std::make_unique<TEvKqp::TEvQueryResponse>();
         auto& queryResponse = *Response->Record.MutableResponse();
         queryResponse.SetSessionId(SessionId);
@@ -1383,6 +1467,8 @@ private:
             LOG_T("Replying: " << Response->ToString());
 
             Send<ESendingType::Tail>(ReplyTo, Response.release());
+            StopWritingTs = TlsActivationContext->AsActorContext().Monotonic().Now();
+            ReportMetrics();
             PassAway();
         }
     }
@@ -1433,7 +1519,24 @@ private:
         return result;
     }
 
+    void ReportMetrics() {
+        auto totalTime = StopWritingTs - StartedTs;
+        auto timeToAllocateTx = TxAllocatedTs - StartedTs;
+        auto timeToResolveScheme = StopResolveSchemeTs - StartResolveSchemeTs;
+        auto timeToResolveShards = StopResolveShardsTs - StartResolveShardsTs;
+        auto timeToRead = StopWritingTs - StartWritingTs;
+
+        Counters->ReportFastUpsert(
+            totalTime.MicroSeconds(),
+            timeToAllocateTx.MicroSeconds(),
+            timeToResolveScheme.MicroSeconds(),
+            timeToResolveShards.MicroSeconds(),
+            timeToRead.MicroSeconds()
+        );
+    }
+
 private:
+    TIntrusivePtr<TKqpCounters> Counters;
     TActorId ReplyTo;
     TString SessionId;
     TFastQueryPtr FastQuery;
@@ -1455,6 +1558,15 @@ private:
 
     size_t WaitingRepliesCount = 0;
     std::unique_ptr<TEvKqp::TEvQueryResponse> Response;
+
+    TMonotonic StartedTs;
+    TMonotonic TxAllocatedTs;
+    TMonotonic StartResolveSchemeTs;
+    TMonotonic StopResolveSchemeTs;
+    TMonotonic StartResolveShardsTs;
+    TMonotonic StopResolveShardsTs;
+    TMonotonic StartWritingTs;
+    TMonotonic StopWritingTs;
 };
 
 class TKqpSessionActor : public TActorBootstrapped<TKqpSessionActor> {
@@ -1613,6 +1725,10 @@ public:
 
         QueryResponse = std::unique_ptr<TEvKqp::TEvQueryResponse>(ev->Release().Release());
         Cleanup();
+    }
+
+    void ReplySelect1() {
+        ReplySuccess(true);
     }
 
     void ReplyTransactionNotFound(const TString& txId) {
@@ -2182,6 +2298,7 @@ public:
         switch (QueryState->FastQuery->ExecutionType) {
         case TFastQuery::EExecutionType::SELECT_QUERY:
             actor = new TFastSelectExecutorActor(
+                Counters,
                 SelfId(),
                 SessionId,
                 QueryState->FastQuery,
@@ -2192,6 +2309,7 @@ public:
             break;
         case TFastQuery::EExecutionType::SELECT_IN_QUERY:
             actor = new TFastSelectInExecutorActor(
+                Counters,
                 SelfId(),
                 SessionId,
                 QueryState->FastQuery,
@@ -2203,6 +2321,7 @@ public:
         case TFastQuery::EExecutionType::UPSERT:
             QueryState->TxCtx->SetHasFastWrites();
             actor = new TFastUpsertActor(
+                Counters,
                 SelfId(),
                 SessionId,
                 QueryState->FastQuery,
@@ -2211,6 +2330,9 @@ public:
                 QueryState->TxId,
                 lockId);
             break;
+        case TFastQuery::EExecutionType::SELECT1:
+            ReplySelect1();
+            return;
         default:
             Y_VERIFY(actor);
         }
@@ -3276,7 +3398,7 @@ public:
         Counters->ReportQueryMaxShardProgramSize(Settings.DbCounters, stats.MaxShardProgramSize);
     }
 
-    void ReplySuccess() {
+    void ReplySuccess(bool addEmptyResultSet = false) {
         YQL_ENSURE(QueryState);
         auto resEv = std::make_unique<TEvKqp::TEvQueryResponse>();
         auto *record = &resEv->Record;
@@ -3287,6 +3409,10 @@ public:
         }
 
         AddQueryIssues(*response, QueryState->Issues);
+
+        if (addEmptyResultSet) {
+            response->AddYdbResults();
+        }
 
         FillStats(record);
 

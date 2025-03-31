@@ -25,6 +25,7 @@ struct TPostgresQuery {
 struct TFastQuery {
     enum class EExecutionType {
         UNSUPPORTED = 0,
+        SELECT1,
         SELECT_QUERY,
         SELECT_IN_QUERY,
         UPSERT,

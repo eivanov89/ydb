@@ -107,6 +107,8 @@ protected:
     void ReportRecompileRequestGet();
     ::NMonitoring::TDynamicCounterPtr GetQueryReplayCounters() const;
 
+    void ReportFastBase(ui64 allocate, ui64 scheme, ui64 shards);
+
 protected:
     ::NMonitoring::TDynamicCounterPtr Counters;
     ::NMonitoring::TDynamicCounterPtr KqpGroup;
@@ -213,6 +215,17 @@ protected:
     ::NMonitoring::TDynamicCounters::TCounterPtr RegularQuery;
     NMonitoring::THistogramPtr CompileCpuTime;
     NMonitoring::THistogramPtr YdbCompileDuration;
+
+    // Fast Querues
+    NMonitoring::THistogramPtr FastSelectTotalTime;
+    NMonitoring::THistogramPtr FastSelectInTotalTime;
+    NMonitoring::THistogramPtr FastUpsertTotalTime;
+    NMonitoring::THistogramPtr FastAllocateTxTime;
+    NMonitoring::THistogramPtr FastResolveSchemeTime;
+    NMonitoring::THistogramPtr FastResolveShardsTime;
+    NMonitoring::THistogramPtr FastReadTime;
+    NMonitoring::THistogramPtr FastReadInTime;
+    NMonitoring::THistogramPtr FastWriteTime;
 };
 
 
@@ -340,6 +353,10 @@ public:
     void ReportCompileRequestTimeout(TKqpDbCountersPtr dbCounters);
     void ReportCompileDurations(TKqpDbCountersPtr dbCounters, TDuration duration, TDuration cpuTime);
     void ReportRecompileRequestGet(TKqpDbCountersPtr dbCounters);
+
+    void ReportFastSelect(ui64 total, ui64 allocate, ui64 scheme, ui64 shards, ui64 read);
+    void ReportFastSelectIn(ui64 total, ui64 allocate, ui64 scheme, ui64 shards, ui64 read);
+    void ReportFastUpsert(ui64 total, ui64 allocate, ui64 scheme, ui64 shards, ui64 write);
 
     const ::NMonitoring::TDynamicCounters::TCounterPtr RecompileRequestGet() const;
     ::NMonitoring::TDynamicCounterPtr GetKqpCounters() const;

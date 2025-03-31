@@ -254,6 +254,26 @@ TFastQuery::EParamType GetParamType(const std::string& typeStr) {
     return (it != typeMap.end()) ? it->second : TFastQuery::EParamType::UNKNOWN;
 }
 
+void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
+    // XXX avoid multiline issues
+    TString query;
+    query.reserve(yqlQuery.size());
+    for (auto ch: yqlQuery) {
+        if (ch != '\n') {
+            query.append(ch);
+        } else {
+            query.append(' ');
+        }
+    }
+
+    const std::regex select1Pattern(R"(\s*SELECT\s+1\s*;\s*)", std::regex::icase);
+    if (std::regex_search(query.c_str(), select1Pattern)) {
+        result->ExecutionType = TFastQuery::EExecutionType::SELECT1;
+    }
+
+    return;
+}
+
 void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
     // Only upserts like this one for now:
     //  DECLARE $batch AS List<Struct<p1:Int32?, p2:Int32, p3:Int32, p4:Int32>>;
@@ -404,6 +424,11 @@ TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
     // for some dumb reason our parser returns "limitOption": "LIMIT_OPTION_COUNT", when there is
     // no limit. So we have to check it here manually
     if (std::regex_search(yqlQuery.c_str(), LimitRegex)) {
+        return result;
+    }
+
+    TryCompileSelect1(yqlQuery, result);
+    if (result->ExecutionType == TFastQuery::EExecutionType::SELECT1) {
         return result;
     }
 

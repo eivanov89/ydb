@@ -209,6 +209,20 @@ Y_UNIT_TEST(ShouldTransformToPostgresSyntaxPragma1) {
     UNIT_ASSERT_EQUAL(result.Query, expectedPostgresQuery);
 }
 
+Y_UNIT_TEST(FastSelect1) {
+    TString query = R"(
+        PRAGMA TablePathPrefix("/Root/db1");
+        Select 1;
+    )";
+
+    size_t goldHash = THash<TString>()(query);
+
+    TFastQueryPtr fastQuery = CompileToFastQuery(query);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->OriginalQueryHash, goldHash);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->ExecutionType, TFastQuery::EExecutionType::SELECT1);
+    UNIT_ASSERT_VALUES_EQUAL(fastQuery->TableName, "");
+}
+
 Y_UNIT_TEST(FastUpsertBasic) {
     TString query = R"(
         PRAGMA TablePathPrefix("/Root/db1");
@@ -508,6 +522,39 @@ Y_UNIT_TEST(ShouldNotQueriesWithIndex) {
 }
 
 Y_UNIT_TEST_SUITE(KqpFastQueryExecution) {
+
+Y_UNIT_TEST(ShouldSelect1) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/customer` (
+            C_W_ID         Int32            NOT NULL,
+            C_D_ID         Int32            NOT NULL,
+            C_ID           Int32            NOT NULL,
+            C_DISCOUNT     Double,
+            C_CREDIT       Utf8,
+            C_LAST         Utf8,
+            C_FIRST        Utf8,
+
+            PRIMARY KEY (C_W_ID, C_D_ID, C_ID)
+        )
+    )").GetValueSync().IsSuccess());
+
+    TString query = R"(
+        --!syntax_v1
+
+        SELECT 1;
+    )";
+
+    auto txControl = TTxControl::BeginTx().CommitTx();
+
+    auto result = session.ExecuteDataQuery(query, txControl).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+}
 
 Y_UNIT_TEST(ShouldSelect) {
     TKikimrRunner kikimr;
