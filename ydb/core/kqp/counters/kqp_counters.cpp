@@ -255,6 +255,62 @@ void TKqpCountersBase::Init() {
 
     YdbCompileDuration = YdbGroup->GetNamedHistogram("name",
         "table.query.compilation.latency_milliseconds", NMonitoring::ExponentialHistogram(20, 2, 1));
+
+    FastSelectTotalTime = KqpGroup->GetHistogram(
+        "FastSelectTotalTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastSelectTotalTime = KqpGroup->GetHistogram(
+        "FastSelectTotalTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastUpsertTotalTime = KqpGroup->GetHistogram(
+        "FastUpsertTotalTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastSelectInTotalTime = KqpGroup->GetHistogram(
+        "FastSelectInTotalTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastAllocateTxTime = KqpGroup->GetHistogram(
+        "FastAllocateTxTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastResolveSchemeTime = KqpGroup->GetHistogram(
+        "FastResolveSchemeTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastResolveShardsTime = KqpGroup->GetHistogram(
+        "FastResolveShardsTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastReadTime = KqpGroup->GetHistogram(
+        "FastReadTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastReadInTime = KqpGroup->GetHistogram(
+        "FastReadInTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+
+    FastWriteTime = KqpGroup->GetHistogram(
+        "FastWriteTime",
+        NMonitoring::ExplicitHistogram(
+            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
+}
+
+void TKqpCountersBase::ReportFastBase(ui64 allocate, ui64 scheme, ui64 shards) {
+    FastAllocateTxTime->Collect(allocate);
+    FastResolveSchemeTime->Collect(scheme);
+    FastResolveShardsTime->Collect(shards);
 }
 
 void TKqpCountersBase::ReportQueryAction(NKikimrKqp::EQueryAction action) {
@@ -1319,6 +1375,25 @@ void TKqpCounters::ReportRecompileRequestGet(TKqpDbCountersPtr dbCounters) {
     if (dbCounters) {
         dbCounters->ReportRecompileRequestGet();
     }
+}
+
+void TKqpCounters::ReportFastSelect(ui64 total, ui64 allocate, ui64 scheme, ui64 shards, ui64 read) {
+    ReportFastBase(allocate, scheme, shards);
+    FastSelectTotalTime->Collect(total);
+    FastReadTime->Collect(read);
+}
+
+void TKqpCounters::ReportFastSelectIn(ui64 total, ui64 allocate, ui64 scheme, ui64 shards, ui64 read) {
+    ReportFastBase(allocate, scheme, shards);
+    FastSelectInTotalTime->Collect(total);
+    FastReadInTime->Collect(read);
+
+}
+
+void TKqpCounters::ReportFastUpsert(ui64 total, ui64 allocate, ui64 scheme, ui64 shards, ui64 write) {
+    ReportFastBase(allocate, scheme, shards);
+    FastUpsertTotalTime->Collect(total);
+    FastWriteTime->Collect(write);
 }
 
 const ::NMonitoring::TDynamicCounters::TCounterPtr TKqpCounters::RecompileRequestGet() const {
