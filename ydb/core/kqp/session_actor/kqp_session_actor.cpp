@@ -586,6 +586,9 @@ private:
     }
 
     void ReportMetrics() {
+        if (!Counters) {
+            return;
+        }
         auto totalTime = StopReadingTs - StartedTs;
         auto timeToAllocateTx = TxAllocatedTs - StartedTs;
         auto timeToResolveScheme = StopResolveSchemeTs - StartResolveSchemeTs;
@@ -1077,6 +1080,10 @@ private:
     }
 
     void ReportMetrics() {
+        if (!Counters) {
+            return;
+        }
+
         auto totalTime = StopReadingTs - StartedTs;
         auto timeToAllocateTx = TxAllocatedTs - StartedTs;
         auto timeToResolveScheme = StopResolveSchemeTs - StartResolveSchemeTs;
@@ -1547,6 +1554,10 @@ private:
     }
 
     void ReportMetrics() {
+        if (!Counters) {
+            return;
+        }
+
         auto totalTime = StopWritingTs - StartedTs;
         auto timeToAllocateTx = TxAllocatedTs - StartedTs;
         auto timeToResolveScheme = StopResolveSchemeTs - StartResolveSchemeTs;
@@ -2213,7 +2224,9 @@ public:
         }
 
         if (QueryState->FastQuery) {
-            PrepareQueryTransaction();
+            if (!PrepareQueryTransaction()) {
+                return;
+            }
         } else {
             if (!PrepareQueryContext()) {
                 return;

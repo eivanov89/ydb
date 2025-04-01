@@ -266,8 +266,8 @@ void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
         }
     }
 
-    const std::regex select1Pattern(R"(\s*SELECT\s+1\s*;\s*)", std::regex::icase);
-    if (std::regex_search(query.c_str(), select1Pattern)) {
+    const std::regex select1Pattern(R"(\s*SELECT\s+1;\s*)", std::regex::icase);
+    if (std::regex_search(query.begin(), query.end(), select1Pattern)) {
         result->ExecutionType = TFastQuery::EExecutionType::SELECT1;
     }
 
