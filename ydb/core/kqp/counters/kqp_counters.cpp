@@ -261,18 +261,13 @@ void TKqpCountersBase::Init() {
         NMonitoring::ExplicitHistogram(
             {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
 
-    FastSelectTotalTime = KqpGroup->GetHistogram(
-        "FastSelectTotalTime",
+    FastSelectInTotalTime = KqpGroup->GetHistogram(
+        "FastSelectInTotalTime",
         NMonitoring::ExplicitHistogram(
             {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
 
     FastUpsertTotalTime = KqpGroup->GetHistogram(
         "FastUpsertTotalTime",
-        NMonitoring::ExplicitHistogram(
-            {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
-
-    FastSelectInTotalTime = KqpGroup->GetHistogram(
-        "FastSelectInTotalTime",
         NMonitoring::ExplicitHistogram(
             {10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000, 1250, 1500, 1750, 2000, 2500, 5000}));
 
