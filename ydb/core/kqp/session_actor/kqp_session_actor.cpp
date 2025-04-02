@@ -2035,12 +2035,14 @@ public:
                     fastQuery->Database = QueryState->Database;
                     fastQuery->DatabaseId = QueryState->UserRequestContext->DatabaseId;
                 }
+                Counters->ReportFastQuery(Settings.DbCounters);
                 LOG_T("Query is a fast query: " << QueryState->GetQuery() << ", " << fastQuery->ToString());
 
                 QueryState->FastQuery = std::move(fastQuery);
                 OnSuccessCompileRequest();
                 return;
             } else {
+                Counters->ReportRegularQuery(Settings.DbCounters);
                 LOG_T("Query is not fast query: " << QueryState->GetQuery()
                     << (fastQuery ? fastQuery->ToString() : TString()) );
             }
@@ -2335,8 +2337,6 @@ public:
 
     void ExecuteFastQuery() {
         ui64 lockId = QueryState->TxCtx->Locks.GetLockTxId();
-
-        Counters->ReportFastQuery(Settings.DbCounters);
 
         IActor* actor = nullptr;
         switch (QueryState->FastQuery->ExecutionType) {
@@ -2723,8 +2723,6 @@ public:
     }
 
     void ExecuteOrDefer() {
-        Counters->ReportRegularQuery(Settings.DbCounters);
-
         bool haveWork = QueryState->PreparedQuery &&
                 QueryState->CurrentTx < QueryState->PreparedQuery->GetPhysicalQuery().TransactionsSize()
                     || QueryState->Commit && !QueryState->Commited;
