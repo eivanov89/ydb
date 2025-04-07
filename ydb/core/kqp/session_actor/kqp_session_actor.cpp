@@ -171,6 +171,145 @@ struct TKqpCleanupCtx {
     }
 };
 
+class TFastSelect1 : public TActor<TFastSelect1> {
+    public:
+        static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+            return NKikimrServices::TActivity::KQP_FAST_QUERY_ACTOR;
+        }
+
+    public:
+        TFastSelect1(TIntrusivePtr<TKqpCounters>& counters,
+                const TActorId& replyTo,
+                const TString& sessionId,
+                TFastQueryPtr fastQuery,
+                const TKqpQueryState::TQueryTxId& userTxId,
+                ui64 lockId)
+            : TActor(&TThis::ExecuteState)
+            , Counters(counters)
+            , ReplyTo(replyTo)
+            , SessionId(sessionId)
+            , FastQuery(std::move(fastQuery))
+            , UserTxId(userTxId)
+            , LockId(lockId)
+            , StartedTs(TlsActivationContext->AsActorContext().Monotonic().Now())
+        {
+        }
+
+        STATEFN(ExecuteState) {
+            try {
+                switch (ev->GetTypeRewrite()) {
+                    hFunc(TEvKqpExecuter::TEvTxRequest, Handle);
+                    hFunc(TEvTxUserProxy::TEvAllocateTxIdResult, Handle);
+                    hFunc(TEvents::TEvUndelivered, Handle);
+                default:
+                    UnexpectedEvent("ExecuteState", ev);
+                }
+            } catch (const TRequestFail& ex) {
+                ReplyQueryError(ex.Status, ex.what(), ex.Issues);
+            } catch (const yexception& ex) {
+                InternalError(ex.what());
+            }
+        }
+
+    private:
+        void Handle(TEvKqpExecuter::TEvTxRequest::TPtr& ev) {
+            OnTxId(ev->Get()->Record.GetRequest().GetTxId());
+        }
+
+        void Handle(TEvTxUserProxy::TEvAllocateTxIdResult::TPtr& ev) {
+            OnTxId(ev->Get()->TxId);
+        }
+
+        void OnTxId(ui64 txId) {
+            LOG_T("allocated txId " << txId << " for query " << FastQuery->PostgresQuery.Query);
+            TxAllocatedTs = TlsActivationContext->AsActorContext().Monotonic().Now();
+            TxId = txId;
+            if (LockId == 0) {
+                LockId = TxId;
+                LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
+            }
+
+            Execute();
+        }
+
+        void Execute() {
+            auto response = std::make_unique<TEvKqp::TEvQueryResponse>();
+            response->Record.SetYdbStatus(Ydb::StatusIds::SUCCESS);
+
+            auto& queryResponse = *response->Record.MutableResponse();
+            queryResponse.SetSessionId(SessionId);
+            queryResponse.AddYdbResults();
+
+            queryResponse.MutableTxMeta()->set_id(UserTxId.GetValue().GetHumanStr());
+
+            LOG_T("replying: " << response->ToString());
+
+            Send<ESendingType::Tail>(ReplyTo, response.release());
+            PassAway();
+        }
+
+        void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+            Execute();
+        }
+
+        void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+            InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
+                << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
+                << " sender: " << ev->Sender);
+        }
+
+        void InternalError(const TString& message) {
+            LOG_E("Internal error, message: " << message);
+            ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, message);
+        }
+
+        void ReplyQueryError(Ydb::StatusIds::StatusCode ydbStatus,
+            const TString& message,
+            std::optional<google::protobuf::RepeatedPtrField<Ydb::Issue::IssueMessage>> issues = {})
+        {
+            LOG_W(" error:" << message);
+
+            auto queryResponse = std::make_unique<TEvKqp::TEvQueryResponse>();
+            queryResponse->Record.SetYdbStatus(ydbStatus);
+
+            if (issues) {
+                auto* response = queryResponse->Record.MutableResponse();
+                for (auto& i : *issues) {
+                    response->AddQueryIssues()->Swap(&i);
+                }
+            }
+
+            Send<ESendingType::Tail>(ReplyTo, queryResponse.release());
+            PassAway();
+        }
+
+        TString LogPrefix() const {
+            TStringBuilder result = TStringBuilder()
+                << "Fast executor SessionId: " << SessionId << ", "
+                << "ActorId: " << SelfId() << ", ";
+            return result;
+        }
+
+    private:
+        TIntrusivePtr<TKqpCounters> Counters;
+        TActorId ReplyTo;
+        TString SessionId;
+        TFastQueryPtr FastQuery;
+        TKqpQueryState::TQueryTxId UserTxId;
+        ui64 LockId;
+
+        ui64 TxId = 0;
+        NLongTxService::TLockHandle LockHandle;
+
+        TVector<TCell> KeyCells;
+        std::unique_ptr<NKikimr::TKeyDesc> ResolvedKeys;
+
+        TMonotonic StartedTs;
+        TMonotonic TxAllocatedTs;
+        TMonotonic StartResolveSchemeTs;
+        TMonotonic StopResolveSchemeTs;
+    };
+
 class TFastSelectExecutorActor : public TActor<TFastSelectExecutorActor> {
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -1738,10 +1877,6 @@ public:
         Cleanup();
     }
 
-    void ReplySelect1() {
-        ReplySuccess(true);
-    }
-
     void ReplyTransactionNotFound(const TString& txId) {
         std::vector<TIssue> issues{YqlIssue(TPosition(), TIssuesIds::KIKIMR_TRANSACTION_NOT_FOUND,
             TStringBuilder() << "Transaction not found: " << txId)};
@@ -2344,8 +2479,14 @@ public:
                 lockId);
             break;
         case TFastQuery::EExecutionType::SELECT1:
-            ReplySelect1();
-            return;
+            actor = new TFastSelect1(
+                Counters,
+                SelfId(),
+                SessionId,
+                QueryState->FastQuery,
+                QueryState->TxId,
+                lockId);
+            break;
         default:
             Y_VERIFY(actor);
         }
