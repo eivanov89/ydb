@@ -242,7 +242,7 @@ public:
     TFastQueryPtr& FastQuery;
 };
 
-/*
+
 TFastQuery::EParamType GetParamType(const std::string& typeStr) {
     static const std::unordered_map<std::string, TFastQuery::EParamType> typeMap = {
         {"Int32", TFastQuery::EParamType::INT32},
@@ -256,6 +256,7 @@ TFastQuery::EParamType GetParamType(const std::string& typeStr) {
     return (it != typeMap.end()) ? it->second : TFastQuery::EParamType::UNKNOWN;
 }
 
+/*
 void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
     // XXX avoid multiline issues
     TString query;
@@ -275,7 +276,7 @@ void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
 
     return;
 }
-
+*/
 
 void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
     // Only upserts like this one for now:
@@ -346,7 +347,6 @@ void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
         result->ExecutionType = TFastQuery::EExecutionType::UPSERT;
     }
 }
-    */
 
 } // anonymous
 
@@ -436,13 +436,13 @@ TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
     if (result->ExecutionType == TFastQuery::EExecutionType::SELECT1) {
         return result;
     }
+    */
 
     // check if this is upsert
     TryCompileUpsert(yqlQuery, result);
     if (result->ExecutionType != TFastQuery::EExecutionType::UNSUPPORTED) {
         return result;
     }
-    */
 
     result->PostgresQuery = YQL2Postgres(yqlQuery);
     if (result->PostgresQuery.Query.empty()) {
