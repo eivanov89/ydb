@@ -38,21 +38,37 @@ struct TFastQuery {
     TString Database;
     TString DatabaseId;
 
-    // parsed items
+    // parsed items for SELECT
+
     TString TableName;
     std::vector<TString> ColumnsToSelect;
 
     THashMap<TString, size_t> WhereColumnsToPos;
 
+    // parsed items for SELECT IN
+
     TVector<TString> WhereSelectInColumns; // column names
     TVector<TVector<size_t>> WhereSelectInPos; // points
 
     // resolved items
+
     THashMap<TString, TSysTables::TTableColumnInfo> ResolvedColumns;
     TVector<TKeyDesc::TColumnOp> Columns;
     TVector<TSysTables::TTableColumnInfo> KeyColumns;
     TVector<NScheme::TTypeInfo> KeyColumnTypes;
     TTableId TableId = {};
+
+    bool NeedToResolveIndex = false;
+    struct TResolvedIndex {
+        TTableId TableId;
+        TVector<TKeyDesc::TColumnOp> Columns;
+        TVector<TKeyDesc::TColumnOp> ColumnInfos;
+        TVector<NScheme::TTypeInfo> ColumnTypes;
+
+        // indices in ColumnsToUpsert and UpsertParams
+        TVector<size_t> OrderedColumnParams;
+    };
+    std::optional<TResolvedIndex> ResolvedIndex;
 
     TVector<size_t> OrderedWhereSelectInColumns;
 
@@ -66,7 +82,7 @@ struct TFastQuery {
         INT64,
         DOUBLE,
         TIMESTAMP,
-        TEXT,
+        TEXT, // either Utf8 or Text
     };
 
     struct TUpsertParam {
@@ -85,7 +101,7 @@ struct TFastQuery {
     TVector<TString> ColumnsToUpsert;
     TVector<TUpsertParam> UpsertParams;
 
-    // e.g. indices for p5, p1, p2 - index within ColumnsToUpsert / UpsertParams
+    // e.g. indices for p5, p1, p2 - index within ColumnsToUpsert and UpsertParams
     TVector<size_t> OrderedKeyParams;
     TVector<size_t> AllOrderedParams;
 

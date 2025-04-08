@@ -24,7 +24,7 @@ NYql::TIssue GetLocksInvalidatedIssue(const TKqpTransactionContext& txCtx, const
                 return YqlIssue(TPosition(), TIssuesIds::KIKIMR_LOCKS_INVALIDATED, message << " Table: " << "`" << table << "`");
             }
         }
-        return YqlIssue(TPosition(), TIssuesIds::KIKIMR_LOCKS_INVALIDATED, message << " Unknown table."); 
+        return YqlIssue(TPosition(), TIssuesIds::KIKIMR_LOCKS_INVALIDATED, message << " Unknown table.");
     }
 }
 
@@ -52,7 +52,7 @@ NYql::TIssue GetLocksInvalidatedIssue(const TShardIdToTableInfo& shardIdToTableI
         }
         return YqlIssue(TPosition(), TIssuesIds::KIKIMR_LOCKS_INVALIDATED, message);
     } else {
-        message << " Unknown table.";   
+        message << " Unknown table.";
     }
     return YqlIssue(TPosition(), TIssuesIds::KIKIMR_LOCKS_INVALIDATED, message);
 }
@@ -128,8 +128,8 @@ TKqpTransactionInfo TKqpTransactionContext::GetInfo() const {
     }
 
     // Kind
-    bool hasReads = false;
-    bool hasWrites = false;
+    bool hasReads = HasFastReads;
+    bool hasWrites = HasFastWrites;
     for (auto& pair : TableOperations) {
         hasReads = hasReads || (pair.second & KikimrReadOps());
         hasWrites = hasWrites || (pair.second & KikimrModifyOps());

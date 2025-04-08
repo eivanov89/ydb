@@ -196,6 +196,10 @@ public:
         HasFastWrites = true;
     }
 
+    void SetHasFastReads() {
+        HasFastReads = true;
+    }
+
     bool TxHasFastWrites() const {
         return HasFastWrites;
     }
@@ -343,6 +347,7 @@ public:
     TDeferredEffects DeferredEffects;
     bool HasImmediateEffects = false;
     bool HasFastWrites = false;
+    bool HasFastReads = false;
     NTopic::TTopicOperations TopicOperations;
     TIntrusivePtr<TParamsState> ParamsState;
     TTxAllocatorState::TPtr TxAlloc;
