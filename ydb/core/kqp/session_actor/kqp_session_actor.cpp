@@ -375,6 +375,7 @@ private:
             LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
         }
 
+        // TODO: fix race
         if (FastQuery->ResolvedColumns.empty()) {
             return ResolveSchema(TlsActivationContext->AsActorContext());
         }
@@ -823,6 +824,7 @@ private:
             LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
         }
 
+        // TODO: fix race
         if (FastQuery->ResolvedColumns.empty()) {
             return ResolveSchema(TlsActivationContext->AsActorContext());
         }
@@ -1310,6 +1312,7 @@ private:
             LockHandle = NLongTxService::TLockHandle(TxId, TActivationContext::ActorSystem());
         }
 
+        // TODO: fix race
         if (FastQuery->ResolvedColumns.empty()) {
             return ResolveSchema(TlsActivationContext->AsActorContext());
         }
@@ -1334,23 +1337,61 @@ private:
     }
 
     void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext &ctx) {
-        StopResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         const auto* response = ev->Get();
         Y_ABORT_UNLESS(response->Request != nullptr);
 
         Y_ABORT_UNLESS(response->Request->ResultSet.size() == 1);
         const auto& entry = response->Request->ResultSet.front();
 
-        FastQuery->TableId = entry.TableId;
-
         if (entry.Status != NSchemeCache::TSchemeCacheNavigate::EStatus::Ok) {
             return ReplyQueryError(Ydb::StatusIds::SCHEME_ERROR, ToString(entry.Status));
         }
 
+        // quick and dirty as everything here
+        if (FastQuery->NeedToResolveIndex) {
+
+            FastQuery->ResolvedIndex = TFastQuery::TResolvedIndex();
+
+            // FIXME: +1 hack to get impl table
+            FastQuery->ResolvedIndex->TableId = entry.TableId;
+            FastQuery->ResolvedIndex->ColumnTypes.reserve(entry.Columns.size());
+            FastQuery->ResolvedIndex->Columns.reserve(entry.Columns.size());
+
+            for (const auto& [_, info] : entry.Columns) {
+                if (info.KeyOrder != -1) {
+                    FastQuery->ResolvedIndex->Columns.emplace_back(info.Id, TKeyDesc::EColumnOperation::Read, info.PType, 0, 0);
+                    FastQuery->ResolvedIndex->ColumnTypes.emplace_back(info.PType);
+                    for (size_t i = 0; i < FastQuery->UpsertParams.size(); ++i) {
+                        if (IsEqual(info.Name, FastQuery->UpsertParams[i].ColumnName)) {
+                            FastQuery->ResolvedIndex->OrderedColumnParams.push_back(i);
+                        }
+                    }
+                } else {
+                    return ReplyQueryError(
+                        Ydb::StatusIds::BAD_REQUEST,
+                        TStringBuilder() << "Covering indexes are not supported, column: " << info.Name);
+                }
+            }
+
+            if (FastQuery->ResolvedIndex->OrderedColumnParams.size() != FastQuery->ResolvedIndex->Columns.size()) {
+                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Upsert doesn't have all needed columns");
+            }
+
+            LOG_T("Found index for table " << FastQuery->TableName
+                << ", tableId: " << FastQuery->ResolvedIndex->TableId
+                << ", index columns size: " << FastQuery->ResolvedIndex->Columns.size());
+
+            StopResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
+            ResolveShards(ctx);
+            return;
+        }
+
+        FastQuery->TableId = entry.TableId;
         FastQuery->ResolvedColumns.reserve(entry.Columns.size());
         FastQuery->Columns.reserve(entry.Columns.size());
         FastQuery->KeyColumns.reserve(entry.Columns.size());
         FastQuery->KeyColumnTypes.reserve(entry.Columns.size());
+        FastQuery->OrderedKeyParams.reserve(entry.Columns.size());
 
         TVector<size_t> nonKeyColumnsOrder;
         nonKeyColumnsOrder.reserve(entry.Columns.size());
@@ -1380,12 +1421,44 @@ private:
             nonKeyColumnsOrder.begin(),
             nonKeyColumnsOrder.end());
 
+        // handle index data if any
+
+        if (entry.Indexes.size() > 1) {
+            return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Table has more than one index");
+        }
+
         LOG_T("Resolved to tableId " << FastQuery->TableId << " with key columns size " << FastQuery->KeyColumns.size()
             << " and total columns size " << FastQuery->ResolvedColumns.size()
             << ", OrderedKeyParams size " << FastQuery->OrderedKeyParams.size()
             << ", AllOrderedParams size " << FastQuery->AllOrderedParams.size());
 
-        ResolveShards(ctx);
+        if (entry.Indexes.size() == 1) {
+            FastQuery->NeedToResolveIndex = true;
+
+            const auto& index = entry.Indexes[0];
+
+            TString path = FastQuery->Database + "/" + FastQuery->TableName + "/" + index.GetName() + "/indexImplTable";
+            LOG_T("Resolving index " << path);
+
+            auto request = std::make_unique<NSchemeCache::TSchemeCacheNavigate>();
+            NSchemeCache::TSchemeCacheNavigate::TEntry indexEntry;
+
+            // XXX: this +1 is OK for this quick proto
+            //indexEntry.TableId =
+            //    TTableId(index.GetPathOwnerId(), index.GetLocalPathId() + 1, index.GetSchemaVersion());
+            //indexEntry.RequestType = NSchemeCache::TSchemeCacheNavigate::TEntry::ERequestType::ByTableId;
+            indexEntry.Path = ::NKikimr::SplitPath(path);
+            if (indexEntry.Path.empty()) {
+                return ReplyQueryError(Ydb::StatusIds::NOT_FOUND, "Invalid index table path specified");
+            }
+            indexEntry.Operation = NSchemeCache::TSchemeCacheNavigate::OpTable;
+            indexEntry.ShowPrivatePath = true;
+            request->ResultSet.emplace_back(indexEntry);
+            Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(request.release()));
+        } else {
+            StopResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
+            ResolveShards(ctx);
+        }
     }
 
     void ResolveShards(const TActorContext &) {
@@ -1409,7 +1482,8 @@ private:
 
         LOG_T("l " << batchValue.items_size() << ": " << batchParam.AsJSON());
 
-        ResolvedPoints.resize(batchValue.items_size());
+        ResolvedPoints.resize(FastQuery->ResolvedIndex ? batchValue.items_size() * 2 : batchValue.items_size());
+
         auto request = std::make_unique<NSchemeCache::TSchemeCacheRequest>();
 
         for (int i = 0; i < batchValue.items_size(); ++i) {
@@ -1427,10 +1501,15 @@ private:
                 } else {
                     itemType = listType.Gettype_id();
                 }
+
                 if (itemType == Ydb::Type::INT64) {
                     LOG_T("Request key column " << j << " mapped to int64 item " << itemIndex
                         << "  with value " << item.Getint64_value() << ": " << listType.AsJSON());
                     resolvedData.KeyCells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
+                } else if (itemType == Ydb::Type::UTF8) {
+                    LOG_T("Request key column " << j << " mapped to UTF8 item " << itemIndex
+                        << "  with value " << item.Gettext_value() << ": " << listType.AsJSON());
+                    resolvedData.KeyCells.emplace_back(TCell(item.Gettext_value().data(), item.Gettext_value().size()));
                 } else {
                     // XXX: we don't check all possible types
                     LOG_T("Request key column " << j << " mapped to item " << itemIndex
@@ -1451,6 +1530,54 @@ private:
                     FastQuery->Columns));
 
             request->ResultSet.emplace_back(std::move(keyDesc));
+        }
+
+        if (FastQuery->ResolvedIndex) {
+            // the same as above, but for index (copy-pasted and modified)
+            for (int i = 0; i < batchValue.items_size(); ++i) {
+                auto& resolvedData = ResolvedPoints[i + batchValue.items_size()];
+                resolvedData.KeyCells.reserve(FastQuery->ResolvedIndex->OrderedColumnParams.size());
+                const auto& listItems = batchValue.Getitems(i);
+                for (size_t j = 0; j < FastQuery->ResolvedIndex->OrderedColumnParams.size(); ++j) {
+                    size_t itemIndex = FastQuery->ResolvedIndex->OrderedColumnParams[j];
+                    const auto& item = listItems.Getitems(itemIndex);
+                    const auto& listType = batchType.Getmembers(itemIndex).Gettype();
+
+                    ::Ydb::Type::PrimitiveTypeId itemType = Ydb::Type::INT32;
+                    if (listType.has_optional_type()) {
+                        itemType = listType.Getoptional_type().Getitem().Gettype_id();
+                    } else {
+                        itemType = listType.Gettype_id();
+                    }
+
+                    if (itemType == Ydb::Type::INT64) {
+                        LOG_T("Request index key column " << j << " mapped to int64 item " << itemIndex
+                            << "  with value " << item.Getint64_value() << ": " << listType.AsJSON());
+                        resolvedData.KeyCells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
+                    } else if (itemType == Ydb::Type::UTF8) {
+                        LOG_T("Request index key column " << j << " mapped to UTF8 item " << itemIndex
+                            << "  with value " << item.Gettext_value() << ": " << listType.AsJSON());
+                        resolvedData.KeyCells.emplace_back(TCell(item.Gettext_value().data(), item.Gettext_value().size()));
+                    } else {
+                        // XXX: we don't check all possible types
+                        LOG_T("Request index key column " << j << " mapped to item " << itemIndex
+                            << "  with value " << item.Getint32_value()  << ": " << listType.AsJSON());
+                        resolvedData.KeyCells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+                    }
+                }
+
+                TTableRange range(resolvedData.KeyCells);
+
+                THolder<NKikimr::TKeyDesc> keyDesc(
+                    new TKeyDesc(
+                        FastQuery->ResolvedIndex->TableId,
+                        range,
+                        TKeyDesc::ERowOperation::Read,
+                        FastQuery->ResolvedIndex->ColumnTypes,
+                        FastQuery->ResolvedIndex->Columns));
+
+                request->ResultSet.emplace_back(std::move(keyDesc));
+            }
         }
 
         auto resolveRequest = std::make_unique<TEvTxProxySchemeCache::TEvResolveKeySet>(request.release());
@@ -1496,84 +1623,203 @@ private:
             return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "empty batch");
         }
 
-        // we suppose that here the order of items is the same as
-        // UpsertParams and corresponding ColumnsToUpsert
-        std::vector<ui32> columnIds;
-        columnIds.reserve(FastQuery->ColumnsToUpsert.size());
-        for (auto paramIndex: FastQuery->AllOrderedParams) {
-            const auto& columnName = FastQuery->ColumnsToUpsert[paramIndex];
-            auto it = FastQuery->ResolvedColumns.find(columnName);
-            if (it == FastQuery->ResolvedColumns.end()) {
-                TStringStream ss;
-                ss << "Failed to resolve column '" << columnName << "'";
-                return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
-            }
-            const auto& info = it->second;
-            LOG_T("Added column " << info.Id);
-            columnIds.emplace_back(info.Id);
-        }
+        using TWritePtr = std::unique_ptr<NKikimr::NEvents::TDataEvents::TEvWrite>;
+        std::vector<std::pair<ui64, TWritePtr>> writes;
+        writes.reserve(FastQuery->ResolvedIndex ? batchValue.items_size() * 2 : batchValue.items_size());
 
-        // naive impl: we don't gather rows into batches
-        // also we suppose that optional fields are at the end, TODO
-        for (int i = 0; i < batchValue.items_size(); ++i) {
-            TVector<TCell> cells;
-            const auto& listItems = batchValue.Getitems(i);
+        auto getWrite = [&writes, this](ui64 shardId) {
+            auto it = std::find_if(writes.begin(), writes.end(),
+                [shardId](const auto& pair) { return pair.first == shardId; });
+            if (it == writes.end()) {
+                const auto& pair = writes.emplace_back(shardId, std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
+                    this->TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE)); // modes is updated later
+                auto* evWrite = pair.second.get();
+                return evWrite;
+            } else {
+                return it->second.get();
+            }
+        };
+
+        {
+            // we suppose that here the order of items is the same as
+            // UpsertParams and corresponding ColumnsToUpsert
+            std::vector<ui32> columnIds;
+            columnIds.reserve(FastQuery->ColumnsToUpsert.size());
             for (auto paramIndex: FastQuery->AllOrderedParams) {
                 const auto& columnName = FastQuery->ColumnsToUpsert[paramIndex];
-                const auto& item = listItems.Getitems(paramIndex);
-                const auto& colInfo = FastQuery->ResolvedColumns[columnName];
-                switch (colInfo.PType.GetTypeId()) {
-                case NYql::NProto::Int32:
-                    cells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
-                    break;
-                case NYql::NProto::Uint32:
-                    cells.emplace_back(TCell::Make<ui32>(item.Getuint32_value()));
-                    break;
-                case NYql::NProto::Timestamp:
-                case NYql::NProto::Int64:
-                case NYql::NProto::Timestamp64:
-                    cells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
-                    break;
-                case NYql::NProto::Uint64:
-                    cells.emplace_back(TCell::Make<ui64>(item.Getuint64_value()));
-                    break;
-                case NYql::NProto::Double:
-                    cells.emplace_back(TCell::Make<double>(item.Getdouble_value()));
-                    break;
-                case NYql::NProto::Float:
-                    cells.emplace_back(TCell::Make<double>(item.Getfloat_value()));
-                    break;
-                case NYql::NProto::Utf8:
-                    cells.emplace_back(TCell::Make(item.Gettext_value()));
-                    break;
-                default: {
+                auto it = FastQuery->ResolvedColumns.find(columnName);
+                if (it == FastQuery->ResolvedColumns.end()) {
                     TStringStream ss;
-                    ss << "unknown type " << colInfo.PType.GetTypeId() << " of column '"
-                       << FastQuery->ColumnsToUpsert[paramIndex] << "'";
-                    LOG_T(ss.Str());
-                    return ReplyQueryError(Ydb::StatusIds::UNSUPPORTED, ss.Str());
+                    ss << "Failed to resolve column '" << columnName << "'";
+                    return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
                 }
-                }
+                const auto& info = it->second;
+                columnIds.emplace_back(info.Id);
             }
 
-            TSerializedCellMatrix matrix(cells, 1, cells.size());
-            auto evWrite = std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
-                TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE);
-            evWrite->SetLockId(LockId, SelfId().NodeId());
-            ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
-                .AddDataToPayload(matrix.ReleaseBuffer());
-            evWrite->AddOperation(
-                NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
-                FastQuery->TableId,
-                columnIds,
-                payloadIndex,
-                NKikimrDataEvents::FORMAT_CELLVEC);
+            for (int i = 0; i < batchValue.items_size(); ++i) {
+                TVector<TCell> cells;
+                const auto& listItems = batchValue.Getitems(i);
+                for (auto paramIndex: FastQuery->AllOrderedParams) {
+                    const auto& columnName = FastQuery->ColumnsToUpsert[paramIndex];
+                    const auto& item = listItems.Getitems(paramIndex);
+                    const auto& colInfo = FastQuery->ResolvedColumns[columnName];
+                    switch (colInfo.PType.GetTypeId()) {
+                    case NYql::NProto::Int32:
+                        cells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+                        break;
+                    case NYql::NProto::Uint32:
+                        cells.emplace_back(TCell::Make<ui32>(item.Getuint32_value()));
+                        break;
+                    case NYql::NProto::Timestamp:
+                    case NYql::NProto::Int64:
+                    case NYql::NProto::Timestamp64:
+                        cells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
+                        break;
+                    case NYql::NProto::Uint64:
+                        cells.emplace_back(TCell::Make<ui64>(item.Getuint64_value()));
+                        break;
+                    case NYql::NProto::Double:
+                        cells.emplace_back(TCell::Make<double>(item.Getdouble_value()));
+                        break;
+                    case NYql::NProto::Float:
+                        cells.emplace_back(TCell::Make<double>(item.Getfloat_value()));
+                        break;
+                    case NYql::NProto::Utf8:
+                        cells.emplace_back(TCell::Make(item.Gettext_value()));
+                        break;
+                    default: {
+                        TStringStream ss;
+                        ss << "unknown type " << colInfo.PType.GetTypeId() << " of column '"
+                            << FastQuery->ColumnsToUpsert[paramIndex] << "'";
+                        LOG_T(ss.Str());
+                        return ReplyQueryError(Ydb::StatusIds::UNSUPPORTED, ss.Str());
+                    }
+                    }
+                }
 
-            const auto& resolvedData = ResolvedPoints[i];
-            LOG_T("Sending write to " << resolvedData.ResolvedShardId);
+                TSerializedCellMatrix matrix(cells, 1, cells.size());
+                auto* evWrite = getWrite(ResolvedPoints[i].ResolvedShardId);
+                ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
+                    .AddDataToPayload(matrix.ReleaseBuffer());
+                evWrite->AddOperation(
+                    NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
+                    FastQuery->TableId,
+                    columnIds,
+                    payloadIndex,
+                    NKikimrDataEvents::FORMAT_CELLVEC);
+            }
+        }
+
+        if (FastQuery->ResolvedIndex) {
+            // we suppose that here the order of items is the same as
+            // UpsertParams and corresponding ColumnsToUpsert
+            std::vector<ui32> indexColumnIds;
+            indexColumnIds.reserve(FastQuery->ResolvedIndex->Columns.size());
+            for (size_t i = 0; i < FastQuery->ResolvedIndex->OrderedColumnParams.size(); ++i) {
+                size_t paramIndex = FastQuery->ResolvedIndex->OrderedColumnParams[i];
+                const auto& columnName = FastQuery->ColumnsToUpsert[paramIndex];
+                auto it = FastQuery->ResolvedColumns.find(columnName);
+                if (it == FastQuery->ResolvedColumns.end()) {
+                    TStringStream ss;
+                    ss << "Failed to resolve index column '" << columnName << "'";
+                    return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, ss.Str());
+                }
+
+                // note, that IDs differ between table being indexed and index table impl
+                indexColumnIds.emplace_back(FastQuery->ResolvedIndex->Columns[i].Column);
+            }
+
+            for (int i = 0; i < batchValue.items_size(); ++i) {
+                TVector<TCell> cells;
+                const auto& listItems = batchValue.Getitems(i);
+                for (size_t j = 0; j < FastQuery->ResolvedIndex->OrderedColumnParams.size(); ++j) {
+                    size_t paramIndex = FastQuery->ResolvedIndex->OrderedColumnParams[j];
+                    const auto& colInfo =  FastQuery->ResolvedIndex->ColumnTypes[j];
+                    const auto& item = listItems.Getitems(paramIndex);
+                    switch (colInfo.GetTypeId()) {
+                    case NYql::NProto::Int32:
+                        cells.emplace_back(TCell::Make<i32>(item.Getint32_value()));
+                        break;
+                    case NYql::NProto::Uint32:
+                        cells.emplace_back(TCell::Make<ui32>(item.Getuint32_value()));
+                        break;
+                    case NYql::NProto::Timestamp:
+                    case NYql::NProto::Int64:
+                    case NYql::NProto::Timestamp64:
+                        cells.emplace_back(TCell::Make<i64>(item.Getint64_value()));
+                        break;
+                    case NYql::NProto::Uint64:
+                        cells.emplace_back(TCell::Make<ui64>(item.Getuint64_value()));
+                        break;
+                    case NYql::NProto::Double:
+                        cells.emplace_back(TCell::Make<double>(item.Getdouble_value()));
+                        break;
+                    case NYql::NProto::Float:
+                        cells.emplace_back(TCell::Make<double>(item.Getfloat_value()));
+                        break;
+                    case NYql::NProto::Utf8:
+                        cells.emplace_back(TCell::Make(item.Gettext_value()));
+                        break;
+                    default: {
+                        TStringStream ss;
+                        ss << "unknown type " << colInfo.GetTypeId() << " of column '"
+                            << FastQuery->ColumnsToUpsert[paramIndex] << "'";
+                        LOG_T(ss.Str());
+                        return ReplyQueryError(Ydb::StatusIds::UNSUPPORTED, ss.Str());
+                    }
+                    }
+                }
+
+                TSerializedCellMatrix matrix(cells, 1, cells.size());
+                const auto& resolvedData = ResolvedPoints[i + batchValue.items_size()];
+                auto* evWrite = getWrite(resolvedData.ResolvedShardId);
+                ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
+                    .AddDataToPayload(matrix.ReleaseBuffer());
+                evWrite->AddOperation(
+                    NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
+                    FastQuery->ResolvedIndex->TableId,
+                    indexColumnIds,
+                    payloadIndex,
+                    NKikimrDataEvents::FORMAT_CELLVEC);
+            }
+        }
+
+        IsDistributed = writes.size() > 1;
+        TVector<ui64> allShards;
+        NKikimrDataEvents::TEvWrite::ETxMode mode;
+        if (IsDistributed) {
+            for (const auto& [shardId, _]: writes) {
+                allShards.push_back(shardId);
+            }
+            mode = NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE;
+        } else {
+            mode = NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE;
+        }
+
+        Response->IsWrite = true;
+        Response->AffectedShards.reserve(writes.size());
+        for (auto& [shardId, evWrite]: writes) {
+            evWrite->Record.SetTxMode(mode);
+
+            if (IsDistributed) {
+                auto* locks = evWrite->Record.MutableLocks();
+                locks->SetOp(NKikimrDataEvents::TKqpLocks::Commit);
+                for (auto shardId: allShards) {
+                    locks->AddSendingShards(shardId);
+                    locks->AddReceivingShards(shardId);
+
+                    // TODO: we don't know arbiter
+                }
+            } else {
+                evWrite->SetLockId(this->LockId, this->SelfId().NodeId());
+            }
+
+            LOG_T("Sending write to " << shardId << ": " << evWrite->ToString());
+            Response->AffectedShards.emplace_back(shardId);
             Send<ESendingType::Tail>(
                 NKikimr::MakePipePerNodeCacheID(false),
-                new TEvPipeCache::TEvForward(evWrite.release(), resolvedData.ResolvedShardId, true),
+                new TEvPipeCache::TEvForward(evWrite.release(), shardId, true),
                 IEventHandle::FlagTrackDelivery,
                 0,
                 0);
@@ -1587,11 +1833,20 @@ private:
         --WaitingRepliesCount;
 
         const auto* msg = ev->Get();
-        if (msg->Record.GetStatus() != NKikimrDataEvents::TEvWriteResult::STATUS_COMPLETED) {
-            LOG_T("received failed write result from shard " << ev->Sender << ": "
-                << msg->ToString()
-                << ", left results " << WaitingRepliesCount);
-            return ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, "TEvWrite failed");
+        if (IsDistributed) {
+            if (msg->Record.GetStatus() != NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED) {
+                LOG_T("received failed write result from shard " << ev->Sender << ": "
+                    << msg->ToString()
+                    << ", left results " << WaitingRepliesCount);
+                return ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, "TEvWrite failed");
+            }
+        } else {
+            if (msg->Record.GetStatus() != NKikimrDataEvents::TEvWriteResult::STATUS_COMPLETED) {
+                LOG_T("received failed write result from shard " << ev->Sender << ": "
+                    << msg->ToString()
+                    << ", left results " << WaitingRepliesCount);
+                return ReplyQueryError(Ydb::StatusIds::INTERNAL_ERROR, "TEvWrite failed");
+            }
         }
 
         LOG_T("received successfull write result from shard " << ev->Sender << ": "
@@ -1659,7 +1914,7 @@ private:
     }
 
     TString LogPrefix() const {
-        TStringBuilder result = TStringBuilder()
+        TString result = TStringBuilder()
             << "Fast executor SessionId: " << SessionId << ", "
             << "ActorId: " << SelfId() << ", ";
         return result;
@@ -1698,6 +1953,7 @@ private:
     ui64 TxId = 0;
     NLongTxService::TLockHandle LockHandle;
 
+    // both requested column data and index data
     struct TResolvedData {
         TVector<TCell> KeyCells;
         TVector<int32_t> KeyInts;
@@ -1707,6 +1963,7 @@ private:
     TVector<TResolvedData> ResolvedPoints;
 
     size_t WaitingRepliesCount = 0;
+    bool IsDistributed = false;
     std::unique_ptr<TEvKqp::TEvQueryResponse> Response;
 
     TMonotonic StartedTs;
@@ -1863,13 +2120,26 @@ public:
     void ForwardResponse(TEvKqp::TEvQueryResponse::TPtr& ev) {
         // fast query locks
         NKikimrMiniKQL::TResult lockResult;
-        if (!ev->Get()->Locks.empty()) {
-            MergeLocksWithFastQuery(ev->Get()->Locks);
-            LOG_T("Fast query acquired " << ev->Get()->Locks.size() << " locks");
+        auto* msg = ev->Get();
+        if (!msg->Locks.empty()) {
+            MergeLocksWithFastQuery(msg->Locks);
+            LOG_T("Fast query acquired " << msg->Locks.size() << " locks");
 
-            if (ev->Get()->LockHandle) {
-                QueryState->TxCtx->Locks.LockHandle = std::move(ev->Get()->LockHandle);
-                LOG_T("Fast query created lock handle");
+            if (msg->LockHandle) {
+                QueryState->TxCtx->Locks.LockHandle = std::move(msg->LockHandle);
+                LOG_T("Fast query created lock handle: " << (QueryState->TxCtx == nullptr)
+                    << ", " << (QueryState->TxCtx->TxManager == nullptr));
+            }
+        }
+
+        if (!msg->AffectedShards.empty() && QueryState->TxCtx && QueryState->TxCtx->TxManager) {
+            auto& txManager = QueryState->TxCtx->TxManager;
+            const ui8 action = msg->IsWrite ?
+                IKqpTransactionManager::EAction::WRITE : IKqpTransactionManager::EAction::READ;
+            for (auto shard: msg->AffectedShards) {
+                LOG_T("Add shard " << shard);
+                txManager->AddShard(shard, false, ""); // TODO: proper path
+                txManager->AddAction(shard, action);
             }
         }
 
@@ -2445,6 +2715,7 @@ public:
         IActor* actor = nullptr;
         switch (QueryState->FastQuery->ExecutionType) {
         case TFastQuery::EExecutionType::SELECT_QUERY:
+            QueryState->TxCtx->SetHasFastReads();
             actor = new TFastSelectExecutorActor(
                 Counters,
                 SelfId(),
@@ -2456,6 +2727,7 @@ public:
                 lockId);
             break;
         case TFastQuery::EExecutionType::SELECT_IN_QUERY:
+            QueryState->TxCtx->SetHasFastReads();
             actor = new TFastSelectInExecutorActor(
                 Counters,
                 SelfId(),

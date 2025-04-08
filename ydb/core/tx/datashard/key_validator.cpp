@@ -12,7 +12,7 @@
 using namespace NKikimr;
 using namespace NKikimr::NDataShard;
 
-TKeyValidator::TKeyValidator(const TDataShard& self) 
+TKeyValidator::TKeyValidator(const TDataShard& self)
     : Self(self)
 {
 

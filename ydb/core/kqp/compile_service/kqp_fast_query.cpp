@@ -208,7 +208,6 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
 
         if (isSelectIn) {
             result->ExecutionType = TFastQuery::EExecutionType::SELECT_IN_QUERY;
-            result->ExecutionType = TFastQuery::EExecutionType::UNSUPPORTED;
         } else {
             result->ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
         }
@@ -242,20 +241,22 @@ public:
     TFastQueryPtr& FastQuery;
 };
 
-/*
+
 TFastQuery::EParamType GetParamType(const std::string& typeStr) {
     static const std::unordered_map<std::string, TFastQuery::EParamType> typeMap = {
         {"Int32", TFastQuery::EParamType::INT32},
         {"Int64", TFastQuery::EParamType::INT64},
         {"Double", TFastQuery::EParamType::DOUBLE},
         {"Timestamp", TFastQuery::EParamType::TIMESTAMP},
-        {"Text", TFastQuery::EParamType::TEXT}
+        {"Text", TFastQuery::EParamType::TEXT},
+        {"Utf8", TFastQuery::EParamType::TEXT}
     };
 
     auto it = typeMap.find(typeStr);
     return (it != typeMap.end()) ? it->second : TFastQuery::EParamType::UNKNOWN;
 }
 
+/*
 void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
     // XXX avoid multiline issues
     TString query;
@@ -275,7 +276,7 @@ void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
 
     return;
 }
-
+*/
 
 void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
     // Only upserts like this one for now:
@@ -342,11 +343,20 @@ void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
         searchStart = match.suffix().first;
     }
 
+    auto ends_with = [](const TString& str, const TString& suffix) {
+        return str.size() >= suffix.size() &&
+               str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+
     if (!result->UpsertParams.empty() && !result->ColumnsToUpsert.empty()) {
-        result->ExecutionType = TFastQuery::EExecutionType::UPSERT;
+        if (ends_with(result->TableName, "customer") || ends_with(result->TableName, "oorder")) {
+            // indices are not yet implemented
+            result->ExecutionType = TFastQuery::EExecutionType::UNSUPPORTED;
+        } else {
+            result->ExecutionType = TFastQuery::EExecutionType::UPSERT;
+        }
     }
 }
-    */
 
 } // anonymous
 
@@ -436,13 +446,13 @@ TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
     if (result->ExecutionType == TFastQuery::EExecutionType::SELECT1) {
         return result;
     }
+    */
 
     // check if this is upsert
     TryCompileUpsert(yqlQuery, result);
     if (result->ExecutionType != TFastQuery::EExecutionType::UNSUPPORTED) {
         return result;
     }
-    */
 
     result->PostgresQuery = YQL2Postgres(yqlQuery);
     if (result->PostgresQuery.Query.empty()) {

@@ -423,7 +423,9 @@ struct TEvQueryResponse: public TEventPBWithArena<TEvQueryResponse, NKikimrKqp::
     {}
 
     TVector<NKikimrDataEvents::TLock> Locks;
+    TVector<ui64> AffectedShards;
     NLongTxService::TLockHandle LockHandle;
+    bool IsWrite = false;
 };
 
 } // namespace NKikimr::NKqp
