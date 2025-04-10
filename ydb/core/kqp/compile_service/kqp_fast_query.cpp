@@ -247,7 +247,8 @@ TFastQuery::EParamType GetParamType(const std::string& typeStr) {
         {"Int64", TFastQuery::EParamType::INT64},
         {"Double", TFastQuery::EParamType::DOUBLE},
         {"Timestamp", TFastQuery::EParamType::TIMESTAMP},
-        {"Text", TFastQuery::EParamType::TEXT}
+        {"Text", TFastQuery::EParamType::TEXT},
+        {"Utf8", TFastQuery::EParamType::TEXT}
     };
 
     auto it = typeMap.find(typeStr);
