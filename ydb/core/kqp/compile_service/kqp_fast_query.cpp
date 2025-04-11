@@ -255,6 +255,9 @@ TFastQuery::EParamType GetParamType(const std::string& typeStr) {
 }
 
 void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
+    result->ExecutionType = TFastQuery::EExecutionType::UNSUPPORTED;
+    return;
+
     // XXX avoid multiline issues
     TString query;
     query.reserve(yqlQuery.size());
