@@ -421,6 +421,7 @@ TPostgresQuery YQL2Postgres(const TString& yqlQuery) {
 
 TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
     TFastQueryPtr result = std::make_shared<TFastQuery>();
+    return result;
 
     result->OriginalQuery = yqlQuery;
     result->OriginalQueryHash = THash<TString>()(yqlQuery);
