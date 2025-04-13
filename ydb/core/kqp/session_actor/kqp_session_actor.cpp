@@ -1648,6 +1648,24 @@ private:
             return ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "empty batch");
         }
 
+        using TWritePtr = std::unique_ptr<NKikimr::NEvents::TDataEvents::TEvWrite>;
+        std::vector<std::pair<ui64, TWritePtr>> writes;
+        writes.reserve(FastQuery->ResolvedIndex ? batchValue.items_size() * 2 : batchValue.items_size());
+
+        auto getWrite = [&writes, this](ui64 shardId) {
+            auto it = std::find_if(writes.begin(), writes.end(),
+                [shardId](const auto& pair) { return pair.first == shardId; });
+            if (it == writes.end()) {
+                const auto& pair = writes.emplace_back(shardId, std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
+                    this->TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE)); // modes is updated later
+                auto* evWrite = pair.second.get();
+                evWrite->SetLockId(this->LockId, this->SelfId().NodeId());
+                return evWrite;
+            } else {
+                return it->second.get();
+            }
+        };
+
         {
             // we suppose that here the order of items is the same as
             // UpsertParams and corresponding ColumnsToUpsert
@@ -1666,8 +1684,6 @@ private:
                 columnIds.emplace_back(info.Id);
             }
 
-            // naive impl: we don't gather rows into batches
-            // also we suppose that optional fields are at the end, TODO
             for (int i = 0; i < batchValue.items_size(); ++i) {
                 TVector<TCell> cells;
                 const auto& listItems = batchValue.Getitems(i);
@@ -1710,9 +1726,7 @@ private:
                 }
 
                 TSerializedCellMatrix matrix(cells, 1, cells.size());
-                auto evWrite = std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
-                    TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE);
-                evWrite->SetLockId(LockId, SelfId().NodeId());
+                auto* evWrite = getWrite(ResolvedPoints[i].ResolvedShardId);
                 ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
                     .AddDataToPayload(matrix.ReleaseBuffer());
                 evWrite->AddOperation(
@@ -1721,21 +1735,9 @@ private:
                     columnIds,
                     payloadIndex,
                     NKikimrDataEvents::FORMAT_CELLVEC);
-
-                const auto& resolvedData = ResolvedPoints[i];
-                LOG_T("Sending write to " << resolvedData.ResolvedShardId);
-                Send<ESendingType::Tail>(
-                    NKikimr::MakePipePerNodeCacheID(false),
-                    new TEvPipeCache::TEvForward(evWrite.release(), resolvedData.ResolvedShardId, true),
-                    IEventHandle::FlagTrackDelivery,
-                    0,
-                    0);
-                ++WaitingRepliesCount;
             }
         }
 
-        // naive impl: we don't gather rows into batches
-        // also we suppose that optional fields are at the end, TODO
         if (FastQuery->ResolvedIndex) {
             // we suppose that here the order of items is the same as
             // UpsertParams and corresponding ColumnsToUpsert
@@ -1798,9 +1800,8 @@ private:
                 }
 
                 TSerializedCellMatrix matrix(cells, 1, cells.size());
-                auto evWrite = std::make_unique<NKikimr::NEvents::TDataEvents::TEvWrite>(
-                    TxId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE);
-                evWrite->SetLockId(LockId, SelfId().NodeId());
+                const auto& resolvedData = ResolvedPoints[i + batchValue.items_size()];
+                auto* evWrite = getWrite(resolvedData.ResolvedShardId);
                 ui64 payloadIndex = NKikimr::NEvWrite::TPayloadWriter<NKikimr::NEvents::TDataEvents::TEvWrite>(*evWrite)
                     .AddDataToPayload(matrix.ReleaseBuffer());
                 evWrite->AddOperation(
@@ -1809,17 +1810,26 @@ private:
                     indexColumnIds,
                     payloadIndex,
                     NKikimrDataEvents::FORMAT_CELLVEC);
-
-                const auto& resolvedData = ResolvedPoints[i + batchValue.items_size()];
-                LOG_T("Sending write to index shard " << resolvedData.ResolvedShardId);
-                Send<ESendingType::Tail>(
-                    NKikimr::MakePipePerNodeCacheID(false),
-                    new TEvPipeCache::TEvForward(evWrite.release(), resolvedData.ResolvedShardId, true),
-                    IEventHandle::FlagTrackDelivery,
-                    0,
-                    0);
-                ++WaitingRepliesCount;
             }
+        }
+
+        NKikimrDataEvents::TEvWrite::ETxMode mode = writes.size() == 1
+            ? NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE
+            : NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE;
+
+        Response->IsWrite = true;
+        Response->AffectedShards.reserve(writes.size());
+        for (auto& [shardId, evWrite]: writes) {
+            evWrite->Record.SetTxMode(mode);
+            LOG_T("Sending write to " << shardId << ": " << evWrite->ToString());
+            Response->AffectedShards.emplace_back(shardId);
+            Send<ESendingType::Tail>(
+                NKikimr::MakePipePerNodeCacheID(false),
+                new TEvPipeCache::TEvForward(evWrite.release(), shardId, true),
+                IEventHandle::FlagTrackDelivery,
+                0,
+                0);
+            ++WaitingRepliesCount;
         }
     }
 
@@ -2106,13 +2116,27 @@ public:
     void ForwardResponse(TEvKqp::TEvQueryResponse::TPtr& ev) {
         // fast query locks
         NKikimrMiniKQL::TResult lockResult;
-        if (!ev->Get()->Locks.empty()) {
-            MergeLocksWithFastQuery(ev->Get()->Locks);
-            LOG_T("Fast query acquired " << ev->Get()->Locks.size() << " locks");
+        auto* msg = ev->Get();
+        if (!msg->Locks.empty()) {
+            QueryState->TxCtx->ExtraLocks = msg->Locks;
+            MergeLocksWithFastQuery(msg->Locks);
+            LOG_T("Fast query acquired " << msg->Locks.size() << " locks");
 
-            if (ev->Get()->LockHandle) {
-                QueryState->TxCtx->Locks.LockHandle = std::move(ev->Get()->LockHandle);
-                LOG_T("Fast query created lock handle");
+            if (msg->LockHandle) {
+                QueryState->TxCtx->Locks.LockHandle = std::move(msg->LockHandle);
+                LOG_T("Fast query created lock handle: " << (QueryState->TxCtx == nullptr)
+                    << ", " << (QueryState->TxCtx->TxManager == nullptr));
+            }
+        }
+
+        if (!msg->AffectedShards.empty() && QueryState->TxCtx && QueryState->TxCtx->TxManager) {
+            auto& txManager = QueryState->TxCtx->TxManager;
+            const ui8 action = msg->IsWrite ?
+                IKqpTransactionManager::EAction::WRITE : IKqpTransactionManager::EAction::READ;
+            for (auto shard: msg->AffectedShards) {
+                LOG_T("Add shard " << shard);
+                txManager->AddShard(shard, false, ""); // TODO: proper path
+                txManager->AddAction(shard, action);
             }
         }
 
@@ -2692,6 +2716,7 @@ public:
         IActor* actor = nullptr;
         switch (QueryState->FastQuery->ExecutionType) {
         case TFastQuery::EExecutionType::SELECT_QUERY:
+            QueryState->TxCtx->SetHasFastReads();
             actor = new TFastSelectExecutorActor(
                 Counters,
                 SelfId(),
@@ -2703,6 +2728,7 @@ public:
                 lockId);
             break;
         case TFastQuery::EExecutionType::SELECT_IN_QUERY:
+            QueryState->TxCtx->SetHasFastReads();
             actor = new TFastSelectInExecutorActor(
                 Counters,
                 SelfId(),
@@ -3386,7 +3412,7 @@ public:
 
         if (Settings.TableService.GetEnableOltpSink()
             && !txCtx->BufferActorId
-            && (txCtx->HasTableWrite || request.TopicOperations.GetSize() != 0)) {
+            && (txCtx->HasTableWrite || request.TopicOperations.GetSize() != 0) || txCtx->HasFastWrites) {
             txCtx->TxManager->SetTopicOperations(std::move(request.TopicOperations));
             txCtx->TxManager->AddTopicsToShards();
 
@@ -3432,7 +3458,9 @@ public:
             QueryState ? QueryState->StatementResultIndex : 0, FederatedQuerySetup,
             (QueryState && QueryState->RequestEv->GetSyntax() == Ydb::Query::Syntax::SYNTAX_PG)
                 ? GUCSettings : nullptr,
-            txCtx->ShardIdToTableInfo, txCtx->TxManager, txCtx->BufferActorId);
+            txCtx->ShardIdToTableInfo, txCtx->TxManager, txCtx->BufferActorId,
+            Nothing(),
+            QueryState ? QueryState->TxCtx->ExtraLocks : TVector<NKikimrDataEvents::TLock>());
 
         auto exId = RegisterWithSameMailbox(executerActor);
         LOG_D("Created new KQP executer: " << exId << " isRollback: " << isRollback);

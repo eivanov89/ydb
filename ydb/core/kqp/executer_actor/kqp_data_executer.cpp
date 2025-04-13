@@ -105,10 +105,11 @@ public:
         const TShardIdToTableInfoPtr& shardIdToTableInfo,
         const IKqpTransactionManagerPtr& txManager,
         const TActorId bufferActorId,
-        TMaybe<TBatchOperationSettings> batchOperationSettings = Nothing())
+        TMaybe<TBatchOperationSettings> batchOperationSettings = Nothing(),
+        TMaybe<TVector<NKikimrDataEvents::TLock>> extraLocks = {})
         : TBase(std::move(request), std::move(asyncIoFactory), federatedQuerySetup, GUCSettings, database, userToken, counters, tableServiceConfig,
             userRequestContext, statementResultIndex, TWilsonKqp::DataExecuter,
-            "DataExecuter", streamResult, bufferActorId, txManager, std::move(batchOperationSettings))
+            "DataExecuter", streamResult, bufferActorId, txManager, std::move(batchOperationSettings), std::move(extraLocks))
         , ShardIdToTableInfo(shardIdToTableInfo)
         , AllowOlapDataQuery(tableServiceConfig.GetAllowOlapDataQuery())
         , WaitCAStatsTimeout(TDuration::MilliSeconds(tableServiceConfig.GetQueryLimits().GetWaitCAStatsTimeoutMs()))
@@ -267,15 +268,26 @@ public:
             }
         }
 
+        if (ExtraLocks) {
+            LOG_D("Adding " << ExtraLocks->size() << " locks");
+            for (const auto& lock: *ExtraLocks) {
+                Locks.push_back(lock);
+                // TODO: update ShardIdToTableInfo ?
+                ShardIdToTableInfo->Add(lock.GetDataShard(), false, "/Root/customer");
+            }
+        }
+
         if (TxManager) {
             TxManager->SetHasSnapshot(GetSnapshot().IsValid());
+
+            LOG_D("Shards size: " << TxManager->GetShards().size() << ", locks: " << TxManager->GetLocks().size());
 
             for (const ui64& shardId : TxManager->GetShards()) {
                 Stats->AffectedShards.insert(shardId);
             }
         }
 
-        if (!BufferActorId || (ReadOnlyTx && Request.LocksOp != ELocksOp::Rollback)) {
+        if (!BufferActorId || (ReadOnlyTx && Request.LocksOp != ELocksOp::Rollback) || !ExtraLocks) {
             Become(&TKqpDataExecuter::FinalizeState);
             MakeResponseAndPassAway();
             return;
@@ -3087,11 +3099,12 @@ IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const
     const TIntrusivePtr<TUserRequestContext>& userRequestContext, ui32 statementResultIndex,
     const std::optional<TKqpFederatedQuerySetup>& federatedQuerySetup, const TGUCSettings::TPtr& GUCSettings,
     const TShardIdToTableInfoPtr& shardIdToTableInfo, const IKqpTransactionManagerPtr& txManager, const TActorId bufferActorId,
-    TMaybe<TBatchOperationSettings> batchOperationSettings)
+    TMaybe<TBatchOperationSettings> batchOperationSettings,
+    TMaybe<TVector<NKikimrDataEvents::TLock>> extraLocks)
 {
     return new TKqpDataExecuter(std::move(request), database, userToken, counters, streamResult, tableServiceConfig,
         std::move(asyncIoFactory), creator, userRequestContext, statementResultIndex, federatedQuerySetup, GUCSettings,
-        shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings));
+        shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings), std::move(extraLocks));
 }
 
 } // namespace NKqp

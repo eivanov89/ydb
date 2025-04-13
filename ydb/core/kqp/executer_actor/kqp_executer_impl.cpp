@@ -83,7 +83,8 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
     const TIntrusivePtr<TUserRequestContext>& userRequestContext, ui32 statementResultIndex,
     const std::optional<TKqpFederatedQuerySetup>& federatedQuerySetup, const TGUCSettings::TPtr& GUCSettings,
     const TShardIdToTableInfoPtr& shardIdToTableInfo, const IKqpTransactionManagerPtr& txManager, const TActorId bufferActorId,
-    TMaybe<TBatchOperationSettings> batchOperationSettings)
+    TMaybe<TBatchOperationSettings> batchOperationSettings,
+    TMaybe<TVector<NKikimrDataEvents::TLock>> extraLocks)
 {
     if (request.Transactions.empty()) {
         // commit-only or rollback-only data transaction
@@ -92,7 +93,8 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
             std::move(asyncIoFactory), creator,
             userRequestContext, statementResultIndex,
             federatedQuerySetup, /*GUCSettings*/nullptr,
-            shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings)
+            shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings),
+            std::move(extraLocks)
         );
     }
 
@@ -116,7 +118,8 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
                 std::move(asyncIoFactory), creator,
                 userRequestContext, statementResultIndex,
                 federatedQuerySetup, /*GUCSettings*/nullptr,
-                shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings)
+                shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings),
+                std::move(extraLocks)
             );
 
         case NKqpProto::TKqpPhyTx::TYPE_SCAN:
@@ -132,7 +135,8 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
                 tableServiceConfig, std::move(asyncIoFactory), creator,
                 userRequestContext, statementResultIndex,
                 federatedQuerySetup, GUCSettings,
-                shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings)
+                shardIdToTableInfo, txManager, bufferActorId, std::move(batchOperationSettings),
+                std::move(extraLocks)
             );
 
         default:

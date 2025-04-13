@@ -140,6 +140,12 @@ public:
     virtual bool ConsumeCommitResult(ui64 shardId) = 0;
 };
 
+struct TLockWithInfo {
+    NKikimrDataEvents::TLock Lock;
+    TString Path;
+    ui8 Action;
+};
+
 using IKqpTransactionManagerPtr = std::shared_ptr<IKqpTransactionManager>;
 
 IKqpTransactionManagerPtr CreateKqpTransactionManager(bool collectOnly = false);

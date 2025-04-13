@@ -189,11 +189,15 @@ public:
     }
 
     bool TxHasEffects() const {
-        return HasImmediateEffects || !DeferredEffects.Empty() || HasFastWrites;
+        return HasImmediateEffects || !DeferredEffects.Empty() || HasFastWrites || HasFastReads;
     }
 
     void SetHasFastWrites() {
         HasFastWrites = true;
+    }
+
+    void SetHasFastReads() {
+        HasFastReads = true;
     }
 
     bool TxHasFastWrites() const {
@@ -352,6 +356,7 @@ public:
     TDeferredEffects DeferredEffects;
     bool HasImmediateEffects = false;
     bool HasFastWrites = false;
+    bool HasFastReads = false;
     NTopic::TTopicOperations TopicOperations;
     TIntrusivePtr<TParamsState> ParamsState;
     TTxAllocatorState::TPtr TxAlloc;
@@ -370,6 +375,8 @@ public:
     IKqpTransactionManagerPtr TxManager = nullptr;
 
     TShardIdToTableInfoPtr ShardIdToTableInfo = std::make_shared<TShardIdToTableInfo>();
+
+    TMaybe<TVector<NKikimrDataEvents::TLock>> ExtraLocks;
 };
 
 struct TTxId {
