@@ -312,11 +312,7 @@ public:
     }
 
     bool CanDeferEffects() const {
-        if (NeedUncommittedChangesFlush || AppData()->FeatureFlags.GetEnableForceImmediateEffectsExecution() || HasOlapTable) {
-            return false;
-        }
-
-        return true;
+        return false;
     }
 
     void ApplyPhysicalQuery(const NKqpProto::TKqpPhyQuery& phyQuery) {
