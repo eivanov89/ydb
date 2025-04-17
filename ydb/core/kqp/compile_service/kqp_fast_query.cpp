@@ -432,6 +432,7 @@ TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
     if (result->ExecutionType == TFastQuery::EExecutionType::SELECT1) {
         return result;
     }
+    return result;
 
     // check if this is upsert
     TryCompileUpsert(yqlQuery, result);

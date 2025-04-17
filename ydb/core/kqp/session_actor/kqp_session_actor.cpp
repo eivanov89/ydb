@@ -48,6 +48,7 @@
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/event_pb.h>
+#include <ydb/library/actors/core/executor_thread.h>
 #include <ydb/library/actors/core/hfunc.h>
 #include <ydb/library/actors/core/log.h>
 
@@ -275,11 +276,11 @@ class TFastSelect1 : public TActor<TFastSelect1> {
             PassAway();
         }
 
-        void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+        void Handle(TEvents::TEvUndelivered::TPtr&) {
             Execute();
         }
 
-        void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+        void UnexpectedEvent(const TString&, TAutoPtr<NActors::IEventHandle>& ev) {
             InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
                 << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
                 << " sender: " << ev->Sender);
@@ -409,7 +410,7 @@ private:
         ResolveShards(TlsActivationContext->AsActorContext());
     }
 
-    void ResolveSchema(const TActorContext &ctx) {
+    void ResolveSchema(const TActorContext &) {
         StartResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TString path;
         if (FastQuery->PostgresQuery.TablePathPrefix) {
@@ -506,7 +507,7 @@ private:
         Send(MakeSchemeCacheID(), resolveRequest.release());
     }
 
-    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &) {
         StopResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
         Y_ABORT_UNLESS(msg->Request->ResultSet.size() == 1);
@@ -553,7 +554,7 @@ private:
         request->Keys.emplace_back(KeyCells);
 
         TRowVersion readVersion(Snapshot.Step, Snapshot.TxId);
-        readVersion.Serialize(*record.MutableSnapshot());
+        readVersion.ToProto(*record.MutableSnapshot());
 
         LOG_T("sending read request to " << FastQuery->TableName << "(" << ResolvedShardId << "): "
             << request->ToString());
@@ -566,7 +567,7 @@ private:
             0);
     }
 
-    void HandleRead(TEvDataShard::TEvReadResult::TPtr ev, const TActorContext &ctx) {
+    void HandleRead(TEvDataShard::TEvReadResult::TPtr ev, const TActorContext &) {
         const auto* msg = ev->Get();
         LOG_T("received read result from shard " << ResolvedShardId << ": " << msg->ToString());
 
@@ -681,12 +682,12 @@ private:
         PassAway();
     }
 
-    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+    void Handle(TEvents::TEvUndelivered::TPtr&) {
         // assume, that it's from DS, because other messages are to local services
         Execute();
     }
 
-    void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+    void UnexpectedEvent(const TString&, TAutoPtr<NActors::IEventHandle>& ev) {
         InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
             << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
             << " sender: " << ev->Sender);
@@ -857,7 +858,7 @@ private:
         ResolveShards(TlsActivationContext->AsActorContext());
     }
 
-    void ResolveSchema(const TActorContext &ctx) {
+    void ResolveSchema(const TActorContext &) {
         StartResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TString path;
         if (FastQuery->PostgresQuery.TablePathPrefix) {
@@ -973,7 +974,7 @@ private:
         Send(MakeSchemeCacheID(), resolveRequest.release());
     }
 
-    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &) {
         StopResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
         Y_ABORT_UNLESS(msg->Request->ResultSet.size() == FastQuery->WhereSelectInPos.size());
@@ -1081,7 +1082,7 @@ private:
             request->Keys.emplace_back(resolvedData.KeyCells);
 
             TRowVersion readVersion(Snapshot.Step, Snapshot.TxId);
-            readVersion.Serialize(*record.MutableSnapshot());
+            readVersion.ToProto(*record.MutableSnapshot());
 
             LOG_T("sending read request to " << FastQuery->TableName << "(" << resolvedData.ResolvedShardId << "): "
                 << request->ToString());
@@ -1097,7 +1098,7 @@ private:
         }
     }
 
-    void HandleRead(TEvDataShard::TEvReadResult::TPtr ev, const TActorContext &ctx) {
+    void HandleRead(TEvDataShard::TEvReadResult::TPtr ev, const TActorContext &) {
         --WaitingRepliesCount;
 
         const auto* msg = ev->Get();
@@ -1175,12 +1176,12 @@ private:
         }
     }
 
-    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+    void Handle(TEvents::TEvUndelivered::TPtr&) {
         // assume, that it's from DS, because other messages are to local services
         Execute();
     }
 
-    void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+    void UnexpectedEvent(const TString&, TAutoPtr<NActors::IEventHandle>& ev) {
         InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
             << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
             << " sender: " << ev->Sender);
@@ -1344,7 +1345,7 @@ private:
         ResolveShards(TlsActivationContext->AsActorContext());
     }
 
-    void ResolveSchema(const TActorContext &ctx) {
+    void ResolveSchema(const TActorContext &) {
         StartResolveSchemeTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TString path = FastQuery->Database + "/" + FastQuery->TableName;
         LOG_T("Resolving " << path);
@@ -1608,7 +1609,7 @@ private:
         Send(MakeSchemeCacheID(), resolveRequest.release());
     }
 
-    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &ctx) {
+    void Handle(TEvTxProxySchemeCache::TEvResolveKeySetResult::TPtr &ev, const TActorContext &) {
         StopResolveShardsTs = TlsActivationContext->AsActorContext().Monotonic().Now();
         TEvTxProxySchemeCache::TEvResolveKeySetResult *msg = ev->Get();
 
@@ -1860,12 +1861,12 @@ private:
         }
     }
 
-    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+    void Handle(TEvents::TEvUndelivered::TPtr&) {
         // assume, that it's from DS, because other messages are to local services
         Execute();
     }
 
-    void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
+    void UnexpectedEvent(const TString&, TAutoPtr<NActors::IEventHandle>& ev) {
         InternalError(TStringBuilder() << "TFastQueryExecutorActor received unexpected event "
             << ev->GetTypeName() << Sprintf("(0x%08" PRIx32 ")", ev->GetTypeRewrite())
             << " sender: " << ev->Sender);
