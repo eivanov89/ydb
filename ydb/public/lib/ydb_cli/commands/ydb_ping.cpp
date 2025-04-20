@@ -248,7 +248,13 @@ bool TCommandPing::PingKqpSelect1(NQuery::TSession& session, const TString& quer
     );
 
     auto result = asyncResult.GetValueSync();
-    return result.IsSuccess();
+    bool isOk = result.IsSuccess();
+    if (!isOk) {
+        const auto& issues = result.GetIssues();
+        Cerr << "select1 failed: " << issues.ToOneLineString() << Endl;
+    }
+
+    return isOk;
 }
 
 } // NYdb::NConsoleClient

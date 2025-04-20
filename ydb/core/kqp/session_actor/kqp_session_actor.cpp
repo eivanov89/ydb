@@ -2117,6 +2117,27 @@ public:
         }
 
         QueryResponse = std::unique_ptr<TEvKqp::TEvQueryResponse>(ev->Release().Release());
+
+        if (FastQueryExecutor) {
+            auto *record = &QueryResponse->Record;
+            auto *response = record->MutableResponse();
+
+            FillStats(record);
+
+            if (QueryState->TxCtx) {
+                QueryState->TxCtx->OnEndQuery();
+            }
+
+            if (QueryState->Commit) {
+                ResetTxState();
+                Transactions.ReleaseTransaction(QueryState->TxId.GetValue());
+                QueryState->TxId.Reset();
+            }
+
+            FillTxInfo(response);
+            FastQueryExecutor = {};
+        }
+
         Cleanup();
     }
 
@@ -4356,10 +4377,14 @@ public:
         if (QueryState && QueryState->TxCtx) {
             auto& txCtx = QueryState->TxCtx;
             if (txCtx->IsInvalidated()) {
-                if (!txCtx->BufferActorId) {
-                    Transactions.AddToBeAborted(txCtx);
+                if (FastQueryExecutor) {
+                    FastQueryExecutor = {};
                 } else {
-                    TerminateBufferActor(txCtx);
+                    if (!txCtx->BufferActorId) {
+                        Transactions.AddToBeAborted(txCtx);
+                    } else {
+                        TerminateBufferActor(txCtx);
+                    }
                 }
                 Transactions.ReleaseTransaction(QueryState->TxId.GetValue());
             }
@@ -4378,6 +4403,7 @@ public:
         }
 
         if (isFinal) {
+            LOG_T("Cleanup3");
             Transactions.FinalCleanup();
             Counters->ReportTxAborted(Settings.DbCounters, Transactions.ToBeAbortedSize());
         }
