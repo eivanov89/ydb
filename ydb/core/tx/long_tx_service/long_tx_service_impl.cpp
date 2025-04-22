@@ -19,6 +19,7 @@ namespace NKikimr {
 namespace NLongTxService {
 
 static constexpr size_t MaxAcquireSnapshotInFlight = 4;
+static constexpr TDuration AcquireSnapshotBatchDelay = TDuration::MicroSeconds(5);
 static constexpr TDuration RemoteLockTimeout = TDuration::Seconds(15);
 static constexpr bool InterconnectUndeliveryBroken = true;
 
@@ -377,8 +378,8 @@ void TLongTxServiceActor::ScheduleAcquireSnapshot(const TString& databaseName, T
         return;
     }
 
-    TXLOG_DEBUG("Send-flush TEvAcquireSnapshotFlush for database " << databaseName);
-    Send(SelfId(), new TEvPrivate::TEvAcquireSnapshotFlush(databaseName));
+    TXLOG_DEBUG("Scheduling TEvAcquireSnapshotFlush for database " << databaseName);
+    Schedule(AcquireSnapshotBatchDelay, new TEvPrivate::TEvAcquireSnapshotFlush(databaseName));
     state.FlushPending = true;
 }
 
