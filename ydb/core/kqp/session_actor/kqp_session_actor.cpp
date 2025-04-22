@@ -2611,8 +2611,13 @@ public:
         QueryState->TxCtx->OnBeginQuery();
 
         if (QueryState->FastQuery) {
-            AcquireMvccSnapshot();
-            return;
+            if (QueryState->FastQuery->ExecutionType == TFastQuery::EExecutionType::SELECT1) {
+                ExecuteFastQuery();
+                return;
+            } else {
+                AcquireMvccSnapshot();
+                return;
+            }
         }
 
         if (QueryState->NeedPersistentSnapshot()) {
