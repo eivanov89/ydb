@@ -19,7 +19,7 @@ namespace NKikimr {
 namespace NLongTxService {
 
 static constexpr size_t MaxAcquireSnapshotInFlight = 4;
-static constexpr TDuration AcquireSnapshotBatchDelay = TDuration::MicroSeconds(100);
+static constexpr TDuration AcquireSnapshotBatchDelay = TDuration::MicroSeconds(10);
 static constexpr TDuration RemoteLockTimeout = TDuration::Seconds(15);
 static constexpr bool InterconnectUndeliveryBroken = true;
 
