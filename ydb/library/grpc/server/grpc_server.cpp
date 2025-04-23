@@ -53,6 +53,38 @@ static void PullEvents(grpc::ServerCompletionQueue* cq, TIntrusivePtr<::NMonitor
     }
 }
 
+static void PullEvents2(grpc::ServerCompletionQueue* cq, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters) {
+    TThread::SetCurrentThreadName("grpc_server_custom");
+    auto okCounter = counters->GetCounter("RequestExecuted", true);
+    auto errorCounter = counters->GetCounter("RequestDestroyed", true);
+    auto cpuTime = counters->GetCounter("ThreadCPU", true);
+
+    NMonotonic::TMonotonic lastCpuTimeTs = {};
+    while (true) {
+        void* tag; // uniquely identifies a request.
+        bool ok;
+
+        auto now = NMonotonic::TMonotonic::Now();
+        if (now - lastCpuTimeTs >= TDuration::Seconds(1)) {
+            lastCpuTimeTs = now;
+            *cpuTime = ThreadCPUTime();
+        }
+
+        if (cq->Next(&tag, &ok)) {
+            IQueueEvent* const ev(static_cast<IQueueEvent*>(tag));
+
+            if (ev->Execute(ok)) {
+                okCounter->Inc();
+            } else {
+                ev->DestroyRequest();
+                errorCounter->Inc();
+            }
+        } else {
+            break;
+        }
+    }
+}
+
 void TGrpcServiceProtectiable::StopService() noexcept {
     AtomicSet(ShuttingDown_, 1);
 
@@ -229,6 +261,8 @@ void TGRpcServer::Start() {
         CQS_.push_back(builder.AddCompletionQueue());
     }
 
+    CQS2_.push_back(builder.AddCompletionQueue());
+
     if (Options_.GRpcMemoryQuotaBytes) {
         // See details KIKIMR-6932
         if (Options_.EnableGRpcMemoryQuota) {
@@ -254,7 +288,7 @@ void TGRpcServer::Start() {
     size_t index = 0;
     for (IGRpcServicePtr service : Services_) {
         // TODO: provide something else for services instead of ServerCompletionQueue
-        service->InitService(CQS_, Options_.Logger, index++);
+        service->InitService(CQS_, CQS2_, Options_.Logger, index++);
     }
 
     Ts.reserve(Options_.WorkerThreads);
@@ -264,6 +298,14 @@ void TGRpcServer::Start() {
         auto workerCounters = grpcCounters->GetSubgroup("worker", ToString(i));
         Ts.push_back(SystemThreadFactory()->Run([cq, workerCounters] {
             PullEvents(cq->get(), std::move(workerCounters));
+        }));
+    }
+
+    for (size_t i = 0; i < 2; ++i) {
+        auto* cq = &CQS2_[i % CQS2_.size()];
+        auto workerCounters = grpcCounters->GetSubgroup("worker2", ToString(i));
+        Ts.push_back(SystemThreadFactory()->Run([cq, workerCounters] {
+            PullEvents2(cq->get(), std::move(workerCounters));
         }));
     }
 
@@ -313,6 +355,10 @@ void TGRpcServer::Stop() {
 
     // Always shutdown the completion queue after the server.
     for (auto& cq : CQS_) {
+        cq->Shutdown();
+    }
+
+    for (auto& cq : CQS2_) {
         cq->Shutdown();
     }
 

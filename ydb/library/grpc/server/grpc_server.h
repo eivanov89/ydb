@@ -202,6 +202,15 @@ public:
         InitService(cqs[index % cqs.size()].get(), logger);
     }
 
+    virtual void InitService(
+        const std::vector<std::unique_ptr<grpc::ServerCompletionQueue>>& cqs,
+        const std::vector<std::unique_ptr<grpc::ServerCompletionQueue>>&,
+        TLoggerPtr logger,
+        size_t index)
+    {
+        InitService(cqs, logger, index);
+    }
+
     virtual void SetGlobalLimiterHandle(TGlobalLimiter* limiter) = 0;
     virtual bool IsUnsafeToShutdown() const = 0;
     virtual size_t RequestsInProgress() const = 0;
@@ -377,6 +386,7 @@ private:
     TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters_;
     std::unique_ptr<grpc::Server> Server_;
     std::vector<std::unique_ptr<grpc::ServerCompletionQueue>> CQS_;
+    std::vector<std::unique_ptr<grpc::ServerCompletionQueue>> CQS2_;
     TVector<IThreadRef> Ts;
 
     TVector<IGRpcServicePtr> Services_;
