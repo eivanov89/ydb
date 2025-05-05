@@ -53,6 +53,10 @@ struct TFastQuery {
     // resolved items
 
     THashMap<TString, TSysTables::TTableColumnInfo> ResolvedColumns;
+
+    // a quick hack
+    TVector<TString> ResolvedColumnNames;
+
     TVector<TKeyDesc::TColumnOp> Columns;
     TVector<TSysTables::TTableColumnInfo> KeyColumns;
     TVector<NScheme::TTypeInfo> KeyColumnTypes;

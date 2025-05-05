@@ -450,8 +450,10 @@ private:
         FastQuery->Columns.reserve(entry.Columns.size());
         FastQuery->KeyColumns.reserve(entry.Columns.size());
         FastQuery->KeyColumnTypes.reserve(entry.Columns.size());
+        FastQuery->ResolvedColumnNames.reserve(entry.Columns.size());
         for (const auto& [_, info] : entry.Columns) {
             FastQuery->ResolvedColumns[info.Name] = info;
+            FastQuery->ResolvedColumnNames.emplace_back(info.Name);
             FastQuery->Columns.emplace_back(info.Id, TKeyDesc::EColumnOperation::Read, info.PType, 0, 0);
             if (info.KeyOrder != -1) {
                 FastQuery->KeyColumns.emplace_back(info);
@@ -486,7 +488,13 @@ private:
             }
 
             const auto& typedValue = it->second;
-            KeyCells.emplace_back(TCell::Make<i32>(typedValue.Getvalue().Getint32_value()));
+            if (typedValue.Gettype().type_id() == Ydb::Type::INT32) {
+                KeyCells.emplace_back(TCell::Make<i32>(typedValue.Getvalue().Getint32_value()));
+            } else if (typedValue.Gettype().type_id() == Ydb::Type::UTF8) {
+                KeyCells.emplace_back(TCell(typedValue.Getvalue().Gettext_value().data(), typedValue.Getvalue().Gettext_value().size()));
+            } else {
+                // TODO
+            }
         }
 
         TTableRange range(KeyCells);
@@ -540,6 +548,11 @@ private:
         record.MutableTableId()->SetOwnerId(FastQuery->TableId.PathId.OwnerId);
         record.MutableTableId()->SetTableId(FastQuery->TableId.PathId.LocalPathId);
         record.MutableTableId()->SetSchemaVersion(FastQuery->TableId.SchemaVersion);
+
+        // hack for "select *"
+        if (FastQuery->ColumnsToSelect.empty()) {
+            FastQuery->ColumnsToSelect = FastQuery->ResolvedColumnNames;
+        }
 
         for (const auto& name: FastQuery->ColumnsToSelect) {
             auto it = FindCaseI(FastQuery->ResolvedColumns, name);
@@ -613,6 +626,9 @@ private:
             case NScheme::NTypeIds::Utf8:
                 column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::UTF8);
                 break;
+            case NScheme::NTypeIds::String:
+                column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::STRING);
+                break;
             case NScheme::NTypeIds::Timestamp:
                 column.mutable_type()->mutable_optional_type()->mutable_item()->set_type_id(Ydb::Type::TIMESTAMP);
                 break;
@@ -662,7 +678,10 @@ private:
                     row.add_items()->set_float_value(cell.AsValue<float>());
                     break;
                 case NScheme::NTypeIds::Utf8:
-                    row.add_items()->set_text_value(""); // XXX
+                    row.add_items()->set_text_value(TStringBuf(cell.Data(), cell.Size()));
+                    break;
+                case NScheme::NTypeIds::String:
+                    row.add_items()->set_bytes_value(TStringBuf(cell.Data(), cell.Size()));
                     break;
                 default:
                     *row.add_items() = it->second.DefaultFromLiteral.value();
@@ -1008,6 +1027,15 @@ private:
         queryResponse.SetSessionId(SessionId);
         auto& resultSets = *queryResponse.AddYdbResults();
         queryResponse.MutableTxMeta()->set_id(UserTxId.GetValue().GetHumanStr());
+
+        // hack for "select *"
+        if (FastQuery->ColumnsToSelect.empty()) {
+            FastQuery->ColumnsToSelect.reserve(FastQuery->ResolvedColumns.size());
+            for (const auto& [name, _]: FastQuery->ResolvedColumns) {
+                FastQuery->ColumnsToSelect.push_back(name);
+            }
+        }
+
         for (size_t i = 0; i < FastQuery->ColumnsToSelect.size(); ++i) {
             const auto& name = FastQuery->ColumnsToSelect[i];
             auto it = FindCaseI(FastQuery->ResolvedColumns, name);

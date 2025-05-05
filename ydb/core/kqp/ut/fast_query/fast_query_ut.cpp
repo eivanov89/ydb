@@ -556,6 +556,59 @@ Y_UNIT_TEST(ShouldSelect1) {
     UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
 }
 
+Y_UNIT_TEST(ShouldSelectYCSB) {
+    TKikimrRunner kikimr;
+    kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);
+    auto db = kikimr.GetTableClient();
+    auto session = db.CreateSession().GetValueSync().GetSession();
+
+    UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+        CREATE TABLE `/Root/usertable` (
+            id         Utf8               NOT NULL,
+            field0     String,
+            field1     String,
+            field2     String,
+            field3     String,
+            field4     String,
+            field5     String,
+            field6     String,
+            field7     String,
+            field8     String,
+            field9     String,
+
+            PRIMARY KEY (id)
+        )
+    )").GetValueSync().IsSuccess());
+
+    UNIT_ASSERT(session.ExecuteDataQuery(R"(
+        UPSERT INTO `/Root/usertable` (id, field0, field1) VALUES
+            ("id1", "id1f0", "id1f1"),
+            ("id2", "id2f0", "id2f1");
+    )", TTxControl::BeginTx().CommitTx()).GetValueSync().IsSuccess());
+
+    TString query = R"(
+        DECLARE $key as Text; SELECT * FROM usertable WHERE id = $key;
+    )";
+
+    auto txControl = TTxControl::BeginTx().CommitTx();
+
+    auto params = session.GetParamsBuilder()
+        .AddParam("$key").Utf8("id1").Build()
+        .Build();
+
+    auto result = session.ExecuteDataQuery(query, txControl, params).ExtractValueSync();
+    UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1);
+
+    TResultSetParser resultParser(result.GetResultSet(0));
+    UNIT_ASSERT(resultParser.TryNextRow());
+
+    auto field0 = *resultParser.ColumnParser("FIELD1").GetOptionalString();
+    UNIT_ASSERT_VALUES_EQUAL(field0, "id1f1");
+
+    UNIT_ASSERT(!resultParser.TryNextRow());
+}
+
 Y_UNIT_TEST(ShouldSelect) {
     TKikimrRunner kikimr;
     kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_TRACE);

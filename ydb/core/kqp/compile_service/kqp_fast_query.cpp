@@ -54,7 +54,7 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
 
         // handle WHERE
 
-        //Cerr << Endl << pgJson << Endl;
+        Cerr << (TStringBuilder() << Endl << "pg query: " << pgJson << Endl);
 
         const auto& whereExpr = selectStatement["whereClause"];
         if (!whereExpr.IsDefined()) {
@@ -185,10 +185,17 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
             return;
         }
 
+        bool withStar = false;
+
         for (const auto& target: targets) {
             const auto& fieldsArray = target["ResTarget"]["val"]["ColumnRef"]["fields"].GetArray();
             if (fieldsArray.size() != 1) {
                 return;
+            }
+
+            if (fieldsArray[0].GetMap().contains("A_Star")) {
+                withStar = true;
+                break;
             }
 
             TString column = fieldsArray[0]["String"]["sval"].GetString();
@@ -202,7 +209,7 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
             return;
         }
 
-        if (result->ColumnsToSelect.empty()) {
+        if (result->ColumnsToSelect.empty() && !withStar) {
             return;
         }
 
@@ -211,6 +218,9 @@ void ProcessPostgresTree(const List* raw, TFastQueryPtr& result) {
         } else {
             result->ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
         }
+        return;
+    } catch (std::exception ex) {
+        // pg_query_free_parse_result(parseResult);
         return;
     } catch (...) {
         //pg_query_free_parse_result(parseResult);
@@ -233,6 +243,7 @@ public:
     }
 
     void OnError(const NYql::TIssue& issue) override {
+        //Cerr << (TStringBuilder() << "TEvents::OnError: " << issue.GetMessage() << Endl);
         Issue = issue;
     }
 
@@ -241,6 +252,7 @@ public:
     TFastQueryPtr& FastQuery;
 };
 
+/*
 TFastQuery::EParamType GetParamType(const std::string& typeStr) {
     static const std::unordered_map<std::string, TFastQuery::EParamType> typeMap = {
         {"Int32", TFastQuery::EParamType::INT32},
@@ -275,6 +287,46 @@ void TryCompileSelect1(const TString& yqlQuery, TFastQueryPtr& result) {
     return;
 }
 
+
+void TryCompileYCSBSelect(const TString& yqlQuery, TFastQueryPtr& result) {
+    // XXX avoid multiline issues
+    TString query;
+    query.reserve(yqlQuery.size());
+    for (auto ch: yqlQuery) {
+        if (ch != '\n') {
+            query.append(ch);
+        } else {
+            query.append(' ');
+        }
+    }
+
+    const std::regex selectPattern(R"(; SELECT \* FROM usertable WHERE id)", std::regex::icase);
+    if (std::regex_search(query.begin(), query.end(), selectPattern)) {
+        result->ExecutionType = TFastQuery::EExecutionType::SELECT_QUERY;
+        result->Database = "/Root";
+        result->TableName = "usertable";
+        result->ColumnsToSelect = {
+            "id",
+            "field0",
+            "field1",
+            "field2",
+            "field3",
+            "field4",
+            "field5",
+            "field6",
+            "field7",
+            "field8",
+            "field9",
+        };
+        result->WhereColumnsToPos["id"] = 1;
+        result->PostgresQuery.PositionalNames.emplace_back("key");
+    }
+
+    return;
+}
+*/
+
+/*
 void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
     // Only upserts like this one for now:
     //  DECLARE $batch AS List<Struct<p1:Int32?, p2:Int32, p3:Int32, p4:Int32>>;
@@ -344,7 +396,7 @@ void TryCompileUpsert(const TString& yqlQuery, TFastQueryPtr& result) {
         result->ExecutionType = TFastQuery::EExecutionType::UPSERT;
     }
 }
-
+*/
 } // anonymous
 
 TString TFastQuery::ToString() const {
@@ -386,7 +438,7 @@ TPostgresQuery YQL2Postgres(const TString& yqlQuery) {
             std::regex_search(yqlQuery.begin() + currentPos, yqlQuery.end(), match, DeclareRegex)) {
         std::string variableName = match[1];
         std::string typeName = match[2];
-        if (typeName != "Int32") {
+        if (typeName != "Int32" && typeName != "Text") {
             return {};
         }
         result.PositionalNames.emplace_back(variableName);
@@ -428,17 +480,18 @@ TFastQueryPtr CompileToFastQuery(const TString& yqlQuery) {
         return result;
     }
 
+/*
     TryCompileSelect1(yqlQuery, result);
     if (result->ExecutionType == TFastQuery::EExecutionType::SELECT1) {
         return result;
     }
-    return result;
 
     // check if this is upsert
     TryCompileUpsert(yqlQuery, result);
     if (result->ExecutionType != TFastQuery::EExecutionType::UNSUPPORTED) {
         return result;
     }
+*/
 
     result->PostgresQuery = YQL2Postgres(yqlQuery);
     if (result->PostgresQuery.Query.empty()) {
