@@ -1,7 +1,5 @@
 #pragma once
 
-#include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/query/client.h>
-
 #include <library/cpp/threading/future/future.h>
 
 #include <exception>
@@ -207,14 +205,6 @@ struct TTask<void> {
     TCoroHandle Handle;
 };
 
-using TTerminalTask = TTask<void>;
-
-// TODO: can we move it?
-struct TTransactionResult {
-};
-
-using TTransactionTask = TTask<TTransactionResult>;
-
 //-----------------------------------------------------------------------------
 
 class ITaskQueue {
@@ -239,6 +229,9 @@ public:
     // functions called by other threads
 
     virtual void TaskReadyThreadSafe(std::coroutine_handle<> handle, size_t terminalId) = 0;
+
+    // Check if current thread is one of the task queue threads
+    virtual bool CheckCurrentThread() const = 0;
 };
 
 std::unique_ptr<ITaskQueue> CreateTaskQueue(
@@ -275,10 +268,9 @@ struct TSuspend {
 
 //-----------------------------------------------------------------------------
 
-// we don't use library/cpp/threading/future/core/coroutine_traits.h, because we
+// we don't use the one from library/cpp/threading/future/core/coroutine_traits.h, because we
 // want to resume terminal in its thread from IReadyTaskQueue and not to resume
 // by SDK thread who set the promise value.
-
 template <typename T>
 struct TSuspendWithFuture {
     TSuspendWithFuture(NThreading::TFuture<T>& future, ITaskQueue& taskQueue, size_t terminalId)
@@ -339,6 +331,29 @@ struct TSuspendWithFuture<void> {
     }
 
     NThreading::TFuture<void>& Future;
+    ITaskQueue& TaskQueue;
+    size_t TerminalId;
+};
+
+// used by coroutine which might be started outside TaskQueue to await, when it is in TaskQueue
+struct TTaskReady {
+    TTaskReady(ITaskQueue& taskQueue, size_t terminalId)
+        : TaskQueue(taskQueue)
+        , TerminalId(terminalId)
+    {}
+
+    bool await_ready() { return false; }
+
+    bool await_suspend(std::coroutine_handle<> h) {
+        if (TaskQueue.CheckCurrentThread()) {
+            return false;
+        }
+        TaskQueue.TaskReadyThreadSafe(h, TerminalId);
+        return true;
+    }
+
+    void await_resume() {}
+
     ITaskQueue& TaskQueue;
     size_t TerminalId;
 };

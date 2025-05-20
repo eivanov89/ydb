@@ -14,7 +14,9 @@ struct TRunConfig {
     int WarmupSeconds = 0;
     int RunSeconds = 0;
 
-    ELogPriority LogPriority = ELogPriority::TLOG_DEBUG;
+    TString Path;
+
+    ELogPriority LogPriority = ELogPriority::TLOG_RESOURCES;
 };
 
 void RunSync(const TRunConfig& config);

@@ -2,17 +2,26 @@
 
 #include "log.h"
 
+//-----------------------------------------------------------------------------
+
+using namespace NYdb::NQuery;
+
+//-----------------------------------------------------------------------------
+
 namespace NYdb::NTPCC {
 
 TTerminal::TTerminal(size_t terminalID,
+                     size_t warehouseID,
+                     size_t warehouseCount,
                      ITaskQueue& taskQueue,
                      TDriver& driver,
+                     const TString& path,
                      std::stop_token stopToken,
                      std::atomic<bool>& stopWarmup,
                      std::shared_ptr<TLog>& log)
     : TaskQueue(taskQueue)
     , Driver(driver)
-    , Context(terminalID, TaskQueue, std::make_shared<NQuery::TQueryClient>(Driver), log)
+    , Context(terminalID, warehouseID, warehouseCount, TaskQueue, std::make_shared<NQuery::TQueryClient>(Driver), path, log)
     , StopToken(stopToken)
     , StopWarmup(stopWarmup)
     , Task(Run())
@@ -29,12 +38,38 @@ TTerminalTask TTerminal::Run() {
 
     while (!StopToken.stop_requested()) {
         try {
-            auto result = co_await GetNewOrderTask(Context);
+            // TODO: disable autocommit
+
+            LOG_T("Terminal " << Context.TerminalID << " starting transaction");
+
+            size_t execCount = 0;
+
+            auto future = Context.Client->RetryQuery([this, &execCount](TSession session) mutable {
+                auto& Log = Context.Log;
+                LOG_T("Terminal " << Context.TerminalID << " started RetryQuery");
+                ++execCount;
+                return GetNewOrderTask(Context, session);
+            });
+
+            auto result = co_await TSuspendWithFuture(future, Context.TaskQueue, Context.TerminalID);
             (void) result;
-        } catch (const std::exception& ex) {
-            LOG_E("Terminal " << Context.TerminalID << " got exception while transaction execution: " << ex.what());
+            LOG_T("Terminal " << Context.TerminalID << " transaction finished in " << execCount << " execution(s)");
+        } catch (const TUserAbortedException& ex) {
+            // it's OK, inc statistics and ignore
+            LOG_T("Terminal " << Context.TerminalID << " transaction aborted by user");
+        } catch (const yexception& ex) {
+            TStringStream ss;
+            ss << "Terminal " << Context.TerminalID << " got exception while transaction execution: "
+                << ex.what();
+            const auto* backtrace = ex.BackTrace();
+            if (backtrace) {
+                ss << ", stacktrace: " << ex.BackTrace()->PrintToString();
+            }
+            LOG_E(ss.Str());
+            std::quick_exit(1);
         }
 
+        LOG_T("Terminal " << " is going to sleep");
         co_await TSuspend(TaskQueue, Context.TerminalID, std::chrono::milliseconds(50));
     }
 

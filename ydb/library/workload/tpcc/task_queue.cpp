@@ -17,6 +17,9 @@ namespace {
 
 constexpr auto SleepUsecIfNoProgress = std::chrono::microseconds(100);
 
+// Initialize thread-local variable
+thread_local int TaskQueueThreadId = -1;
+
 //-----------------------------------------------------------------------------
 
 struct alignas(64) TPerThreadContext {
@@ -54,6 +57,8 @@ public:
     void AsyncSleep(std::coroutine_handle<> handle, size_t terminalId, std::chrono::milliseconds delay) override;
 
     void TaskReadyThreadSafe(std::coroutine_handle<> handle, size_t terminalId) override;
+
+    bool CheckCurrentThread() const override;
 
 private:
     void RunThread(size_t threadId);
@@ -152,7 +157,10 @@ void TTaskQueue::TaskReadyThreadSafe(std::coroutine_handle<> handle, size_t term
 }
 
 void TTaskQueue::RunThread(size_t threadId) {
+    TaskQueueThreadId = static_cast<int>(threadId);
     TThread::SetCurrentThreadName((TStringBuilder() << "task_queue_" << threadId).c_str());
+
+    // TODO: just set seed? Or use random generator per terminal?
 
     auto& context = PerThreadContext[threadId];
 
@@ -196,6 +204,10 @@ void TTaskQueue::RunThread(size_t threadId) {
             std::this_thread::sleep_for(SleepUsecIfNoProgress);
         }
     }
+}
+
+bool TTaskQueue::CheckCurrentThread() const {
+    return TaskQueueThreadId >= 0;
 }
 
 } // anonymous

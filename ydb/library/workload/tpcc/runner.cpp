@@ -81,7 +81,7 @@ TPCCRunner::TPCCRunner(const TRunConfig& config)
     if (cpuCount == 0) {
         // dump sanity check
         std::cerr << "No CPUs" << std::endl;
-        std::terminate();
+        std::exit(1);
     }
 
     const size_t networkThreadCount = NConsoleClient::TYdbCommand::GetNetworkThreadNum(Config.ConnectionConfig);
@@ -117,10 +117,14 @@ TPCCRunner::TPCCRunner(const TRunConfig& config)
     Terminals.reserve(terminalsCount);
     for (size_t i = 0; i < terminalsCount; ++i) {
         // note, that terminal adds itself to ready terminals
+        size_t warehouseID = i % TERMINALS_PER_WAREHOUSE + 1;
         Terminals.emplace_back(
             i,
+            warehouseID,
+            Config.WarehouseCount,
             *TaskQueue,
             drivers[i % drivers.size()],
+            Config.Path,
             TerminalsStopSource.get_token(),
             StopWarmup,
             Log);

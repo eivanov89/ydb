@@ -20,14 +20,19 @@ struct TTerminalStats {
     std::atomic<size_t> NewOrdersDone = 0;
 };
 
+using TTerminalTask = TTask<void>;
+
 //-----------------------------------------------------------------------------
 
 class alignas(64) TTerminal {
 public:
     TTerminal(
         size_t terminalID,
+        size_t warehouseID,
+        size_t warehouseCount,
         ITaskQueue& taskQueue,
         TDriver& driver,
+        const TString& path,
         std::stop_token stopToken,
         std::atomic<bool>& stopWarmup,
         std::shared_ptr<TLog>& log);
