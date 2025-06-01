@@ -16,6 +16,14 @@
 
 #include <ydb/public/sdk/cpp/src/library/issue/yql_issue_message.h>
 
+#ifndef YDB_GRPC_LATENCY_SAMPLE_DUMP
+#define YDB_GRPC_LATENCY_SAMPLE_DUMP
+#endif
+
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+#include <util/system/hp_timer.h>
+#endif
+
 namespace NYdb::inline Dev {
 
 constexpr TDuration GRPC_KEEP_ALIVE_TIMEOUT_FOR_DISCOVERY = TDuration::Seconds(10);
@@ -153,6 +161,12 @@ public:
         using TConnection = std::unique_ptr<TServiceConnection<TService>>;
         Y_ABORT_UNLESS(dbState);
 
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+        std::shared_ptr<std::vector<THPTimer>> timers = std::make_shared<std::vector<THPTimer>>();
+        timers->reserve(10);
+        timers->emplace_back();
+#endif
+
         if (!TryCreateContext(context)) {
             TPlainStatus status(EStatus::CLIENT_CANCELLED, "Client is stopped");
             userResponseCb(nullptr, TPlainStatus{status.Status, std::move(status.Issues)});
@@ -174,8 +188,14 @@ public:
         }
 
         WithServiceConnection<TService>(
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+            [this, request = std::move(request), userResponseCb = std::move(userResponseCb), rpc, requestSettings, context = std::move(context), dbState, timers = timers]
+            (TPlainStatus status, TConnection serviceConnection, TEndpointKey endpoint) mutable -> void {
+                //timers.emplace_back();
+#else
             [this, request = std::move(request), userResponseCb = std::move(userResponseCb), rpc, requestSettings, context = std::move(context), dbState]
             (TPlainStatus status, TConnection serviceConnection, TEndpointKey endpoint) mutable -> void {
+#endif
                 if (!status.Ok()) {
                     userResponseCb(
                         nullptr,
@@ -225,8 +245,14 @@ public:
                 dbState->StatCollector.IncGRpcInFlightByHost(endpoint.GetEndpoint());
 
                 NYdbGrpc::TAdvancedResponseCallback<TResponse> responseCbLow =
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+                    [this, context, userResponseCb = std::move(userResponseCb), endpoint, dbState, timers = timers]
+                    (const grpc::ClientContext& ctx, TGrpcStatus&& grpcStatus, TResponse&& response) mutable -> void {
+                        timers->emplace_back();
+#else
                     [this, context, userResponseCb = std::move(userResponseCb), endpoint, dbState]
                     (const grpc::ClientContext& ctx, TGrpcStatus&& grpcStatus, TResponse&& response) mutable -> void {
+#endif
                         dbState->StatCollector.DecGRpcInFlight();
                         dbState->StatCollector.DecGRpcInFlightByHost(endpoint.GetEndpoint());
 
@@ -251,7 +277,11 @@ public:
                                 this,
                                 std::move(context),
                                 endpoint.GetEndpoint(),
-                                std::move(metadata));
+                                std::move(metadata)
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+                                , timers
+#endif
+                            );
 
                             EnqueueResponse(resp);
                         } else {
@@ -271,7 +301,7 @@ public:
                         }
                     };
 
-                serviceConnection->DoAdvancedRequest(std::move(request), std::move(responseCbLow), rpc, meta,
+                serviceConnection->DoAdvancedRequest(std::move(request), std::move(responseCbLow), rpc, timers, meta,
                     context.get());
             }, dbState, requestSettings.PreferredEndpoint, requestSettings.EndpointPolicy);
     }

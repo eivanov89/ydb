@@ -6,6 +6,15 @@
 
 #include <util/thread/factory.h>
 #include <util/string/builder.h>
+
+#ifndef YDB_GRPC_LATENCY_SAMPLE_DUMP
+#define YDB_GRPC_LATENCY_SAMPLE_DUMP
+#endif
+
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+#include <util/system/hp_timer.h>
+#endif
+
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/support/async_stream.h>
 #include <grpcpp/support/async_unary_call.h>
@@ -342,10 +351,6 @@ public:
     }
 
     bool Execute(bool ok) override {
-        {
-            std::unique_lock<std::mutex> guard(Mutex_);
-            LocalContext.reset();
-        }
         TGrpcStatus status;
         if (ok) {
             status = Status;
@@ -355,6 +360,10 @@ public:
         Replied_ = true;
         Callback_(Context, std::move(status), std::move(Reply_));
         Callback_ = nullptr; // free resources as early as possible
+        {
+            std::unique_lock<std::mutex> guard(Mutex_);
+            LocalContext.reset();
+        }
         return false;
     }
 
@@ -368,6 +377,28 @@ private:
         return this;
     }
 
+    void Start(TStub& stub, TAsyncRequest asyncRequest, const TRequest& request, IQueueClientContextProvider* provider, std::shared_ptr<std::vector<THPTimer>>& timers) {
+        auto context = provider->CreateContext();
+        if (!context) {
+            Replied_ = true;
+            Callback_(Context, TGrpcStatus(grpc::StatusCode::CANCELLED, "Client is shutting down"), std::move(Reply_));
+            Callback_ = nullptr;
+            return;
+        }
+        {
+            {
+                std::unique_lock<std::mutex> guard(Mutex_);
+                LocalContext = context;
+            }
+            Reader_ = (stub.*asyncRequest)(&Context, request, context->CompletionQueue());
+            timers->emplace_back();
+            Reader_->Finish(&Reply_, &Status, FinishedEvent());
+        }
+        context->SubscribeStop([self = TPtr(this)] {
+            self->Stop();
+        });
+    }
+
     void Start(TStub& stub, TAsyncRequest asyncRequest, const TRequest& request, IQueueClientContextProvider* provider) {
         auto context = provider->CreateContext();
         if (!context) {
@@ -377,8 +408,10 @@ private:
             return;
         }
         {
-            std::unique_lock<std::mutex> guard(Mutex_);
-            LocalContext = context;
+            {
+                std::unique_lock<std::mutex> guard(Mutex_);
+                LocalContext = context;
+            }
             Reader_ = (stub.*asyncRequest)(&Context, request, context->CompletionQueue());
             Reader_->Finish(&Reply_, &Status, FinishedEvent());
         }
@@ -1300,6 +1333,23 @@ public:
     }
 
     /*
+     * Start simple request
+     */
+    template<typename TRequest, typename TResponse>
+    void DoAdvancedRequest(const TRequest& request,
+                           TAdvancedResponseCallback<TResponse> callback,
+                           typename TAdvancedRequestProcessor<TStub, TRequest, TResponse>::TAsyncRequest asyncRequest,
+                           std::shared_ptr<std::vector<THPTimer>>& timers,
+                           const TCallMeta& = { },
+                           IQueueClientContextProvider* provider = nullptr)
+    {
+        auto processor = MakeIntrusive<TAdvancedRequestProcessor<TStub, TRequest, TResponse>>(std::move(callback));
+        //processor->ApplyMeta(metas);
+        timers->emplace_back();
+        processor->Start(*Stub_, asyncRequest, request, provider ? provider : Provider_, timers);
+    }
+
+    /*
      * Start bidirectional streamming
      */
     template<typename TRequest, typename TResponse>
@@ -1416,7 +1466,7 @@ private:
         return static_cast<ECqState>(CqState_.load());
     }
 
-    inline void SetCqState(ECqState state) { 
+    inline void SetCqState(ECqState state) {
         CqState_.store(state);
     }
 

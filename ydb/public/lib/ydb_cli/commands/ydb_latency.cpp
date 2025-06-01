@@ -214,9 +214,18 @@ int TCommandLatency::Run(TConfig& config) {
     const size_t cpuCount = NSystemInfo::CachedNumberOfCpus();
     const size_t driverCount = std::min(MaxInflight, int(cpuCount));
 
+    // XXX
+    TDriverConfig driverConfig;
+    {
+        TDriver fakeDriver(CreateDriver(config));
+        driverConfig = fakeDriver.GetConfig();
+    }
+
+    //driverConfig.SetClientThreadsNum(2);
+
     std::vector<TDriver> drivers;
     for (size_t i = 0; i < driverCount; ++i) {
-        drivers.emplace_back(CreateDriver(config));
+        drivers.emplace_back(driverConfig);
     }
 
     // share driver in RR manner

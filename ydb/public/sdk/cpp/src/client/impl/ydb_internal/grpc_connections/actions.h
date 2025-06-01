@@ -9,6 +9,14 @@
 
 #include <ydb/public/sdk/cpp/src/library/grpc/client/grpc_client_low.h>
 
+#ifndef YDB_GRPC_LATENCY_SAMPLE_DUMP
+#define YDB_GRPC_LATENCY_SAMPLE_DUMP
+#endif
+
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+#include <util/system/hp_timer.h>
+#include <util/random/random.h>
+#endif
 #include <util/thread/pool.h>
 
 #include <grpcpp/alarm.h>
@@ -155,14 +163,45 @@ public:
             TGRpcConnectionsImpl* connections,
             std::shared_ptr<IQueueClientContext> context,
             const std::string& endpoint,
-            std::multimap<std::string, std::string>&& metadata)
+            std::multimap<std::string, std::string>&& metadata
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+            , std::shared_ptr<std::vector<THPTimer>> timers = {}
+#endif
+        )
         : TGenericCbHolder<TResponseCb<TResponse>>(std::move(userCb), connections, std::move(context))
         , Response_(std::move(response))
         , GRpcStatus_(std::move(status))
         , Endpoint_(endpoint)
-        , Metadata_(std::move(metadata)) {}
+        , Metadata_(std::move(metadata))
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+        , Timers(std::move(timers))
+    {
+        //Timers->emplace_back();
+    }
+#else
+    {}
+#endif
 
     void Process(void*) override {
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+        //Timers.emplace_back();
+        int randNum = ::RandomNumber(100U);
+        if (false && Timers->front().Passed() > 0.002 && randNum < 20) {
+            std::vector<ui64> passedVec;
+            passedVec.reserve(Timers->size());
+            for (const auto& timer: *Timers) {
+                passedVec.emplace_back(static_cast<ui64>(timer.Passed() * 1000));
+            }
+            TStringStream ss;
+            ss << "total: " << passedVec[0];
+            for (size_t i = 1; i < passedVec.size(); ++i) {
+                auto delta = passedVec[i-1] - passedVec[i];
+                ss << ", +" << delta;
+            }
+            ss << Endl;
+            Cerr << ss.Str();
+        }
+#endif
         this->UserResponseCb_(&Response_, TPlainStatus{GRpcStatus_, Endpoint_, std::move(Metadata_)});
         delete this;
     }
@@ -172,6 +211,10 @@ private:
     NYdbGrpc::TGrpcStatus GRpcStatus_;
     const std::string Endpoint_;
     std::multimap<std::string, std::string> Metadata_;
+
+#ifdef YDB_GRPC_LATENCY_SAMPLE_DUMP
+    std::shared_ptr<std::vector<THPTimer>> Timers;
+#endif
 };
 
 class TSimpleCbResult
