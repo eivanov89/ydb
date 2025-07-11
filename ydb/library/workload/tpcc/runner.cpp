@@ -384,6 +384,11 @@ void TPCCRunner::UpdateDisplayIfNeeded(Clock::time_point now) {
     }
     firstTime = false;
 
+    static int i = 1;
+    LOG_I("Test message " << i);
+    LOG_I("LlllllLLLLlllLLllooooooOOooooOOoooOOOooOOooonnnnnnnnnnnnnNGGGGGGGGGGGGGGGGGGG meeeeeeeeesssssssssaageqqqqq");
+    ++i;
+
     CollectDataToDisplay(now);
 
     switch (Config.DisplayMode) {
