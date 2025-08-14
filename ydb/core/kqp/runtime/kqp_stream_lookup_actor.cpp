@@ -612,6 +612,7 @@ private:
         auto defaultSettings = GetDefaultReadSettings()->Record;
         record.SetMaxRows(defaultSettings.GetMaxRows());
         record.SetMaxBytes(defaultSettings.GetMaxBytes());
+        //record.SetMaxRowsInResult(defaultSettings.GetMaxRows() / 4);
         record.SetResultFormat(NKikimrDataEvents::FORMAT_CELLVEC);
 
         CA_LOG_D(TStringBuilder() << "Send EvRead (stream lookup) to shardId=" << shardId

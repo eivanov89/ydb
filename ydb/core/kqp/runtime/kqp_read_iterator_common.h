@@ -21,11 +21,11 @@ struct TIteratorReadBackoffSettings : TAtomicRefCount<TIteratorReadBackoffSettin
 
 struct TEvReadSettings : public TAtomicRefCount<TEvReadSettings> {
     TEvReadSettings() {
-        Read.SetMaxRows(32767);
-        Read.SetMaxBytes(5_MB);
+        Read.SetMaxRows(500000);
+        Read.SetMaxBytes(30_MB);
 
-        Ack.SetMaxRows(32767);
-        Ack.SetMaxBytes(5_MB);
+        Ack.SetMaxRows(500000);
+        Ack.SetMaxBytes(30_MB);
     }
 
     NKikimrTxDataShard::TEvRead Read;
