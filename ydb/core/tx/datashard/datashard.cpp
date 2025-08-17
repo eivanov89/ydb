@@ -17,6 +17,8 @@
 #include <library/cpp/monlib/service/pages/templates.h>
 
 #include <contrib/libs/apache/arrow/cpp/src/arrow/api.h>
+#include <library/cpp/streams/zstd/zstd.h>
+#include <util/stream/str.h>
 
 LWTRACE_USING(DATASHARD_PROVIDER)
 
@@ -743,12 +745,12 @@ public:
 
     void OnCommit(ui64) override {
         if (WriteResult->IsError()) {
-            LOG_ERROR_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, 
-                "Complete volatile write [" << Step << " : " << TxId << "] from " << Self->TabletID() 
+            LOG_ERROR_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                "Complete volatile write [" << Step << " : " << TxId << "] from " << Self->TabletID()
                 << " at tablet " << Self->TabletID() << ", error:  " << WriteResult->GetError());
         } else {
-            LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, 
-                "Complete volatile write [" << Step << " : " << TxId << "] from " << Self->TabletID() 
+            LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                "Complete volatile write [" << Step << " : " << TxId << "] from " << Self->TabletID()
                 << " at tablet " << Self->TabletID() << " send result to client " << Target);
         }
 
@@ -3385,7 +3387,7 @@ void TDataShard::Handle(TEvPrivate::TEvDelayedProposeTransaction::TPtr &ev, cons
                     if (datashardTransactionSpan) {
                         datashardTransactionSpan.Attribute("Shard", std::to_string(TabletID()));
                     }
-                    
+
                     Execute(new TTxProposeTransactionBase(this, std::move(event), item.ReceivedAt, item.TieBreakerIndex, /* delayed */ true, std::move(datashardTransactionSpan)), ctx);
                     return;
                 }
@@ -3427,7 +3429,7 @@ void TDataShard::Handle(TEvPrivate::TEvDelayedProposeTransaction::TPtr &ev, cons
                 Y_FAIL_S("Unexpected event type " << item.Event->GetTypeRewrite());
         }
 
-        
+
     }
 
     // N.B. Ack directly since we didn't start any delayed transactions
@@ -4826,6 +4828,20 @@ NActors::IEventBase* TEvDataShard::TEvReadResult::Load(TEventSerializedData* dat
         auto schema = NArrow::DeserializeSchema(batch.GetSchema());
         event->ArrowBatch = NArrow::DeserializeBatch(batch.GetBatch(), schema);
         record.ClearArrowBatch();
+    } else if (record.HasCompressedCellVec()) {
+        const auto& compressed = record.GetCompressedCellVec();
+        TStringInput input(compressed);
+        TZstdDecompress decompress(&input);
+        const TString decompressed = decompress.ReadAll();
+
+        NKikimrTxDataShard::TEvReadResult::TCellVecBatch batch;
+        if (batch.ParseFromArray(decompressed.data(), static_cast<int>(decompressed.size()))) {
+            event->RowsSerialized.reserve(batch.RowsSize());
+            for (auto& row : *batch.MutableRows()) {
+                event->RowsSerialized.emplace_back(std::move(row));
+            }
+        }
+        record.ClearCompressedCellVec();
     } else if (record.HasCellVec()) {
         auto& batch = *record.MutableCellVec();
         event->RowsSerialized.reserve(batch.RowsSize());
@@ -4847,22 +4863,33 @@ void TEvDataShard::TEvReadResult::FillRecord() {
         return;
     }
 
-    if (!Batch.empty()) {
-        auto* protoBatch = Record.MutableCellVec();
-        protoBatch->MutableRows()->Reserve(Batch.Size());
-        for (const auto& row: Batch) {
-            protoBatch->AddRows(TSerializedCellVec::Serialize(row));
+    if (!Batch.empty() || !Rows.empty()) {
+        NKikimrTxDataShard::TEvReadResult::TCellVecBatch protoBatch;
+        if (!Batch.empty()) {
+            protoBatch.MutableRows()->Reserve(Batch.Size());
+            for (const auto& row : Batch) {
+                protoBatch.AddRows(TSerializedCellVec::Serialize(row));
+            }
+        } else {
+            protoBatch.MutableRows()->Reserve(Rows.size());
+            for (const auto& row : Rows) {
+                protoBatch.AddRows(TSerializedCellVec::Serialize(row));
+            }
         }
-        Batch = {};
-        return;
-    }
 
-    if (!Rows.empty()) {
-        auto* protoBatch = Record.MutableCellVec();
-        protoBatch->MutableRows()->Reserve(Rows.size());
-        for (const auto& row: Rows) {
-            protoBatch->AddRows(TSerializedCellVec::Serialize(row));
+        TString raw;
+        (void)protoBatch.SerializeToString(&raw);
+
+        TString compressed;
+        {
+            TStringOutput output(compressed);
+            TZstdCompress zstd(&output);
+            zstd.Write(raw.data(), raw.size());
         }
+
+        Record.SetCompressedCellVec(std::move(compressed));
+
+        Batch = {};
         Rows.clear();
         return;
     }
