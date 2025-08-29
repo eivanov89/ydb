@@ -1,4 +1,5 @@
 import json
+import collections
 import copy
 import logging
 import random
@@ -11,32 +12,46 @@ import traceback
 import yaml
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+
 
 logger = logging.getLogger(__name__)
 
-# Request healthcheck from the next in RR endpoint every amount of time
-HEALTH_CHECK_INTERVAL = 0.1
+# Delay between health checks
+HEALTH_CHECK_INTERVAL = 0.2
 
 # Refresh piles list via CLI every amount of time
 PILES_REFRESH_INTERVAL = 0.5
 
-# Consider a pile responsive if last health check is within this threshold (seconds)
-# Initial healthecks to endpoints of the same pile are evenly distributed across
-# this interval of time
-RESPONSIVENESS_THRESHOLD_SECONDS = 2.0
+# Consider a pile responsive if last health check is within this threshold
+RESPONSIVENESS_THRESHOLD_SECONDS = 5.0
 
+# A minimum number of endpoints in any pile, must be odd
 MINIMAL_EXPECTED_ENDPOINTS_PER_PILE = 3
+
+# a minimal number of endpoints to gather the quorum
+MINIMAL_MAJORITY_SIZE = MINIMAL_EXPECTED_ENDPOINTS_PER_PILE // 2 + 1
+
+# send at most this amount of health checks per pile (but wait for majority)
+# note, that when there are more than HEALTH_ENDPOINTS_PER_PILE we don't have
+# a strict quorum, see PileHealth.
+#
+# In case of 3 nodes, there might be at most 1 faulty node. In case of 5 nodes – 2.
+# However, when there are more than HEALTH_ENDPOINTS_PER_PILE nodes, we don't
+# use strict check: just use random HEALTH_ENDPOINTS_PER_PILE nodes and their majority.
+HEALTH_ENDPOINTS_PER_PILE = 5
 
 # Consider healthcheck reply valid only within this amount of time
 HEALTH_REPLY_TTL_SECONDS = 5.0
 
 # Currently when pile goes from 'NOT SYNCHRONIZED -> SYNCHRONIZED' there might be
 # healthchecks reporting it bad, we should ignore them for some time.
-TO_SYNC_TRANSITION_GRACE_PERIOD = RESPONSIVENESS_THRESHOLD_SECONDS * 3
+TO_SYNC_TRANSITION_GRACE_PERIOD = RESPONSIVENESS_THRESHOLD_SECONDS * 2
 
 # Emit an info-level "All is good" at most once per this period (seconds)
 ALL_GOOD_INFO_PERIOD_SECONDS = 60.0
+
+YDB_HEALTHCHECK_TIMEOUT_MS = RESPONSIVENESS_THRESHOLD_SECONDS * 1000
 
 STATUS_COLOR = {
     # ydb reported statuses
@@ -55,59 +70,194 @@ STATUS_COLOR = {
     "UNKNOWN": "red",
 }
 
-# Keep at most this many endpoints per pile when resolving
-# TODO: consider larger number of larger installations
-MAX_ENDPOINTS_PER_PILE = 3
+
+def filter_pile_issue(issue):
+    try:
+        type = issue['type']
+        status = issue['status']
+        pile_name = issue['location']['storage']['pool']['group']['pile']['name']
+
+        if pile_name and ('GROUP' in type) and status == 'RED':
+            return True
+    except:
+        return False
+
+
+class PileHealth:
+    """
+    Pile health state obtained by AsyncHealthcheckRunner
+
+    - Uses quorum from multiple endpoints to avoid split brains and faulty nodes.
+    """
+
+    def __init__(self, name: str, results: Dict[str, Dict[str, Any]]):
+        self.name = name
+
+        self.ts = time.time()
+        self.monoTs = time.monotonic()
+
+        # endpoints which built the quorum
+        self.quorum_endpoints = []
+
+        # result itself: each field is what majority of endpoints agree with
+
+        # healthcheck: result["self_check_result"]
+        self.self_check_result = None
+
+        # healthcheck: there is an issue with 'RED' status and *GROUP* type and
+        # path ['location']['storage']['pool']['group']['pile']
+        self.bad_piles = []
+
+        if len(results) >= MINIMAL_MAJORITY_SIZE:
+            self.endpoint_to_result = {}
+            for endpoint, result in results.items():
+                self.endpoint_to_result[endpoint] = result
+
+            self._calculate_state()
+
+    def _calculate_state(self):
+        total_reports = len(self.endpoint_to_result)
+
+        self_check_result_counter = collections.defaultdict(int)
+        bad_pile_vote_counter = collections.defaultdict(int)
+
+        for endpoint, data in self.endpoint_to_result.items():
+            try:
+                if 'self_check_result' in data:
+                    self_check_result_counter[data['self_check_result']] += 1
+
+                issues = data.get('issue_log', []) or []
+                failed_groups = filter(filter_pile_issue, issues)
+                failed_piles = set(
+                    map(lambda issue: issue['location']['storage']['pool']['group']['pile']['name'], failed_groups)
+                )
+                for pile_name in failed_piles:
+                    bad_pile_vote_counter[pile_name] += 1
+            except Exception:
+                continue
+
+        total_reports = len(self.endpoint_to_result)
+        majority_threshold = min(MINIMAL_MAJORITY_SIZE, total_reports // 2 + 1)
+
+        for self_check_result, count in self_check_result_counter.items():
+            if count >= majority_threshold:
+                self.self_check_result = self_check_result
+
+        for bad_pile_name, count in bad_pile_vote_counter.items():
+            if count >= majority_threshold:
+                self.bad_piles.append(bad_pile_name)
+
+        # We are not paranoid and a little bit sloppy,
+        # so that choose quorum nodes just based on self_check_result.
+        # Normally, we would want the same nodes agree on both check result and bad piles
+        for endpoint, data in self.endpoint_to_result.items():
+            try:
+                if data['self_check_result'] == self.self_check_result:
+                    self.quorum_endpoints.append(endpoint)
+            except:
+                continue
+
+
+def async_do_pile_health_check(pile_name, endpoints, use_https=False, executor: ThreadPoolExecutor = None):
+    def fetch_health(endpoint: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        try:
+            scheme = 'https' if use_https else 'http'
+            r = requests.get(
+                f'{scheme}://{endpoint}:8765/viewer/healthcheck',
+                params={'merge_records': 'true', 'timeout': str(YDB_HEALTHCHECK_TIMEOUT_MS)},
+                verify=False,
+                # TODO add requests timeout?
+            )
+            r.raise_for_status()
+            data = r.json()
+            return (endpoint, data)
+        except Exception as e:
+            logger.debug(f"async_do_pile_health_check: request failed for pile '{pile_name}' {endpoint}: {e}")
+            return None
+
+    def worker() -> PileHealth:
+        results: Dict[str, Dict[str, Any]] = {}
+        if not endpoints:
+            return PileHealth(pile_name, results)
+
+        max_workers = min(len(endpoints), 8)
+        future_map = {executor.submit(fetch_health, endpoint): endpoint for endpoint in endpoints}
+        for f in as_completed(list(future_map.keys())):
+            try:
+                res = f.result()
+            except Exception:
+                res = None
+            if res is None:
+                continue
+            endpoint, data = res
+            results[endpoint] = data
+
+        pile_health = PileHealth(pile_name, results)
+        try:
+            pile_health.quorum_endpoints = list(results.keys())
+        except Exception:
+            pass
+        return pile_health
+
+    if executor is None:
+        raise ValueError("executor must be provided to async_do_pile_health_check")
+
+    return executor.submit(worker)
+
+
+class PileAdminItem:
+    def __init__(self, name: str, admin_reported_state: str):
+        self.name = name
+        self.admin_reported_state = admin_reported_state
+
+
+class PileAdminStates:
+    """
+    List of configured piles and their admin reported states
+
+    AsyncHealthcheckRunner must obtain it from any endpoing from PileHealth.quorum_endpoints
+    """
+    def __init__(self, generation: int, piles: Dict[str, PileAdminItem]):
+        self.generation = generation
+        self.piles = piles
+
+
+class PileWorldView:
+    def __init__(self, name: str, health: Optional[PileHealth] = None, admin_states: Optional[PileAdminStates] = None):
+        self.name = name
+        self.health = health
+        self.admin_states = admin_states
 
 
 class AsyncHealthcheckRunner:
     """
     Periodically performs healthcheck requests to viewer endpoints concurrently.
 
-    - Constructor accepts endpoints and shuffles them
-    - start() begins asynchronous round-robin dispatch in a background thread
+    Based on healtheck maintains how each pile sees itself and others.
+    It's up to the caller to build global state based on these visions.
+
+    - Constructor accepts pile to its endpoints map
+    - start() begins asynchronous healthcheck a background thread
     - Maintains a dictionary: reporter pile name -> set of failed pile names
-    - get_health_state_and_piles() is thread-safe and returns a snapshot for Bridgekeeper
+    - get_health_state() is thread-safe and returns a snapshot for Bridgekeeper
     """
 
     def __init__(self, endpoints, path_to_cli, initial_piles, use_https=False):
-        self.endpoints = list(endpoints)
         self.path_to_cli = path_to_cli
-        self.initial_piles = initial_piles
+        self.pile_to_endpoints = initial_piles
         self.use_https = use_https
 
-        random.shuffle(self.endpoints)
-
-        self._executor = ThreadPoolExecutor(max_workers=max(1, min(4, len(self.endpoints) or 1)))
-        self._stop_event = threading.Event()
-        self._thread = None
         self._lock = threading.Lock()
 
-        # reporter_pile -> set(failed_pile_names)
-        self._reporter_to_failed = {}
-        # reporter_pile -> last health check timestamp
-        self._reporter_last_ts = {}
+        self._pile_world_views = {}
+        for pile_name in self.pile_to_endpoints.keys():
+            self._pile_world_views[pile_name] = PileWorldView(pile_name)
 
-        # endpoint -> Future (or None if idle)
-        self._inflight = {}
-        self._rr_index = 0
-
-        # piles list snapshot (dict: pile_name -> state string)
-        self._piles_list = {}
-        self._piles_generation = None
-        self._last_piles_refresh_ts = 0.0
-
-        # Track mapping from endpoint -> pile and last response time per endpoint
-        # TODO: probably get ridd of _endpoint_to_pile if we have initial mapping?
-        self._endpoint_to_pile = {}
-        self._endpoint_last_ts = {}
-
-        # Set by keeper
-        self._primary_hint = None
+        self._executor = ThreadPoolExecutor(max_workers=max(1, min(4, len(initial_piles) or 1)))
+        self._stop_event = threading.Event()
+        self._thread = None
 
     def start(self):
-        if not self.endpoints:
-            return
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -123,6 +273,13 @@ class AsyncHealthcheckRunner:
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def _get_pile_random_endpoints(self, pile_name: str) -> List[str]:
+        selected = list(self.pile_to_endpoints[pile_name] or [])
+        if len(selected) > HEALTH_ENDPOINTS_PER_PILE:
+            random.shuffle(selected)
+            selected = selected[:HEALTH_ENDPOINTS_PER_PILE]
+        return selected
+
     def _run_loop(self):
         try:
             self._run_loop_impl()
@@ -130,15 +287,15 @@ class AsyncHealthcheckRunner:
             logger.exception(f"AsyncHealthcheckRunner's run loop got exception: {e}")
 
     def _run_loop_impl(self):
-        # Pre-fill inflight slots with None
-        for endpoint in self.endpoints:
-            self._inflight.setdefault(endpoint, None)
+
+
+
 
         # start healthecks for the same pile evenly distributed within RESPONSIVENESS_THRESHOLD_SECONDS
         # TODO: proper impl for the case when piles have different number of endpoints
-        if self.initial_piles and len(self.initial_piles) > 0:
+        if self.pile_to_endpoints and len(self.pile_to_endpoints) > 0:
             endpoints_multiqueue = []
-            for pile_endpoints in self.initial_piles.values():
+            for pile_endpoints in self.pile_to_endpoints.values():
                 endpoints_multiqueue.append(pile_endpoints)
             endpoints_per_pile = max(len(endpoints_multiqueue[0]), MINIMAL_EXPECTED_ENDPOINTS_PER_PILE)
             delay = RESPONSIVENESS_THRESHOLD_SECONDS / endpoints_per_pile
@@ -191,45 +348,38 @@ class AsyncHealthcheckRunner:
             time.sleep(HEALTH_CHECK_INTERVAL)
 
     def _fetch_piles_list(self):
-        # we want to prefer pile, which is good: either any is good until
-        # failover or use hinted primary
-        with self._lock:
-            primary_hint = self._primary_hint
+        for pile_name, pileView in self._pile_world_views:
+            if pileView.health and pileView.quorum_endpoints and len(pileView.quorum_endpoints) > 0:
+                endpoints = list(pileView.quorum_endpoints)
+            else:
+                endpoints = self._get_pile_random_endpoints(pile_name)
 
-        endpoints = None
-        strict_order = False
-        if primary_hint:
-            endpoints = self.get_ordered_endpoints(primary_hint)
-            if len(endpoints) != 0:
-                strict_order = True
+            endpoints = endpoints[:3]
 
-        if not endpoints or len(endpoints) == 0:
-            endpoints = self.endpoints
-
-        cmd = ['admin', 'cluster', 'bridge', 'list', '--format=json']
-        result = execute_cli_command(self.path_to_cli, cmd, endpoints, strict_order=strict_order)
-        if result is None:
-            return
-        try:
-            parsed = json.loads(result.stdout.decode())
-            generation = parsed['generation']
-
-            # it is OK to read without lock, since we are the only writer
-            if self._piles_generation is not None and generation <= self._piles_generation:
+            cmd = ['admin', 'cluster', 'bridge', 'list', '--format=json']
+            result = execute_cli_command_parallel(self.path_to_cli, cmd, endpoints)
+            if result is None:
                 return
+            try:
+                parsed = json.loads(result.stdout.decode())
+                generation = parsed['generation']
+            except Exception:
+                logger.debug("Failed to parse piles list JSON", exc_info=True)
+                continue
 
-            piles_map = {}
-            for item in parsed["piles"]:
-                name = item.get('pile_name')
-                state = item.get('state')
-                if name is None:
-                    continue
-                piles_map[name] = state
-            with self._lock:
-                self._piles_list = dict(piles_map)
-                self._piles_generation = generation
-        except Exception:
-            logger.debug("Failed to parse piles list JSON", exc_info=True)
+            if pileView.admin_states is None or pileView.admin_states.generation < generation:
+                piles_map = {}
+                for item in parsed["piles"]:
+                    name = item.get('pile_name')
+                    state = item.get('state')
+                    if name is None:
+                        continue
+                    piles_map[name] = PileAdminItem(name, state)
+
+                admin_states = PileAdminStates(generation, piles_map)
+                logger.debug(f"New ")
+                with self._lock:
+                    pileView.admin_states = admin_states
 
     def _do_request(self, endpoint):
         try:
@@ -274,36 +424,11 @@ class AsyncHealthcheckRunner:
         with self._lock:
             self._reporter_to_failed[reporter_pile] = set(failed_piles)
             self._reporter_last_ts[reporter_pile] = monotonicNow
-            # Track per-endpoint recency and pile mapping
-            self._endpoint_to_pile[endpoint] = reporter_pile
-            self._endpoint_last_ts[endpoint] = monotonicNow
 
-    def get_health_state_and_piles(self):
-        """Thread-safe snapshot: (reporter pile -> {failed_piles: set, last_ts: float}), pile_name -> state string)"""
+    def get_health_state(self):
+        """Thread-safe snapshot: {pile_name -> PileWorldView} """
         with self._lock:
-            health_state = {
-                pile: {
-                    'failed_piles': set(failed),
-                    'last_ts': self._reporter_last_ts.get(pile, 0.0),
-                }
-                for pile, failed in self._reporter_to_failed.items()
-            }
-
-            piles = dict(self._piles_list)
-
-            return (health_state, piles, self._piles_generation)
-
-    def get_ordered_endpoints(self, pile: str):
-        """Thread-safe snapshot of pile endpoints ordered by response recency (most recent first)."""
-        with self._lock:
-            candidates = [ep for ep, p in self._endpoint_to_pile.items() if p == pile]
-
-        ranked = sorted(candidates, key=lambda ep: self._endpoint_last_ts.get(ep, 0.0), reverse=True)
-        return list(ranked)
-
-    def set_primary_hint(self, new_primary: str):
-        with self._lock:
-            self._primary_hint = new_primary
+            return copy.deepcopy(self._pile_world_views)
 
 
 class PileState:
@@ -414,7 +539,7 @@ class PileState:
         )
 
 
-class TotalState:
+class GlobalState:
     def __init__(self, generation):
         self.WallTimestamp = time.time()
         self.MonotonicTs = time.monotonic()
@@ -432,7 +557,7 @@ class TotalState:
         return not self.Piles[self.PrimaryName]
 
     def __eq__(self, other):
-        if not isinstance(other, TotalState):
+        if not isinstance(other, GlobalState):
             return NotImplemented
         if self.Generation != other.Generation:
             return False
@@ -461,7 +586,7 @@ class TotalState:
             details_parts.append(f"{name}={pile}")
         piles_str = ", ".join(piles_parts)
         details_str = ", ".join(details_parts)
-        return (f"TotalState(ts={ts}, primary={self.PrimaryName}, gen={self.Generation}, "
+        return (f"GlobalState(ts={ts}, primary={self.PrimaryName}, gen={self.Generation}, "
             f"piles=[{piles_str}], details=[{details_str}])")
 
 
@@ -530,14 +655,13 @@ class TransitionHistory:
 
 
 class Bridgekeeper:
-    def __init__(self, endpoints: List[str], path_to_cli: str, initial_piles: Dict[str, List[str]], use_https: bool = False, auto_failover: bool = True):
-        self.endpoints = endpoints
+    def __init__(self, path_to_cli: str, initial_piles: Dict[str, List[str]], use_https: bool = False, auto_failover: bool = True):
         self.path_to_cli = path_to_cli
         self.initial_piles = initial_piles
         self.use_https = use_https
         self.auto_failover = auto_failover
 
-        self.async_checker = AsyncHealthcheckRunner(endpoints, path_to_cli, initial_piles, use_https=use_https)
+        self.async_checker = AsyncHealthcheckRunner(path_to_cli, initial_piles, use_https=use_https)
         self.async_checker.start()
 
         # TODO: avoid hack, sleep to give async_checker time to get data
@@ -569,11 +693,11 @@ class Bridgekeeper:
 
     def _do_healthcheck(self):
         # TODO: it seems that sometimes this calls takes too long for unknown yet reason,
-        # thus it's important to call before TotalState() constructor, which inits
+        # thus it's important to call before GlobalState() constructor, which inits
         # timestamps.
-        health_state, cluster_admin_piles, generation = self.async_checker.get_health_state_and_piles()
+        health_state, cluster_admin_piles, generation = self.async_checker.get_health_state()
 
-        new_state = TotalState(generation)
+        new_state = GlobalState(generation)
         for pile_name, state in (cluster_admin_piles or {}).items():
             new_state.Piles[pile_name] = PileState()
             new_state.Piles[pile_name].admin_reported_state = state
@@ -702,7 +826,9 @@ class Bridgekeeper:
     def _apply_decision(self, primary: str, commands: List[List[str]]):
         # primary is either working primary or candidate,
         # thus we prefer its endpoints, because at least some are healthy
-        endpoints = self.async_checker.get_ordered_endpoints(primary)
+
+        # XXX
+        endpoints = self.async_checker.get_pile_endpoints(primary)
         strict_order = True
         if len(endpoints) == 0:
             logger.warning(f"No endpoints for primary / primary candidate '{primary}', fall back to all endpoints")
@@ -772,7 +898,7 @@ class Bridgekeeper:
         except Exception:
             pass
 
-    def get_state_and_history(self) -> Tuple[Optional[TotalState], List[str]]:
+    def get_state_and_history(self) -> Tuple[Optional[GlobalState], List[str]]:
         with self._state_lock:
             state_copy = copy.deepcopy(self.current_state) if self.current_state is not None else None
             transitions_copy = list(self.state_history.get_transitions())
@@ -864,18 +990,8 @@ def resolve(endpoint: str, path_to_cli: str) -> Dict[str, List[str]]:
         logger.debug("Failed to build piles_to_hosts mapping from YAML")
         return None
 
-    # Cap to at most MAX_ENDPOINTS_PER_PILE random hosts per pile
-    for pile, hosts in list(piles_to_hosts.items()):
-        if not hosts:
-            continue
-        k = min(MAX_ENDPOINTS_PER_PILE, len(hosts))
-        try:
-            piles_to_hosts[pile] = random.sample(list(hosts), k)
-        except ValueError:
-            piles_to_hosts[pile] = list(hosts)[:k]
-
     summary = ", ".join(f"{pile}: {len(hosts)}" for pile, hosts in piles_to_hosts.items())
-    logger.info("Piles host counts (capped to %d per pile): %s", MAX_ENDPOINTS_PER_PILE, summary)
+    logger.info(f"Piles host counts: {summary}", summary)
 
     return piles_to_hosts
 

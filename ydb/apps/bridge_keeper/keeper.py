@@ -1,4 +1,16 @@
 #! /usr/bin/python3
+#
+#             o7
+#            /|
+#     .--.  / |        Skipper
+#    / _  \   |     "Smile and wave, boys."
+#   | (o)(o)  |
+#   |   __    |
+#   |  (__)   |
+#  /|         |\
+# /_|  ___    |_\
+#   |_/___\__|
+#
 
 import argparse
 import atexit
@@ -189,14 +201,14 @@ def _parse_args():
     return parser.parse_args()
 
 
-def _run_no_tui(endpoints, path_to_cli, piles, use_https, auto_failover):
-    keeper = bridge.Bridgekeeper(endpoints, path_to_cli, piles, use_https=use_https, auto_failover=auto_failover)
+def _run_no_tui(path_to_cli, piles, use_https, auto_failover):
+    keeper = bridge.Bridgekeeper(path_to_cli, piles, use_https=use_https, auto_failover=auto_failover)
     keeper.run()
 
 
-def _run_tui(args, endpoints, path_to_cli, piles):
+def _run_tui(args, path_to_cli, piles):
     auto_failover = not args.disable_auto_failover
-    keeper = bridge.Bridgekeeper(endpoints, path_to_cli, piles, use_https=args.https, auto_failover=auto_failover)
+    keeper = bridge.Bridgekeeper(path_to_cli, piles, use_https=args.https, auto_failover=auto_failover)
     app = keeper_tui.KeeperApp(
         keeper=keeper,
         cluster_name=args.cluster,
@@ -237,29 +249,35 @@ def main():
         path_to_cli = found
         logger.debug(f'Found ydb CLI: {path_to_cli}')
 
-    endpoints = None
     piles = None
-
     try:
         piles = bridge.resolve(args.endpoint, path_to_cli)
-        if piles:
-            endpoints = [h for hosts in piles.values() for h in hosts]
     except Exception as e:
         # ignore, result is checked below
         logger.debug(f'Resolve throw exception: {e}')
 
     if not piles or len(piles) == 0:
-        logger.error(f'No piles resilved')
+        logger.error(f'No piles resolved')
 
-    if not endpoints or len(endpoints) == 0:
+    total_endpoints = 0
+    for pile_name, endpoints in piles.items():
+        endpoint_count = len(endpoints)
+        if endpoint_count == 0:
+            logger.error(f"No endpoints resolved for pile '{pile_name}'")
+        if endpoint_count < bridge.MINIMAL_EXPECTED_ENDPOINTS_PER_PILE:
+            logger.warning(f"Resolved {endpoint_count} endpoints for pile '{pile_name}', "
+                           f"which is less than required {bridge.MINIMAL_EXPECTED_ENDPOINTS_PER_PILE}")
+        total_endpoints += len(endpoints)
+
+    if total_endpoints == 0:
         logger.error(f'No endpoints resolved from {args.endpoint}')
         sys.exit(1)
 
     if args.tui:
-        _run_tui(args, endpoints, path_to_cli, piles)
+        _run_tui(args, path_to_cli, piles)
     else:
         auto_failover = not args.disable_auto_failover
-        _run_no_tui(endpoints, path_to_cli, piles, args.https, auto_failover)
+        _run_no_tui(path_to_cli, piles, args.https, auto_failover)
 
 
 if __name__ == '__main__':
