@@ -15,6 +15,8 @@ namespace NKikimr::NKMeans {
 
 namespace {
 
+    // 2-way
+
     Y_FORCE_INLINE
     static void TwoWayDotProductIteration(__m128& sumLR, __m128& sumRR, const __m128 a, const __m128 b) {
         sumLR = _mm_add_ps(sumLR, _mm_mul_ps(a, b));
@@ -85,15 +87,363 @@ namespace {
         return result;
     }
 
+    // 2-way AVX2
+
     Y_FORCE_INLINE
-    static void TriWayDotProductIterationAvx2(__m256& sumLL, __m256& sumLR, __m256& sumRR, const __m256 a, const __m256 b) {
-        sumLL = _mm256_fmadd_ps(a, a, sumLL);
+    static void TwoWayDotProductIterationAvx2(__m256& sumLR, __m256& sumRR, const __m256 a, const __m256 b) {
         sumLR = _mm256_fmadd_ps(a, b, sumLR);
         sumRR = _mm256_fmadd_ps(b, b, sumRR);
     }
 
+    static TTriWayDotProduct<float>
+    TwoWayDotProductImplAvx2(const float* lhs, const float* rhs, size_t length, float ll) noexcept
+    {
+        __m256 sumLR1 = _mm256_setzero_ps();
+        __m256 sumRR1 = _mm256_setzero_ps();
+        __m256 sumLR2 = _mm256_setzero_ps();
+        __m256 sumRR2 = _mm256_setzero_ps();
+
+        // Main AVX2 loop: process 16 floats per iteration (2 * 8)
+        while (length >= 16) {
+            TwoWayDotProductIterationAvx2(sumLR1, sumRR1, _mm256_loadu_ps(lhs + 0), _mm256_loadu_ps(rhs + 0));
+            TwoWayDotProductIterationAvx2(sumLR2, sumRR2, _mm256_loadu_ps(lhs + 8), _mm256_loadu_ps(rhs + 8));
+            length -= 16;
+            lhs += 16;
+            rhs += 16;
+        }
+
+        // Handle one more 8-float block if present
+        if (length >= 8) {
+            TwoWayDotProductIterationAvx2(sumLR1, sumRR1, _mm256_loadu_ps(lhs + 0), _mm256_loadu_ps(rhs + 0));
+            length -= 8;
+            lhs += 8;
+            rhs += 8;
+        }
+
+        // Merge the two accumulators
+        sumLR1 = _mm256_add_ps(sumLR1, sumLR2);
+        sumRR1 = _mm256_add_ps(sumRR1, sumRR2);
+
+        // Tail < 8 floats
+        if (length) {
+            __m256 a, b;
+            switch (length) {
+                case 7:
+                    a = _mm256_set_ps(0.0f,
+                                    lhs[6], lhs[5], lhs[4],
+                                    lhs[3], lhs[2], lhs[1], lhs[0]);
+                    b = _mm256_set_ps(0.0f,
+                                    rhs[6], rhs[5], rhs[4],
+                                    rhs[3], rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 6:
+                    a = _mm256_set_ps(0.0f, 0.0f,
+                                    lhs[5], lhs[4],
+                                    lhs[3], lhs[2], lhs[1], lhs[0]);
+                    b = _mm256_set_ps(0.0f, 0.0f,
+                                    rhs[5], rhs[4],
+                                    rhs[3], rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 5:
+                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f,
+                                    lhs[4],
+                                    lhs[3], lhs[2], lhs[1], lhs[0]);
+                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f,
+                                    rhs[4],
+                                    rhs[3], rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 4:
+                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[3], lhs[2], lhs[1], lhs[0]);
+                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[3], rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 3:
+                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f,
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f,
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 2:
+                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f, 0.0f,
+                                    lhs[1], lhs[0]);
+                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f, 0.0f,
+                                    rhs[1], rhs[0]);
+                    break;
+                case 1:
+                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f, 0.0f, 0.0f,
+                                    lhs[0]);
+                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f, 0.0f, 0.0f,
+                                    rhs[0]);
+                    break;
+                default:
+                    Y_UNREACHABLE();
+            }
+            TwoWayDotProductIterationAvx2(sumLR1, sumRR1, a, b);
+        }
+
+        // Collapse 256-bit sums into 128-bit sums (4-lane partials),
+        // preserving the "4-lane layout" logic used by the transpose trick.
+        __m128 sumLR128 = _mm_add_ps(_mm256_castps256_ps128(sumLR1),
+                                    _mm256_extractf128_ps(sumLR1, 1));
+        __m128 sumRR128 = _mm_add_ps(_mm256_castps256_ps128(sumRR1),
+                                    _mm256_extractf128_ps(sumRR1, 1));
+
+        // LL: put ll into lane 0, others zero
+        __m128 sumLL128 = _mm_set_ps(0.0f, 0.0f, 0.0f, ll);
+
+        // Same transpose+add trick as before
+        __m128 t0 = sumLL128;
+        __m128 t1 = sumLR128;
+        __m128 t2 = sumRR128;
+        __m128 t3 = _mm_setzero_ps();
+
+        _MM_TRANSPOSE4_PS(t0, t1, t2, t3);
+        t0 = _mm_add_ps(t0, t1);
+        t0 = _mm_add_ps(t0, t2);
+        t0 = _mm_add_ps(t0, t3);
+
+        alignas(16) float res[4];
+        _mm_store_ps(res, t0);
+
+        TTriWayDotProduct<float> result{res[0], res[1], res[2]};
+        return result;
+    }
+
+    // 2-way AVX512
+
     Y_FORCE_INLINE
-    static void TwoWayDotProductIterationAvx2(__m256& sumLR, __m256& sumRR, const __m256 a, const __m256 b) {
+    static void TwoWayDotProductIterationAvx512(__m512& sumLR, __m512& sumRR, const __m512 a, const __m512 b) {
+        sumLR = _mm512_fmadd_ps(a, b, sumLR);
+        sumRR = _mm512_fmadd_ps(b, b, sumRR);
+    }
+
+    static TTriWayDotProduct<float>
+    TwoWayDotProductImplAvx512(const float* lhs, const float* rhs, size_t length, float ll) noexcept
+    {
+        __m512 sumLR1 = _mm512_setzero_ps();
+        __m512 sumRR1 = _mm512_setzero_ps();
+        __m512 sumLR2 = _mm512_setzero_ps();
+        __m512 sumRR2 = _mm512_setzero_ps();
+
+        // Main AVX-512 loop: process 32 floats per iteration (2 * 16)
+        while (length >= 32) {
+            TwoWayDotProductIterationAvx512(sumLR1, sumRR1, _mm512_loadu_ps(lhs + 0), _mm512_loadu_ps(rhs + 0));
+            TwoWayDotProductIterationAvx512(sumLR2, sumRR2, _mm512_loadu_ps(lhs + 16), _mm512_loadu_ps(rhs + 16));
+            length -= 32;
+            lhs += 32;
+            rhs += 32;
+        }
+
+        // Handle one more 16-float block if present
+        if (length >= 16) {
+            TwoWayDotProductIterationAvx512(sumLR1, sumRR1, _mm512_loadu_ps(lhs + 0), _mm512_loadu_ps(rhs + 0));
+            length -= 16;
+            lhs += 16;
+            rhs += 16;
+        }
+
+        // Merge the two accumulators
+        sumLR1 = _mm512_add_ps(sumLR1, sumLR2);
+        sumRR1 = _mm512_add_ps(sumRR1, sumRR2);
+
+        // Tail < 16 floats
+        if (length) {
+            __m512 a, b;
+            switch (length) {
+                case 15:
+                    a = _mm512_set_ps(0.0f,
+                                    lhs[14], lhs[13], lhs[12], lhs[11],
+                                    lhs[10], lhs[9], lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f,
+                                    rhs[14], rhs[13], rhs[12], rhs[11],
+                                    rhs[10], rhs[9], rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 14:
+                    a = _mm512_set_ps(0.0f, 0.0f,
+                                    lhs[13], lhs[12], lhs[11],
+                                    lhs[10], lhs[9], lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f,
+                                    rhs[13], rhs[12], rhs[11],
+                                    rhs[10], rhs[9], rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 13:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f,
+                                    lhs[12], lhs[11],
+                                    lhs[10], lhs[9], lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f,
+                                    rhs[12], rhs[11],
+                                    rhs[10], rhs[9], rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 12:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[11],
+                                    lhs[10], lhs[9], lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[11],
+                                    rhs[10], rhs[9], rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 11:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[10], lhs[9], lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[10], rhs[9], rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 10:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[9], lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[9], rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 9:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[8], lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[8], rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 8:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[7],
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[7],
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 7:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[6], lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[6], rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 6:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[5], lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[5], rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 5:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[4], lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[4], rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 4:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[3],
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[3],
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 3:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[2], lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[2], rhs[1], rhs[0]);
+                    break;
+                case 2:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[1], lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[1], rhs[0]);
+                    break;
+                case 1:
+                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    lhs[0]);
+                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    rhs[0]);
+                    break;
+                default:
+                    Y_UNREACHABLE();
+            }
+            TwoWayDotProductIterationAvx512(sumLR1, sumRR1, a, b);
+        }
+
+        // Collapse 512-bit sums into 128-bit sums (4-lane partials)
+        // Extract 4 chunks of 128 bits (lanes 0-3, 4-7, 8-11, 12-15) and sum them
+        __m128 sumLR128_0 = _mm512_castps512_ps128(sumLR1);           // lanes 0-3
+        __m128 sumLR128_1 = _mm512_extractf32x4_ps(sumLR1, 1);        // lanes 4-7
+        __m128 sumLR128_2 = _mm512_extractf32x4_ps(sumLR1, 2);        // lanes 8-11
+        __m128 sumLR128_3 = _mm512_extractf32x4_ps(sumLR1, 3);        // lanes 12-15
+
+        __m128 sumRR128_0 = _mm512_castps512_ps128(sumRR1);           // lanes 0-3
+        __m128 sumRR128_1 = _mm512_extractf32x4_ps(sumRR1, 1);        // lanes 4-7
+        __m128 sumRR128_2 = _mm512_extractf32x4_ps(sumRR1, 2);        // lanes 8-11
+        __m128 sumRR128_3 = _mm512_extractf32x4_ps(sumRR1, 3);        // lanes 12-15
+
+        __m128 sumLR128 = _mm_add_ps(_mm_add_ps(sumLR128_0, sumLR128_1),
+                                     _mm_add_ps(sumLR128_2, sumLR128_3));
+        __m128 sumRR128 = _mm_add_ps(_mm_add_ps(sumRR128_0, sumRR128_1),
+                                     _mm_add_ps(sumRR128_2, sumRR128_3));
+
+        // LL: put ll into lane 0, others zero
+        __m128 sumLL128 = _mm_set_ps(0.0f, 0.0f, 0.0f, ll);
+
+        // Same transpose+add trick as before
+        __m128 t0 = sumLL128;
+        __m128 t1 = sumLR128;
+        __m128 t2 = sumRR128;
+        __m128 t3 = _mm_setzero_ps();
+
+        _MM_TRANSPOSE4_PS(t0, t1, t2, t3);
+        t0 = _mm_add_ps(t0, t1);
+        t0 = _mm_add_ps(t0, t2);
+        t0 = _mm_add_ps(t0, t3);
+
+        alignas(16) float res[4];
+        _mm_store_ps(res, t0);
+
+        TTriWayDotProduct<float> result{res[0], res[1], res[2]};
+        return result;
+    }
+
+    // 3-way AVX2
+
+    Y_FORCE_INLINE
+    static void TriWayDotProductIterationAvx2(__m256& sumLL, __m256& sumLR, __m256& sumRR, const __m256 a, const __m256 b) {
+        sumLL = _mm256_fmadd_ps(a, a, sumLL);
         sumLR = _mm256_fmadd_ps(a, b, sumLR);
         sumRR = _mm256_fmadd_ps(b, b, sumRR);
     }
@@ -220,136 +570,11 @@ namespace {
         return result;
     }
 
-    static TTriWayDotProduct<float>
-    TwoWayDotProductImplAvx2(const float* lhs, const float* rhs, size_t length, float ll) noexcept
-    {
-        __m256 sumLR1 = _mm256_setzero_ps();
-        __m256 sumRR1 = _mm256_setzero_ps();
-        __m256 sumLR2 = _mm256_setzero_ps();
-        __m256 sumRR2 = _mm256_setzero_ps();
-
-        // Main AVX2 loop: process 16 floats per iteration (2 * 8)
-        while (length >= 16) {
-            TwoWayDotProductIterationAvx2(sumLR1, sumRR1, _mm256_loadu_ps(lhs + 0), _mm256_loadu_ps(rhs + 0));
-            TwoWayDotProductIterationAvx2(sumLR2, sumRR2, _mm256_loadu_ps(lhs + 8), _mm256_loadu_ps(rhs + 8));
-            length -= 16;
-            lhs += 16;
-            rhs += 16;
-        }
-
-        // Handle one more 8-float block if present
-        if (length >= 8) {
-            TwoWayDotProductIterationAvx2(sumLR1, sumRR1, _mm256_loadu_ps(lhs + 0), _mm256_loadu_ps(rhs + 0));
-            length -= 8;
-            lhs += 8;
-            rhs += 8;
-        }
-
-        // Merge the two accumulators
-        sumLR1 = _mm256_add_ps(sumLR1, sumLR2);
-        sumRR1 = _mm256_add_ps(sumRR1, sumRR2);
-
-        // Tail < 8 floats
-        if (length) {
-            __m256 a, b;
-            switch (length) {
-                case 7:
-                    a = _mm256_set_ps(0.0f,
-                                    lhs[6], lhs[5], lhs[4],
-                                    lhs[3], lhs[2], lhs[1], lhs[0]);
-                    b = _mm256_set_ps(0.0f,
-                                    rhs[6], rhs[5], rhs[4],
-                                    rhs[3], rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 6:
-                    a = _mm256_set_ps(0.0f, 0.0f,
-                                    lhs[5], lhs[4],
-                                    lhs[3], lhs[2], lhs[1], lhs[0]);
-                    b = _mm256_set_ps(0.0f, 0.0f,
-                                    rhs[5], rhs[4],
-                                    rhs[3], rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 5:
-                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f,
-                                    lhs[4],
-                                    lhs[3], lhs[2], lhs[1], lhs[0]);
-                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f,
-                                    rhs[4],
-                                    rhs[3], rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 4:
-                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[3], lhs[2], lhs[1], lhs[0]);
-                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[3], rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 3:
-                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    0.0f,
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    0.0f,
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 2:
-                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    0.0f, 0.0f,
-                                    lhs[1], lhs[0]);
-                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    0.0f, 0.0f,
-                                    rhs[1], rhs[0]);
-                    break;
-                case 1:
-                    a = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    0.0f, 0.0f, 0.0f,
-                                    lhs[0]);
-                    b = _mm256_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    0.0f, 0.0f, 0.0f,
-                                    rhs[0]);
-                    break;
-                default:
-                    Y_UNREACHABLE();
-            }
-            TwoWayDotProductIterationAvx2(sumLR1, sumRR1, a, b);
-        }
-
-        // Collapse 256-bit sums into 128-bit sums (4-lane partials),
-        // preserving the "4-lane layout" logic used by the transpose trick.
-        __m128 sumLR128 = _mm_add_ps(_mm256_castps256_ps128(sumLR1),
-                                    _mm256_extractf128_ps(sumLR1, 1));
-        __m128 sumRR128 = _mm_add_ps(_mm256_castps256_ps128(sumRR1),
-                                    _mm256_extractf128_ps(sumRR1, 1));
-
-        // LL: put ll into lane 0, others zero
-        __m128 sumLL128 = _mm_set_ps(0.0f, 0.0f, 0.0f, ll);
-
-        // Same transpose+add trick as before
-        __m128 t0 = sumLL128;
-        __m128 t1 = sumLR128;
-        __m128 t2 = sumRR128;
-        __m128 t3 = _mm_setzero_ps();
-
-        _MM_TRANSPOSE4_PS(t0, t1, t2, t3);
-        t0 = _mm_add_ps(t0, t1);
-        t0 = _mm_add_ps(t0, t2);
-        t0 = _mm_add_ps(t0, t3);
-
-        alignas(16) float res[4];
-        _mm_store_ps(res, t0);
-
-        TTriWayDotProduct<float> result{res[0], res[1], res[2]};
-        return result;
-    }
+    // 3-way AVX512
 
     Y_FORCE_INLINE
     static void TriWayDotProductIterationAvx512(__m512& sumLL, __m512& sumLR, __m512& sumRR, const __m512 a, const __m512 b) {
         sumLL = _mm512_fmadd_ps(a, a, sumLL);
-        sumLR = _mm512_fmadd_ps(a, b, sumLR);
-        sumRR = _mm512_fmadd_ps(b, b, sumRR);
-    }
-
-    Y_FORCE_INLINE
-    static void TwoWayDotProductIterationAvx512(__m512& sumLR, __m512& sumRR, const __m512 a, const __m512 b) {
         sumLR = _mm512_fmadd_ps(a, b, sumLR);
         sumRR = _mm512_fmadd_ps(b, b, sumRR);
     }
@@ -559,221 +784,6 @@ namespace {
                                      _mm_add_ps(sumRR128_2, sumRR128_3));
 
         // Transpose+add trick
-        __m128 t0 = sumLL128;
-        __m128 t1 = sumLR128;
-        __m128 t2 = sumRR128;
-        __m128 t3 = _mm_setzero_ps();
-
-        _MM_TRANSPOSE4_PS(t0, t1, t2, t3);
-        t0 = _mm_add_ps(t0, t1);
-        t0 = _mm_add_ps(t0, t2);
-        t0 = _mm_add_ps(t0, t3);
-
-        alignas(16) float res[4];
-        _mm_store_ps(res, t0);
-
-        TTriWayDotProduct<float> result{res[0], res[1], res[2]};
-        return result;
-    }
-
-    static TTriWayDotProduct<float>
-    TwoWayDotProductImplAvx512(const float* lhs, const float* rhs, size_t length, float ll) noexcept
-    {
-        __m512 sumLR1 = _mm512_setzero_ps();
-        __m512 sumRR1 = _mm512_setzero_ps();
-        __m512 sumLR2 = _mm512_setzero_ps();
-        __m512 sumRR2 = _mm512_setzero_ps();
-
-        // Main AVX-512 loop: process 32 floats per iteration (2 * 16)
-        while (length >= 32) {
-            TwoWayDotProductIterationAvx512(sumLR1, sumRR1, _mm512_loadu_ps(lhs + 0), _mm512_loadu_ps(rhs + 0));
-            TwoWayDotProductIterationAvx512(sumLR2, sumRR2, _mm512_loadu_ps(lhs + 16), _mm512_loadu_ps(rhs + 16));
-            length -= 32;
-            lhs += 32;
-            rhs += 32;
-        }
-
-        // Handle one more 16-float block if present
-        if (length >= 16) {
-            TwoWayDotProductIterationAvx512(sumLR1, sumRR1, _mm512_loadu_ps(lhs + 0), _mm512_loadu_ps(rhs + 0));
-            length -= 16;
-            lhs += 16;
-            rhs += 16;
-        }
-
-        // Merge the two accumulators
-        sumLR1 = _mm512_add_ps(sumLR1, sumLR2);
-        sumRR1 = _mm512_add_ps(sumRR1, sumRR2);
-
-        // Tail < 16 floats
-        if (length) {
-            __m512 a, b;
-            switch (length) {
-                case 15:
-                    a = _mm512_set_ps(0.0f,
-                                    lhs[14], lhs[13], lhs[12], lhs[11],
-                                    lhs[10], lhs[9], lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f,
-                                    rhs[14], rhs[13], rhs[12], rhs[11],
-                                    rhs[10], rhs[9], rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 14:
-                    a = _mm512_set_ps(0.0f, 0.0f,
-                                    lhs[13], lhs[12], lhs[11],
-                                    lhs[10], lhs[9], lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f,
-                                    rhs[13], rhs[12], rhs[11],
-                                    rhs[10], rhs[9], rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 13:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f,
-                                    lhs[12], lhs[11],
-                                    lhs[10], lhs[9], lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f,
-                                    rhs[12], rhs[11],
-                                    rhs[10], rhs[9], rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 12:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[11],
-                                    lhs[10], lhs[9], lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[11],
-                                    rhs[10], rhs[9], rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 11:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[10], lhs[9], lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[10], rhs[9], rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 10:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[9], lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[9], rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 9:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[8], lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[8], rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 8:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[7],
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[7],
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 7:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[6], lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[6], rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 6:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[5], lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[5], rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 5:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[4], lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[4], rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 4:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[3],
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[3],
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 3:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[2], lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[2], rhs[1], rhs[0]);
-                    break;
-                case 2:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[1], lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[1], rhs[0]);
-                    break;
-                case 1:
-                    a = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    lhs[0]);
-                    b = _mm512_set_ps(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                    rhs[0]);
-                    break;
-                default:
-                    Y_UNREACHABLE();
-            }
-            TwoWayDotProductIterationAvx512(sumLR1, sumRR1, a, b);
-        }
-
-        // Collapse 512-bit sums into 128-bit sums (4-lane partials)
-        // Extract 4 chunks of 128 bits (lanes 0-3, 4-7, 8-11, 12-15) and sum them
-        __m128 sumLR128_0 = _mm512_castps512_ps128(sumLR1);           // lanes 0-3
-        __m128 sumLR128_1 = _mm512_extractf32x4_ps(sumLR1, 1);        // lanes 4-7
-        __m128 sumLR128_2 = _mm512_extractf32x4_ps(sumLR1, 2);        // lanes 8-11
-        __m128 sumLR128_3 = _mm512_extractf32x4_ps(sumLR1, 3);        // lanes 12-15
-
-        __m128 sumRR128_0 = _mm512_castps512_ps128(sumRR1);           // lanes 0-3
-        __m128 sumRR128_1 = _mm512_extractf32x4_ps(sumRR1, 1);        // lanes 4-7
-        __m128 sumRR128_2 = _mm512_extractf32x4_ps(sumRR1, 2);        // lanes 8-11
-        __m128 sumRR128_3 = _mm512_extractf32x4_ps(sumRR1, 3);        // lanes 12-15
-
-        __m128 sumLR128 = _mm_add_ps(_mm_add_ps(sumLR128_0, sumLR128_1),
-                                     _mm_add_ps(sumLR128_2, sumLR128_3));
-        __m128 sumRR128 = _mm_add_ps(_mm_add_ps(sumRR128_0, sumRR128_1),
-                                     _mm_add_ps(sumRR128_2, sumRR128_3));
-
-        // LL: put ll into lane 0, others zero
-        __m128 sumLL128 = _mm_set_ps(0.0f, 0.0f, 0.0f, ll);
-
-        // Same transpose+add trick as before
         __m128 t0 = sumLL128;
         __m128 t1 = sumLR128;
         __m128 t2 = sumRR128;
