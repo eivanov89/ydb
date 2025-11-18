@@ -13,6 +13,8 @@
 
 #include <ydb/library/actors/core/monotonic_provider.h>
 
+#include <library/cpp/dot_product/dot_product.h>
+
 #include <util/system/hp_timer.h>
 
 #include <utility>
@@ -41,6 +43,7 @@ struct TReadIteratorVectorTop {
     ui32 Column = 0;
     ui32 Limit = 0;
     TString Target;
+    float TargetSquare = 0;
     std::unique_ptr<NKMeans::IClusters> KMeans;
     std::vector<TReadIteratorVectorTopItem> Rows;
     ui64 TotalReadRows = 0;
@@ -53,7 +56,7 @@ struct TReadIteratorVectorTop {
         }
         TotalReadRows++;
         TotalReadBytes += EstimateSize(cells);
-        double distance = KMeans->CalcDistance(embedding, Target);
+        double distance = KMeans->CalcDistance(embedding, Target, TargetSquare);
         if (Rows.size() < Limit) {
             Rows.emplace_back(cells, distance);
             std::push_heap(Rows.begin(), Rows.end());
@@ -82,6 +85,27 @@ struct TReadIteratorVectorTop {
 };
 
 namespace {
+
+inline constexpr auto HeaderLen = sizeof(ui8);
+
+template <typename TTo>
+inline TArrayRef<const TTo> GetArray(const TStringBuf& str) {
+    const char* buf = str.Data();
+    const size_t len = str.Size() - HeaderLen;
+
+    if (Y_UNLIKELY(len % sizeof(TTo) != 0)) {
+        return {};
+    }
+
+    const ui32 count = len / sizeof(TTo);
+
+    return {reinterpret_cast<const TTo*>(buf), count};
+}
+
+float VectorSquare(const float* vector, size_t len) {
+    auto res = TriWayDotProduct(vector, vector, len, ETriWayDotProductComputeMask::LL);
+    return res.LL;
+}
 
 constexpr ui64 MinRowsPerCheck = 1000;
 
@@ -536,7 +560,7 @@ public:
         ui32 queryIndex)
     {
         if (UsePrechargeForExtBlobs) {
-            // This is slower for a general case, but faster for the case when we know 
+            // This is slower for a general case, but faster for the case when we know
             // that we have external blobs.
             ui64 rowsLeft = GetRowsLeft();
             ui64 prechargedRowsSize = 0;
@@ -554,7 +578,7 @@ public:
                 if (!(queryIndex < State.Request->Keys.size())) {
                     break;
                 }
-                
+
                 const auto key = ToRawTypeValue(State.Request->Keys[queryIndex].GetCells(), TableInfo, true);
 
                 NTable::TRowState rowState;
@@ -564,7 +588,7 @@ public:
 
                 if (txc.Env.MissingReferencesSize()) {
                     ready = false;
-                    
+
                     prechargedRowsSize += EstimateSize(*rowState);
                 }
 
@@ -2178,6 +2202,13 @@ public:
             topState->Column = topK.GetColumn();
             topState->Limit = topK.GetLimit();
             topState->Target = topK.GetTargetVector();
+
+            // fixme: format
+
+            TStringBuf targetBuf(topState->Target);
+            const TArrayRef<const float> targetFloats = GetArray<float>(targetBuf);
+            topState->TargetSquare = VectorSquare(targetFloats.data(), targetFloats.size());
+
             state.VectorTopK = std::move(topState);
         }
 
@@ -2218,7 +2249,7 @@ public:
                 << " (shard# " << Self->TabletID() << " node# " << ctx.SelfID.NodeId() << " state# " << DatashardStateName(Self->State) << ")");
             Result->Record.SetReadId(state.ReadId.ReadId);
             Self->SendImmediateReadResult(state.ReadId.Sender, Result.release(), 0, state.SessionId, request->ReadSpan.GetTraceId());
-            
+
             request->ReadSpan.EndError("Iterator aborted");
             Self->DeleteReadIterator(it);
             return;
@@ -3221,7 +3252,7 @@ public:
         } else {
             LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " read iterator# " << state.ReadId
                 << " finished in ReadContinue");
-            
+
             state.Request->ReadSpan.EndOk();
             Self->DeleteReadIterator(it);
         }
@@ -3231,7 +3262,7 @@ public:
 void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ctx) {
     // Note that we mutate this request below
     auto* request = ev->Get();
-    
+
     if (ev->TraceId && !request->ReadSpan) {
         request->ReadSpan = NWilson::TSpan(TWilsonTablet::TabletTopLevel, std::move(ev->TraceId), "Datashard.Read", NWilson::EFlags::AUTO_END);
         if (request->ReadSpan) {
@@ -3244,7 +3275,7 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
     const auto& record = request->Record;
     if (Y_UNLIKELY(!record.HasReadId())) {
         TString msg = TStringBuilder() << "Missing ReadId at shard " << TabletID();
-        
+
         auto result = MakeEvReadResult(ctx.SelfID.NodeId());
         SetStatusError(result->Record, Ydb::StatusIds::BAD_REQUEST, msg);
         ctx.Send(ev->Sender, result.release());
@@ -3264,7 +3295,7 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
 
     auto replyWithError = [&] (auto code, const auto& msg) {
         auto result = MakeEvReadResult(ctx.SelfID.NodeId());
-        
+
         SetStatusError(
             result->Record,
             code,
