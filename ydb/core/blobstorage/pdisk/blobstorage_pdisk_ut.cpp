@@ -137,7 +137,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestPDiskActorPDiskStopStart) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -165,7 +165,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestPDiskActorPDiskStopBroken) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -197,7 +197,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestPDiskActorPDiskStopUninitialized) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -224,7 +224,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestPDiskOwnerRecreation) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -244,7 +244,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestPDiskOwnerRecreationWithStableOwner) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -271,7 +271,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestPDiskManyOwnersInitiation) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -332,7 +332,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestVDiskMock) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -344,7 +344,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestRealFile) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             settings.UseSectorMap = false;
             TActorTestContext testCtx(settings);
@@ -358,7 +358,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestLogWriteReadWithRestarts) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -386,7 +386,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
                 .DiskSize = 1ull << 30,
                 .ChunkSize = 1ull * (1 << 20),
                 .SmallDisk = true,
-                .EnableFormatEncryption = encryption,
+                .EnableFormatAndMetadataEncryption = encryption,
                 .EnableSectorEncryption = encryption,
             });
             TVDiskMock sporadicVDisk(&testCtx);
@@ -441,7 +441,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
                 .DiskSize = 1ull << 30,
                 .ChunkSize = 1ull * (1 << 20),
                 .SmallDisk = true,
-                .EnableFormatEncryption = encryption,
+                .EnableFormatAndMetadataEncryption = encryption,
                 .EnableSectorEncryption = encryption,
             });
             TVDiskMock sporadicVDisk(&testCtx);
@@ -517,7 +517,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestFakeErrorPDiskManyLogWrite) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             testCtx.TestCtx.SectorMap->IoErrorEveryNthRequests = 1000;
@@ -547,7 +547,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestFakeErrorPDiskLogRead) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -580,7 +580,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestFakeErrorPDiskSysLogRead) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -603,7 +603,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestFakeErrorPDiskManyChunkRead) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             testCtx.TestCtx.SectorMap->ReadIoErrorEveryNthRequests = 100;
@@ -646,7 +646,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestFakeErrorPDiskManyChunkWrite) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             testCtx.TestCtx.SectorMap->IoErrorEveryNthRequests = 1000;
@@ -687,7 +687,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(TestSIGSEGVInTUndelivered) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             const TVDiskID vDiskID(0, 1, 0, 0, 0);
@@ -710,7 +710,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(PDiskRestart) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             TVDiskMock vdisk(&testCtx);
@@ -732,7 +732,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         {
             auto cfg = testCtx.GetPDiskConfig();
             cfg->EnableSectorEncryption = false;
-            cfg->EnableFormatEncryption = false;
+            cfg->EnableFormatAndMetadataEncryption = false;
             testCtx.UpdateConfigRecreatePDisk(cfg, true);
         }
 
@@ -762,7 +762,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         UNIT_ASSERT_VALUES_EQUAL(readRes->Data.ToString(), writeData);
     }
 
-    void AfterObliterateShouldNotReadLog(bool enableFormatEncryption) {
+    void AfterObliterateShouldNotReadLog(bool enableFormatAndMeatadaEncryption) {
         // regression test for #31337
         const TString expectedLogData = PrepareData(12346);
         TActorTestContext::TSettings settings{};
@@ -771,7 +771,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         settings.ChunkSize = NPDisk::SmallDiskMaximumChunkSize;
         settings.DiskSize = (ui64)settings.ChunkSize * 50;
         settings.SmallDisk = true;
-        settings.EnableFormatEncryption = enableFormatEncryption;
+        settings.EnableFormatAndMetadataEncryption = enableFormatAndMeatadaEncryption;
         settings.EnableSectorEncryption = false;
         settings.NonceRandNum = 13;
 
@@ -832,7 +832,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         AfterObliterateShouldNotReadLog(false);
     }
 
-    void AfterObliterateDontReuseOldChunkData(bool enableFormatEncryption) {
+    void AfterObliterateDontReuseOldChunkData(bool enableFormatAndMeatadaEncryption) {
         // regression test for #31337
         const TString writeData = PrepareData(4096);
         const size_t chunkCount = 10;
@@ -845,7 +845,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         settings.DiskSize = (ui64)settings.ChunkSize * 50;
         settings.SmallDisk = true;
         settings.PlainDataChunks = false;
-        settings.EnableFormatEncryption = enableFormatEncryption;
+        settings.EnableFormatAndMetadataEncryption = enableFormatAndMeatadaEncryption;
         settings.EnableSectorEncryption = false;
         settings.NonceRandNum = 13;
 
@@ -983,6 +983,9 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
 
         TVector<ui32> chunkIds;
         size_t expectedLogCount = 0;
+        ui32 metadataSeq = 0;
+        TString lastMetadata;
+        bool hasMetadata = false;
 
         // we start with a default settings, i.e. sector encryption is on
         TActorTestContext::TSettings settings{};
@@ -1027,6 +1030,13 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
             }
         };
 
+        auto readMetadata = [&]() -> TRcBuf {
+            testCtx.Send(new NPDisk::TEvReadMetadata());
+            auto res = testCtx.Recv<NPDisk::TEvReadMetadataResult>();
+            UNIT_ASSERT_VALUES_EQUAL(res->Outcome, NPDisk::EPDiskMetadataOutcome::OK);
+            return std::move(res->Metadata);
+        };
+
         auto doWritesAndCheck = [&]() {
             TVDiskMock vdisk(&testCtx, true);
             vdisk.InitFull();
@@ -1048,6 +1058,21 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
                     NKikimrProto::OK);
 
             verifyVdiskData(vdisk, expectedLogCount);
+
+            if (hasMetadata) {
+                const TString metadata = TRcBuf(readMetadata()).ExtractUnderlyingContainerOrCopy<TString>();
+                UNIT_ASSERT_VALUES_EQUAL(metadata, lastMetadata);
+            }
+
+            const TString newMetadata = TStringBuilder() << "metadata-" << metadataSeq++;
+            testCtx.Send(new NPDisk::TEvWriteMetadata(TRcBuf(newMetadata)));
+            auto writeRes = testCtx.Recv<NPDisk::TEvWriteMetadataResult>();
+            UNIT_ASSERT_VALUES_EQUAL(writeRes->Outcome, NPDisk::EPDiskMetadataOutcome::OK);
+
+            const TString readBack = TRcBuf(readMetadata()).ExtractUnderlyingContainerOrCopy<TString>();
+            UNIT_ASSERT_VALUES_EQUAL(readBack, newMetadata);
+            lastMetadata = newMetadata;
+            hasMetadata = true;
         };
 
         auto restartPDisk = [&](bool enableSectorEncryption) {
@@ -1087,7 +1112,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(PDiskOwnerSlayRace) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             testCtx.GetPDisk(); // inits pdisk
@@ -1119,7 +1144,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(PDiskRestartManyLogWrites) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 
@@ -1159,7 +1184,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(CommitDeleteChunks) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
             TVDiskMock intensiveVDisk(&testCtx);
@@ -1181,7 +1206,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
                 .DiskSize = 1ull << 30,
                 .ChunkSize = 1ull * (1 << 20),
                 .SmallDisk = true,
-                .EnableFormatEncryption = encryption,
+                .EnableFormatAndMetadataEncryption = encryption,
                 .EnableSectorEncryption = encryption,
             });
 
@@ -1578,7 +1603,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
                 .IsBad=false,
                 .DiskSize = 1_GB,
                 .ChunkSize = 1_MB,
-                .EnableFormatEncryption = encryption,
+                .EnableFormatAndMetadataEncryption = encryption,
                 .EnableSectorEncryption = encryption,
             });
 
@@ -2220,7 +2245,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     Y_UNIT_TEST(ChunkWriteBadOffset) {
         for (bool encryption: {true, false}) {
             TActorTestContext::TSettings settings{};
-            settings.EnableFormatEncryption = encryption;
+            settings.EnableFormatAndMetadataEncryption = encryption;
             settings.EnableSectorEncryption = encryption;
             TActorTestContext testCtx(settings);
 

@@ -98,7 +98,7 @@ TPDisk::TPDisk(std::shared_ptr<TPDiskCtx> pCtx, const TIntrusivePtr<TPDiskConfig
     AddCbs(OwnerUnallocated, GateTrim, "Trim", 0ull);
     ConfigureCbs(OwnerUnallocated, GateTrim, 16);
 
-    Format.Clear(Cfg->EnableFormatEncryption);
+    Format.Clear(Cfg->EnableFormatAndMetadataEncryption);
     *Mon.PDiskState = NKikimrBlobStorage::TPDiskState::Initial;
     *Mon.PDiskBriefState = TPDiskMon::TPDisk::Booting;
     ErrorStr = "PDisk is initializing now";
@@ -139,7 +139,7 @@ TCheckDiskFormatResult TPDisk::ReadChunk0Format(ui8* formatSectors, const NPDisk
     ui32 mainKeySize = mainKey.Keys.size();
 
     for (ui32 k = 0; k < mainKeySize; ++k) {
-        TPDiskStreamCypher cypher(Cfg->EnableFormatEncryption);
+        TPDiskStreamCypher cypher(Cfg->EnableFormatAndMetadataEncryption);
         cypher.SetKey(mainKey.Keys[k]);
 
         ui32 lastGoodIdx = (ui32)-1;
@@ -153,7 +153,7 @@ TCheckDiskFormatResult TPDisk::ReadChunk0Format(ui8* formatSectors, const NPDisk
 
             cypher.StartMessage(footer->Nonce);
             alignas(16) TDiskFormat diskFormat;
-            diskFormat.SetEncryptFormat(Cfg->EnableFormatEncryption);
+            diskFormat.SetEncryptFormat(Cfg->EnableFormatAndMetadataEncryption);
             cypher.Encrypt(&diskFormat, formatSector, sizeof(TDiskFormat));
 
             isBad[i] = !diskFormat.IsHashOk(FormatSectorSize);
@@ -229,7 +229,7 @@ bool TPDisk::IsFormatMagicValid(ui8 *magicData8, ui32 magicDataSize, const TMain
         magicDataSize,
         mainKey,
         PCtx->PDiskLogPrefix,
-        Cfg->EnableFormatEncryption);
+        Cfg->EnableFormatAndMetadataEncryption);
     return format.has_value();
 }
 
@@ -1744,7 +1744,7 @@ void TPDisk::WriteApplyFormatRecord(TDiskFormat format, const TKey &mainKey) {
 
         // Encrypt chunk0 format record using mainKey
         ui64 nonce = 1;
-        bool encrypt = Cfg->EnableFormatEncryption;
+        bool encrypt = Cfg->EnableFormatAndMetadataEncryption;
         TSysLogWriter formatWriter(Mon, *BlockDevice.Get(), Format, nonce, mainKey, BufferPool.Get(),
                 0, ReplicationFactor, Format.MagicFormatChunk, 0, nullptr, 0, nullptr, PCtx,
                 &DriveModel, encrypt);
@@ -1774,7 +1774,7 @@ void TPDisk::WriteDiskFormat(ui64 diskSizeBytes, ui32 sectorSizeBytes, ui32 user
     TGuard<TMutex> guard(StateMutex);
     // Prepare format record
     alignas(16) TDiskFormat format;
-    format.Clear(Cfg->EnableFormatEncryption);
+    format.Clear(Cfg->EnableFormatAndMetadataEncryption);
     format.SetPlainDataChunks(plainDataChunks);
     format.DiskSize = diskSizeBytes;
     format.SectorSize = sectorSizeBytes;
@@ -1785,7 +1785,7 @@ void TPDisk::WriteDiskFormat(ui64 diskSizeBytes, ui32 sectorSizeBytes, ui32 user
     format.ChunkKey = chunkKey;
     format.LogKey = logKey;
     format.SysLogKey = sysLogKey;
-    bool randomizeMagic = !Cfg->EnableFormatEncryption || !Cfg->EnableSectorEncryption || plainDataChunks;
+    bool randomizeMagic = !Cfg->EnableFormatAndMetadataEncryption || !Cfg->EnableSectorEncryption || plainDataChunks;
 #ifdef DISABLE_PDISK_ENCRYPTION
     randomizeMagic = true;
 #endif
