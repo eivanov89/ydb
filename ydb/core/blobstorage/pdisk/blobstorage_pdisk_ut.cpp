@@ -731,7 +731,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         TActorTestContext testCtx(settings);
         {
             auto cfg = testCtx.GetPDiskConfig();
-            cfg->EnableSectorEncryption = false;
+            cfg->FeatureFlags.SetEnablePDiskDataEncryption(false);
             cfg->EnableFormatAndMetadataEncryption = false;
             testCtx.UpdateConfigRecreatePDisk(cfg, true);
         }
@@ -1077,7 +1077,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
 
         auto restartPDisk = [&](bool enableSectorEncryption) {
             auto cfg = testCtx.GetPDiskConfig();
-            cfg->EnableSectorEncryption = enableSectorEncryption;
+            cfg->FeatureFlags.SetEnablePDiskDataEncryption(enableSectorEncryption);
             testCtx.RestartPDiskSync();
         };
 
