@@ -273,6 +273,7 @@ struct TPDiskTest : public TPerfTest {
             pDiskConfig->ChunkSize = ChunkSize;
             pDiskConfig->DeviceInFlight = TestProto.GetDeviceInFlight() != 0 ? FastClp2(TestProto.GetDeviceInFlight()) : 4;
             pDiskConfig->FeatureFlags.SetEnableSeparateSubmitThreadForPDisk(true);
+            pDiskConfig->FeatureFlags.SetEnablePDiskDataEncryption(!Cfg.DisablePDiskDataEncryption);
             if (!TestProto.GetEnableTrim()) {
                 pDiskConfig->DriveModelTrimSpeedBps = 0;
             }
