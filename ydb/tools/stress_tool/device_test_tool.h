@@ -226,6 +226,7 @@ struct TPerfTestConfig {
     NPDisk::EDeviceType DeviceType;
     TResultPrinter::EOutputFormat OutputFormat;
     bool DoLockFile;
+    bool DisablePDiskDataEncryption;
 
     TMap<const TString, NPDisk::EDeviceType> DeviceStrToType {
         {"ROT",  NPDisk::DEVICE_TYPE_ROT},
@@ -239,11 +240,12 @@ struct TPerfTestConfig {
     };
 
     TPerfTestConfig(const TString path, const TString name, const TString type, const TString outputFormatName,
-            const TString monPort, bool doLockFile)
+            const TString monPort, bool doLockFile, bool disablePDiskDataEncryption = false)
         : Path(path)
         , Name(name)
         , MonPort(std::strtol(monPort.c_str(), nullptr, 10))
         , DoLockFile(doLockFile)
+        , DisablePDiskDataEncryption(disablePDiskDataEncryption)
     {
         auto it_type = DeviceStrToType.find(type);
         if (it_type != DeviceStrToType.end()) {
