@@ -105,6 +105,12 @@ void TPDisk::RenderState(IOutputStream &str, THttpInfo &httpInfo) {
         if (!Cfg->FeatureFlags.GetEnablePDiskDataEncryption()) {
             PARA() {str << "Note - PDisk sector enctyption is disabled<br>"; }
         }
+        if (Cfg->CompletionThreadsCount != 1) {
+            PARA() {str << "Note - PDisk completion threads: " << Cfg->CompletionThreadsCount; }
+        }
+        if (Cfg->SubmitThreadCount != 1) {
+            PARA() {str << "Note - PDisk submit threads: " << Cfg->SubmitThreadCount; }
+        }
         PARA() {str << httpInfo.ErrorStr; }
         TAG(TH4) {str << "Uptime"; }
         PARA() {

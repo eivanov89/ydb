@@ -30,6 +30,8 @@
 #include <util/system/spinlock.h>
 #include <util/system/thread.h>
 
+#include <optional>
+
 namespace NKikimr {
 namespace NPDisk {
 
@@ -218,6 +220,111 @@ class TRealBlockDevice : public IBlockDevice {
         TAtomic SeqnoL7 = 0;
     };
 
+    // TODO: a very naive implementation
+    struct TSubmitQueue {
+        TRealBlockDevice& Device;
+        std::shared_ptr<TPDiskCtx> &PCtx;
+
+        TAdaptiveLock Lock;
+        TDeque<IAsyncIoOperation *> Queue;
+        TAtomicBlockCounter SubmitQuitCounter;
+
+        TMutex CondMtx;
+        TCondVar CondVar;
+        static constexpr TAtomicBase SubmitInFlightBytesMax = 1ull << 16; // note, it's larger than in a single thread
+        TAtomic SubmitInFlightBytes = 0;
+        TMutex SubmitMtx;
+        TCondVar SubmitCondVar;
+
+        TSubmitQueue(TRealBlockDevice& device)
+            : Device(device)
+            , PCtx(device.PCtx)
+        {}
+
+        std::optional<IAsyncIoOperation*> Pop() {
+            TGuard<TAdaptiveLock> guard(Lock);
+            if (SubmitQuitCounter.IsBlocked() && Queue.empty()) {
+                return nullptr;
+            }
+
+            if (Queue.empty()) {
+                return std::optional<IAsyncIoOperation*>();
+            }
+
+            SubmitQuitCounter.Decrement();
+            auto* op = Queue.front();
+            Queue.pop_front();
+
+            return op;
+        }
+
+        void Push(IAsyncIoOperation* op) {
+            if (!op) {
+                SubmitQuitCounter.BlockA();
+                SignalWaiters();
+                return;
+            }
+
+            if (!SubmitQuitCounter.Increment()) {
+                Device.FreeOperation(op);
+                return;
+            }
+
+            const ui64 size = op->GetSize();
+            const bool shouldWait = AtomicGetAndAdd(SubmitInFlightBytes, size) > SubmitInFlightBytesMax;
+
+            {
+                TGuard<TAdaptiveLock> guard(Lock);
+                Queue.push_back(op);
+            }
+            SignalWaiters();
+
+            if (shouldWait) {
+                NHPTimer::STime start;
+                TGuard<TMutex> guard(SubmitMtx);
+                start = HPNow();
+                while (AtomicGet(SubmitInFlightBytes) > SubmitInFlightBytesMax) {
+                    if (SubmitCondVar.WaitT(SubmitMtx, TDuration::Seconds(1))) {
+                        return;
+                    } else {
+                        P_LOG(PRI_WARN, BPD01, "Exceed 1 second deadline in SubmitQueue",
+                                    (PDiskId, PCtx->PDiskId),
+                                    (Path, Device.Path),
+                                    (TotalTimeInWaitingSec, NHPTimer::GetSeconds(HPNow() - start)),
+                                    (SubmitInFlightBytes, AtomicGet(SubmitInFlightBytes)),
+                                    (SubmitInFlightBytesMax, SubmitInFlightBytesMax));
+                    }
+                }
+            }
+        }
+
+        void Wait() {
+            TGuard<TMutex> guard(CondMtx);
+            while (true) {
+                {
+                    TGuard<TAdaptiveLock> guard2(Lock);
+                    if (!Queue.empty() || SubmitQuitCounter.IsBlocked()) {
+                        return;
+                    }
+                }
+                CondVar.Wait(CondMtx);
+            }
+        }
+
+        void OnSubmitComplete(ui64 size) {
+            if (AtomicSub(SubmitInFlightBytes, size) <= SubmitInFlightBytesMax) {
+                TGuard<TMutex> guard(SubmitMtx);
+                SubmitCondVar.Signal();
+            }
+        }
+
+    private:
+        void SignalWaiters() {
+            TGuard<TMutex> guard(CondMtx);
+            CondVar.BroadCast();
+        }
+    };
+
     class TSubmitThreadBase : public TThread {
     protected:
         TRealBlockDevice &Device;
@@ -375,6 +482,97 @@ class TRealBlockDevice : public IBlockDevice {
             }
             Y_VERIFY_S(OperationsToBeSubmit.GetWaitingSize() == 0, PCtx->PDiskLogPrefix);
         }
+    };
+
+    class TSubmitMultiThread : public TThread {
+    public:
+        TSubmitMultiThread(TRealBlockDevice &device)
+            : TThread(&ThreadProc, this)
+            , Device(device)
+            , Rng((ui64)this)
+        {}
+
+        static void* ThreadProc(void* _this) {
+            SetCurrentThreadName("PdSbmEv");
+            static_cast<TSubmitMultiThread*>(_this)->Exec();
+            return nullptr;
+        }
+
+        void ReleaseOp(IAsyncIoOperation *op) {
+            Device.DecrementMonInFlight(op->GetType(), op->GetSize());
+            Device.FreeOperation(op);
+            Device.QuitCounter.Decrement();
+            Device.IdleCounter.Decrement();
+        }
+
+        void Submit(IAsyncIoOperation *op) {
+            TCompletionAction *action = static_cast<TCompletionAction*>(op->GetCookie());
+
+            if (!Device.QuitCounter.Increment()) {
+                Device.FreeOperation(op);
+                return;
+            }
+            Device.IdleCounter.Increment();
+
+            Device.IncrementMonInFlight(op->GetType(), op->GetSize());
+
+            if (action->FlushAction) {
+                action->FlushAction->OperationIdx = action->OperationIdx;
+            }
+
+            EIoResult ret = EIoResult::TryAgain;
+            while (ret == EIoResult::TryAgain) {
+                action->SubmitTime = HPNow();
+                if (action->FlushAction) {
+                    action->FlushAction->SubmitTime = action->SubmitTime;
+                }
+
+                if (op->GetType() == IAsyncIoOperation::EType::PWrite) {
+                    PDISK_FAIL_INJECTION(1);
+                }
+                ret = Device.IoContext->Submit(op, Device.SharedCallback.Get());
+
+                if (ret == EIoResult::Ok) {
+                    return;
+                }
+                if (Device.QuitCounter.IsBlocked()) {
+                    ReleaseOp(op);
+                    return;
+                }
+            }
+            // IoError happend
+            ReleaseOp(op);
+            Device.BecomeErrorState(TStringBuilder() << " Submit error, reason# " << ret);
+        }
+
+        void Exec() {
+            auto prevCycleEnd = HPNow();
+            auto& SubmitQueue = Device.SubmitSharedQueue;
+            while(!SubmitQueue.SubmitQuitCounter.IsBlocked() || SubmitQueue.SubmitQuitCounter.Get()) {
+                auto optionalOp = Device.SubmitSharedQueue.Pop();
+                if (optionalOp.has_value() && optionalOp.value() == nullptr) {
+                    break;
+                }
+
+                if (!optionalOp.has_value()) {
+                    *Device.Mon.SubmitThreadCPU = ThreadCPUTime();
+                    SubmitQueue.Wait();
+                    continue;
+                }
+
+                const ui64 opSize = (*optionalOp)->GetSize();
+                Submit(*optionalOp);
+                SubmitQueue.OnSubmitComplete(opSize);
+
+                auto cycleEnd = HPNow();
+                *Device.Mon.DeviceSubmitThreadBusyTimeNs += HPNanoSeconds(cycleEnd - prevCycleEnd);
+                prevCycleEnd = cycleEnd;
+            }
+        }
+    protected:
+        TRealBlockDevice &Device;
+        TReallyFastRng32 Rng;
+
     };
 
     ////////////////////////////////////////////////////////
@@ -812,7 +1010,10 @@ private:
     THolder<TSubmitGetThread> SpdkSubmitGetThread;
 
     THolder<TSharedCallback> SharedCallback;
+
+    // depending on the feature flag either one is used
     THolder<TSubmitThreadBase> SubmitThread;
+    TVector<THolder<TSubmitMultiThread>> SubmitThreads;
 
     bool IsFileOpened;
     bool IsInitialized;
@@ -821,6 +1022,7 @@ private:
     bool IsTrimEnabled;
     const ui32 MaxQueuedCompletionActions; // for all threads
     const ui32 CompletionThreadsCount;
+    const ui32 SubmitThreadCount;
 
     TIdleCounter IdleCounter; // Includes reads, writes and trims
 
@@ -830,7 +1032,7 @@ private:
     ISpdkState *SpdkState = nullptr;
 
     static constexpr int WaitTimeoutMs = 1;
-    static constexpr int MaxEvents = 32;
+    static constexpr int MaxEvents = 32; // TODO: consider increasing
 
     ui64 DeviceInFlight;
     TFlightControl FlightControl;
@@ -842,10 +1044,13 @@ private:
 
     std::optional<TDriveData> DriveData;
 
+    // used only when there are multiple submit threads
+    TSubmitQueue SubmitSharedQueue;
+
 public:
     TRealBlockDevice(const TString &path, TPDiskMon &mon, ui64 reorderingCycles,
             ui64 seekCostNs, ui64 deviceInFlight, TDeviceMode::TFlags flags, ui32 maxQueuedCompletionActions,
-            ui32 completionThreadsCount, TIntrusivePtr<TSectorMap> sectorMap, bool readOnly)
+            ui32 completionThreadsCount, ui32 submitThreadCount, TIntrusivePtr<TSectorMap> sectorMap, bool readOnly)
         : Mon(mon)
         , Path(path)
         , CompletionThreads(nullptr)
@@ -860,6 +1065,7 @@ public:
         , IsTrimEnabled(true)
         , MaxQueuedCompletionActions(maxQueuedCompletionActions)
         , CompletionThreadsCount(completionThreadsCount)
+        , SubmitThreadCount(submitThreadCount)
         , IdleCounter(Mon.IdleLight)
         , Flags(flags)
         , SectorMap(sectorMap)
@@ -867,6 +1073,7 @@ public:
         , FlightControl(CountTrailingZeroBits(DeviceInFlight))
         , LastWarning(IsPowerOf2(deviceInFlight) ? "" : "Device inflight must be a power of 2")
         , ReadOnly(readOnly)
+        , SubmitSharedQueue(*this)
     {
         if (sectorMap) {
             DriveData = TDriveData();
@@ -934,8 +1141,16 @@ protected:
                     SubmitThread = MakeHolder<TSubmitGetThread>(*this);
                     SubmitThread->Start();
                 } else {
-                    SubmitThread = MakeHolder<TSubmitThread>(*this);
-                    SubmitThread->Start();
+                    if (SubmitThreadCount <= 1) {
+                        SubmitThread = MakeHolder<TSubmitThread>(*this);
+                        SubmitThread->Start();
+                    } else {
+                        for (size_t i = 0; i < SubmitThreadCount; ++i) {
+                            SubmitThreads.emplace_back(MakeHolder<TSubmitMultiThread>(*this));
+                            SubmitThreads.back()->Start();
+                        }
+                    }
+
                     GetEventsThread = MakeHolder<TGetThread>(*this);
                     GetEventsThread->Start();
                 }
@@ -1025,7 +1240,15 @@ protected:
         if (Flags & TDeviceMode::UseSpdk) {
             SpdkSubmitGetThread->Schedule(op);
         } else {
-            SubmitThread->Schedule(op);
+            if (SubmitThread) {
+                SubmitThread->Schedule(op);
+            } else {
+                double blockedMs = 0;
+                TCompletionAction *action = static_cast<TCompletionAction*>(op->GetCookie());
+                action->OperationIdx = FlightControl.Schedule(blockedMs);
+                *Mon.DeviceWaitTimeMs += blockedMs;
+                SubmitSharedQueue.Push(op);
+            }
         }
     }
 
@@ -1202,9 +1425,16 @@ protected:
                     SpdkSubmitGetThread->Schedule(nullptr); // Stop the SpdkSubmitGetEvents thread
                     SpdkState->WaitAllThreads();
                 } else {
-                    Y_VERIFY_S(SubmitThread, PCtx->PDiskLogPrefix);
-                    SubmitThread->Schedule(nullptr); // Stop the SubminEvents thread
-                    SubmitThread->Join();
+                    Y_VERIFY_S(SubmitThread || !SubmitThreads.empty(), PCtx->PDiskLogPrefix);
+                    if (SubmitThread) {
+                        SubmitThread->Schedule(nullptr); // Stop the SubminEvents thread
+                        SubmitThread->Join();
+                    } else {
+                        SubmitSharedQueue.Push(nullptr); // Stop the SubminEvents thread
+                        for (auto& thread: SubmitThreads) {
+                            thread->Join();
+                        }
+                    }
 
                     if (!(Flags & TDeviceMode::UseSubmitGetThread)) {
                         Y_VERIFY_S(GetEventsThread, PCtx->PDiskLogPrefix);
@@ -1216,7 +1446,7 @@ protected:
                 CompletionThreads->Join();
                 IsInitialized = false;
             } else {
-                Y_VERIFY_S(SubmitThread.Get() == nullptr, PCtx->PDiskLogPrefix);
+                Y_VERIFY_S(SubmitThread.Get() == nullptr && SubmitThreads.empty(), PCtx->PDiskLogPrefix);
                 Y_VERIFY_S(GetEventsThread.Get() == nullptr, PCtx->PDiskLogPrefix);
                 Y_VERIFY_S(TrimThread.Get() == nullptr, PCtx->PDiskLogPrefix);
                 Y_VERIFY_S(CompletionThreads.Get() == nullptr, PCtx->PDiskLogPrefix);
@@ -1355,9 +1585,9 @@ class TCachedBlockDevice : public TRealBlockDevice {
 public:
     TCachedBlockDevice(const TString &path, TPDiskMon &mon, ui64 reorderingCycles,
             ui64 seekCostNs, ui64 deviceInFlight, TDeviceMode::TFlags flags, ui32 maxQueuedCompletionActions,
-            ui32 completionThreadsCount, TIntrusivePtr<TSectorMap> sectorMap, TPDisk * const pdisk, bool readOnly)
+            ui32 completionThreadsCount, ui32 submitThreadCount, TIntrusivePtr<TSectorMap> sectorMap, TPDisk * const pdisk, bool readOnly)
         : TRealBlockDevice(path, mon, reorderingCycles, seekCostNs, deviceInFlight, flags,
-                maxQueuedCompletionActions, completionThreadsCount, sectorMap, readOnly)
+                maxQueuedCompletionActions, completionThreadsCount, submitThreadCount, sectorMap, readOnly)
         , ReadsInFly(0)
         , PDisk(pdisk)
     {}
@@ -1493,14 +1723,14 @@ public:
 
 IBlockDevice* CreateRealBlockDevice(const TString &path, TPDiskMon &mon, ui64 reorderingCycles,
         ui64 seekCostNs, ui64 deviceInFlight, TDeviceMode::TFlags flags, ui32 maxQueuedCompletionActions,
-        ui32 completionThreadsCount, TIntrusivePtr<TSectorMap> sectorMap, TPDisk * const pdisk, bool readOnly) {
+        ui32 completionThreadsCount, ui32 submitThreadCount, TIntrusivePtr<TSectorMap> sectorMap, TPDisk * const pdisk, bool readOnly) {
     return new TCachedBlockDevice(path, mon, reorderingCycles, seekCostNs, deviceInFlight, flags,
-            maxQueuedCompletionActions, completionThreadsCount, sectorMap, pdisk, readOnly);
+            maxQueuedCompletionActions, completionThreadsCount, submitThreadCount, sectorMap, pdisk, readOnly);
 }
 
 IBlockDevice* CreateRealBlockDeviceWithDefaults(const TString &path, TPDiskMon &mon, TDeviceMode::TFlags flags,
         TIntrusivePtr<TSectorMap> sectorMap, TActorSystem *actorSystem, TPDisk * const pdisk, bool readOnly) {
-    IBlockDevice *device = CreateRealBlockDevice(path, mon, 0, 0, 4, flags, 8, 1, sectorMap, pdisk, readOnly);
+    IBlockDevice *device = CreateRealBlockDevice(path, mon, 0, 0, 4, flags, 8, 1, 1, sectorMap, pdisk, readOnly);
     device->Initialize(std::make_shared<TPDiskCtx>(actorSystem));
     return device;
 }

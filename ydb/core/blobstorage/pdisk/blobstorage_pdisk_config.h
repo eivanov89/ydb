@@ -174,6 +174,7 @@ struct TPDiskConfig : public TThrRefBase {
     NKikimrBlobStorage::TPDiskSpaceColor::E SpaceColorBorder = NKikimrBlobStorage::TPDiskSpaceColor::GREEN;
 
     ui32 CompletionThreadsCount = 1;
+    ui32 SubmitThreadCount = 1;
     bool UseNoopScheduler = false;
 
     bool PlainDataChunks = false;
@@ -341,6 +342,7 @@ struct TPDiskConfig : public TThrRefBase {
         str << " MaxMetadataMegabytes# " << MaxMetadataMegabytes << x;
         str << " SpaceColorBorder# " << SpaceColorBorder << x;
         str << " CompletionThreadsCount# " << CompletionThreadsCount << x;
+        str << " SubmitThreadCount# " << SubmitThreadCount << x;
         str << " UseNoopScheduler# " << (UseNoopScheduler ? "true" : "false") << x;
         str << " PlainDataChunks# " << PlainDataChunks << x;
         str << " SeparateHugePriorities# " << SeparateHugePriorities << x;
@@ -431,6 +433,10 @@ struct TPDiskConfig : public TThrRefBase {
 
         if (cfg->HasCompletionThreadsCount()) {
             CompletionThreadsCount = cfg->GetCompletionThreadsCount();
+        }
+
+        if (cfg->HasSubmitThreadCount()) {
+            SubmitThreadCount = cfg->GetSubmitThreadCount();
         }
 
         if (cfg->HasUseNoopScheduler()) {
