@@ -47,7 +47,7 @@ public:
     ui64 HashSector(const ui64 sectorOffset, const ui64 magic, const ui8 *sector,
             const ui32 sectorSize) {
         if (UseT1ha0Hasher) {
-            return T1ha0HashSector<TT1ha0NoAvxHasher>(sectorOffset, magic, sector, sectorSize);
+            return T1ha0HashSector<TT1ha0AvxHasher>(sectorOffset, magic, sector, sectorSize);
         } else {
             return OldHashSector(sectorOffset, magic, sector, sectorSize);
         }
@@ -58,7 +58,7 @@ public:
         // On production servers may be two versions.
         // If by default used OldHash version, then use it first
         // If by default used T1ha0NoAvx version, then use it
-        return sectorHash == T1ha0HashSector<TT1ha0NoAvxHasher>(sectorOffset, magic, sector, sectorSize)
+        return sectorHash == T1ha0HashSector<TT1ha0AvxHasher>(sectorOffset, magic, sector, sectorSize)
             || sectorHash == OldHashSector(sectorOffset, magic, sector, sectorSize);
     }
 };
