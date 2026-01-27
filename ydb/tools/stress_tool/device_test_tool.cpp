@@ -48,6 +48,7 @@ int main(int argc, char **argv) {
     opts.AddLongOption("no-logo", "disable logo printing on start").NoArgument();
     opts.AddLongOption("disable-file-lock", "disable file locking before test").NoArgument().DefaultValue("0");
     opts.AddLongOption("disable-pdisk-encryption", "disable PDisk data encryption").StoreTrue(&disablePDiskDataEncryption);
+    opts.AddLongOption("submit-thread-count", "number of PDisk submit threads").DefaultValue("1");
     TOptsParseResult res(&opts, argc, argv);
 
     if (!res.Has("no-logo") && res.Get("output-format") != TString("json")) {
@@ -55,7 +56,8 @@ int main(int argc, char **argv) {
     }
 
     NKikimr::TPerfTestConfig config(res.Get("path"), res.Get("name"), res.Get("type"),
-            res.Get("output-format"), res.Get("mon-port"), !res.Has("disable-file-lock"), disablePDiskDataEncryption);
+            res.Get("output-format"), res.Get("mon-port"), !res.Has("disable-file-lock"),
+            res.Get("submit-thread-count"), disablePDiskDataEncryption);
     NDevicePerfTest::TPerfTests protoTests;
     NKikimr::ParsePBFromFile(res.Get("cfg"), &protoTests);
     auto printer = MakeIntrusive<NKikimr::TResultPrinter>(config.OutputFormat);

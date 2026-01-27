@@ -225,6 +225,7 @@ struct TPerfTestConfig {
     ui16 MonPort;
     NPDisk::EDeviceType DeviceType;
     TResultPrinter::EOutputFormat OutputFormat;
+    ui32 SubmitThreadCount;
     bool DoLockFile;
     bool DisablePDiskDataEncryption;
 
@@ -240,10 +241,12 @@ struct TPerfTestConfig {
     };
 
     TPerfTestConfig(const TString path, const TString name, const TString type, const TString outputFormatName,
-            const TString monPort, bool doLockFile, bool disablePDiskDataEncryption = false)
+            const TString monPort, bool doLockFile, const TString submitThreadCount,
+            bool disablePDiskDataEncryption = false)
         : Path(path)
         , Name(name)
         , MonPort(std::strtol(monPort.c_str(), nullptr, 10))
+        , SubmitThreadCount(std::strtoul(submitThreadCount.c_str(), nullptr, 10))
         , DoLockFile(doLockFile)
         , DisablePDiskDataEncryption(disablePDiskDataEncryption)
     {

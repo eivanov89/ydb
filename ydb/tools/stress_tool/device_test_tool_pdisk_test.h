@@ -272,7 +272,7 @@ struct TPDiskTest : public TPerfTest {
             pDiskConfig->WriteCacheSwitch = NKikimrBlobStorage::TPDiskConfig::DoNotTouch;
             pDiskConfig->ChunkSize = ChunkSize;
             pDiskConfig->DeviceInFlight = TestProto.GetDeviceInFlight() != 0 ? FastClp2(TestProto.GetDeviceInFlight()) : 4;
-            pDiskConfig->FeatureFlags.SetEnableSeparateSubmitThreadForPDisk(true);
+            pDiskConfig->SubmitThreadCount = Cfg.SubmitThreadCount;
             pDiskConfig->FeatureFlags.SetEnablePDiskDataEncryption(!Cfg.DisablePDiskDataEncryption);
             if (!TestProto.GetEnableTrim()) {
                 pDiskConfig->DriveModelTrimSpeedBps = 0;
@@ -285,6 +285,7 @@ struct TPDiskTest : public TPerfTest {
                 Printer->AddGlobalParam("Trim", "off");
             }
             Printer->AddGlobalParam("PDiskInFlight", pDiskConfig->DeviceInFlight);
+            Printer->AddGlobalParam("SubmitThreadCount", pDiskConfig->SubmitThreadCount);
 #if ENABLE_PDISK_ENCRYPTION
             Printer->AddGlobalParam("Encryption", "on");
 #else
