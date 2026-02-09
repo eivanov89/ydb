@@ -12,6 +12,7 @@ message TReplyStatus {
         SESSION_MISMATCH = 5;
         INCORRECT_REQUEST = 6;
         MISSING_RECORD = 7;
+        OVERLOADED = 8;
     }
 }
 

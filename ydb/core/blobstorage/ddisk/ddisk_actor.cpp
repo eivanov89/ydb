@@ -110,6 +110,12 @@ namespace NKikimr::NDDisk {
     }
 
     void TDDiskActor::PassAway() {
+#if defined(__linux__)
+        if (UringRouter) {
+            UringRouter->Stop();
+            UringRouter.reset();
+        }
+#endif
         CountersBase->RemoveSubgroupChain(CountersChain);
         TActorBootstrapped::PassAway();
     }

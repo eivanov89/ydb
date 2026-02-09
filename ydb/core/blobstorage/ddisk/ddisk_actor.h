@@ -11,6 +11,11 @@
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
 
+#if defined(__linux__)
+#include <ydb/library/pdisk_io/uring_router.h>
+#endif
+
+#include <atomic>
 #include <queue>
 
 namespace NKikimrBlobStorage::NDDisk::NInternal {
@@ -65,6 +70,30 @@ namespace NKikimr::NDDisk {
         ui64 DDiskInstanceGuid = RandomNumber<ui64>();
 
         static constexpr ui32 BlockSize = 4096;
+
+#if defined(__linux__)
+        // Direct I/O operation context passed through io_uring.
+        // Allocated on the actor thread (new), freed in OnComplete callback (delete).
+        struct TDirectIoOp : NPDisk::TUringOperation {
+            TActorId Sender;                    // original requester
+            ui64 Cookie = 0;                    // original event cookie
+            TActorId InterconnectSession;       // for Rewrite if non-null
+            TActorId DDiskId;                   // DDisk's SelfId (reply source)
+            NWilson::TSpan Span;                // tracing
+            bool IsRead = false;
+            ui32 Size = 0;
+            TRcBuf DataHolder;                  // keeps aligned buffer alive until completion
+            std::atomic<ui32>* InFlightCount = nullptr; // shared with DDisk actor
+
+            static void OnDirectIoComplete(NPDisk::TUringOperation* baseOp, NActors::TActorSystem* actorSystem);
+        };
+
+        std::unique_ptr<NPDisk::TUringRouter> UringRouter;
+        std::atomic<ui32> InFlightCount{0};
+        static constexpr ui32 MaxInFlight = 128;
+#endif
+        ui64 FirstChunkOffset = 0;
+        ui64 RawChunkSize = 0;
 
     private:
         struct {
@@ -323,6 +352,13 @@ namespace NKikimr::NDDisk {
 
         void Handle(TEvWrite::TPtr ev);
         void Handle(TEvRead::TPtr ev);
+
+#if defined(__linux__)
+        void DirectWrite(TEvWrite::TPtr ev, const TBlockSelector& selector, const TWriteInstruction& instr,
+            TChunkRef& chunkRef, NWilson::TSpan span);
+        void DirectRead(TEvRead::TPtr ev, const TBlockSelector& selector, TChunkRef& chunkRef,
+            NWilson::TSpan span);
+#endif
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Persistent buffer services

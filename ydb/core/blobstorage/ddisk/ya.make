@@ -18,4 +18,10 @@ LIBRARY()
         ydb/core/blobstorage/vdisk/common
     )
 
+    IF (OS_LINUX)
+        PEERDIR(
+            ydb/library/pdisk_io
+        )
+    ENDIF()
+
 END()
