@@ -13,6 +13,7 @@
 #include <ydb/core/util/stlog.h>
 #include <library/cpp/monlib/dynamic_counters/counters.h>
 #include <util/generic/map.h>
+#include <util/system/fhandle.h>
 
 
 namespace NKikimr {
@@ -140,6 +141,7 @@ struct TEvYardInit : TEventLocal<TEvYardInit, TEvBlobStorage::EvYardInit> {
     TActorId WhiteboardProxyId;
     ui32 SlotId;
     ui32 GroupSizeInUnits;
+    bool GetDiskFd = false; // if true, response will contain a duplicated file descriptor for direct disk access
 
     TEvYardInit(
             TOwnerRound ownerRound,
@@ -148,7 +150,8 @@ struct TEvYardInit : TEventLocal<TEvYardInit, TEvBlobStorage::EvYardInit> {
             const TActorId &cutLogID = TActorId(),
             const TActorId& whiteboardProxyId = {},
             ui32 slotId = Max<ui32>(),
-            ui32 groupSizeInUnits = 0
+            ui32 groupSizeInUnits = 0,
+            bool getDiskFd = false
         )
         : OwnerRound(ownerRound)
         , VDisk(vdisk)
@@ -157,6 +160,7 @@ struct TEvYardInit : TEventLocal<TEvYardInit, TEvBlobStorage::EvYardInit> {
         , WhiteboardProxyId(whiteboardProxyId)
         , SlotId(slotId)
         , GroupSizeInUnits(groupSizeInUnits)
+        , GetDiskFd(getDiskFd)
     {}
 
     TString ToString() const {
@@ -172,6 +176,7 @@ struct TEvYardInit : TEventLocal<TEvYardInit, TEvBlobStorage::EvYardInit> {
         str << " WhiteboardProxyId# " << record.WhiteboardProxyId;
         str << " SlotId# " << record.SlotId;
         str << " GroupSizeInUnits# " << record.GroupSizeInUnits;
+        str << " GetDiskFd# " << record.GetDiskFd;
         str << "}";
         return str.Str();
     }
@@ -184,6 +189,7 @@ struct TEvYardInitResult : TEventLocal<TEvYardInitResult, TEvBlobStorage::EvYard
     TIntrusivePtr<TPDiskParams> PDiskParams;
     TVector<TChunkIdx> OwnedChunks;  // Sorted vector of owned chunk identifiers.
     TString ErrorReason;
+    FHANDLE DiskFd = INVALID_FHANDLE; // duplicated fd for direct disk access (owned by block device)
 
     TEvYardInitResult(const NKikimrProto::EReplyStatus status, TString errorReason)
         : Status(status)
@@ -249,6 +255,7 @@ struct TEvYardInitResult : TEventLocal<TEvYardInitResult, TEvBlobStorage::EvYard
             str << record.OwnedChunks[i];
         }
         str << "}";
+        str << " DiskFd# " << record.DiskFd;
         str << "}";
         return str.Str();
     }

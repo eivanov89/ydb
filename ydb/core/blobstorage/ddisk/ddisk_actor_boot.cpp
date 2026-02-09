@@ -7,7 +7,8 @@ namespace NKikimr::NDDisk {
         STLOG(PRI_DEBUG, BS_DDISK, BSDD01, "TDDiskActor::InitPDiskInterface", (DDiskId, DDiskId), (PDiskActorId, BaseInfo.PDiskActorID));
 
         Send(BaseInfo.PDiskActorID, new NPDisk::TEvYardInit(BaseInfo.InitOwnerRound, TVDiskID(Info->GroupID,
-            Info->GroupGeneration, BaseInfo.VDiskIdShort), BaseInfo.PDiskGuid, SelfId(), SelfId(), BaseInfo.VDiskSlotId));
+            Info->GroupGeneration, BaseInfo.VDiskIdShort), BaseInfo.PDiskGuid, SelfId(), SelfId(), BaseInfo.VDiskSlotId,
+            0 /*groupSizeInUnits*/, true /*getDiskFd*/));
     }
 
     void TDDiskActor::Handle(NPDisk::TEvYardInitResult::TPtr ev) {
@@ -20,6 +21,7 @@ namespace NKikimr::NDDisk {
 
         PDiskParams = std::move(msg.PDiskParams);
         OwnedChunksOnBoot = std::move(msg.OwnedChunks);
+        DiskFd = msg.DiskFd;
 
         if (const auto it = msg.StartingPoints.find(TLogSignature::SignatureDDiskChunkMap); it != msg.StartingPoints.end()) {
             NPDisk::TLogRecord& record = it->second;

@@ -58,6 +58,12 @@ public:
     virtual void SetWriteCache(bool isEnable) = 0;
     virtual void Stop() = 0;
     virtual TString DebugInfo() = 0;
+
+    // Returns a duplicated file descriptor (via dup()) for the underlying block device.
+    // The caller must NOT close the returned fd; it is owned by the block device and
+    // will be closed when the device is stopped.
+    // Returns INVALID_FHANDLE if the device does not support fd duplication (e.g. SectorMap).
+    virtual FHANDLE DuplicateFd() = 0;
 };
 
 class TPDisk;
