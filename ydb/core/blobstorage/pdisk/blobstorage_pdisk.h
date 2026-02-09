@@ -191,6 +191,8 @@ struct TEvYardInitResult : TEventLocal<TEvYardInitResult, TEvBlobStorage::EvYard
     TVector<TChunkIdx> OwnedChunks;  // Sorted vector of owned chunk identifiers.
     TString ErrorReason;
     TFileHandle DiskFd; // A duplicated fd for direct disk access
+    ui64 FirstChunkOffset = 0; // byte offset on disk where chunk 0 starts (for direct disk access)
+    ui64 RawChunkSize = 0; // raw size of each chunk in bytes on disk (for direct disk access)
 
     TEvYardInitResult(const NKikimrProto::EReplyStatus status, TString errorReason)
         : Status(status)
@@ -257,6 +259,8 @@ struct TEvYardInitResult : TEventLocal<TEvYardInitResult, TEvBlobStorage::EvYard
         }
         str << "}";
         str << " DiskFd# " << static_cast<FHANDLE>(record.DiskFd);
+        str << " FirstChunkOffset# " << record.FirstChunkOffset;
+        str << " RawChunkSize# " << record.RawChunkSize;
         str << "}";
         return str.Str();
     }

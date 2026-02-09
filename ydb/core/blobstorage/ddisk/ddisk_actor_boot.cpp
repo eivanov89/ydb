@@ -27,6 +27,8 @@ namespace NKikimr::NDDisk {
                 "TDDiskActor::Handle(TEvYardInitResult) DiskFd is invalid, all further I/O will be routed through PDisk",
                 (DDiskId, DDiskId), (PDiskActorId, BaseInfo.PDiskActorID));
         }
+        FirstChunkOffset = msg.FirstChunkOffset;
+        RawChunkSize = msg.RawChunkSize;
 
         if (const auto it = msg.StartingPoints.find(TLogSignature::SignatureDDiskChunkMap); it != msg.StartingPoints.end()) {
             NPDisk::TLogRecord& record = it->second;
@@ -109,6 +111,14 @@ namespace NKikimr::NDDisk {
     }
 
     void TDDiskActor::StartHandlingQueries() {
+#if defined(__linux__)
+        if (!UringRouter && DiskFd != INVALID_FHANDLE && NPDisk::TUringRouter::Probe()) {
+            NPDisk::TUringRouterConfig config;
+            config.QueueDepth = MaxInFlight;
+            UringRouter = std::make_unique<NPDisk::TUringRouter>(DiskFd, TActivationContext::ActorSystem(), config);
+            UringRouter->RegisterFile();
+        }
+#endif
         TActivationContext::Send(new IEventHandle(TEvPrivate::EvHandleSingleQuery, 0, SelfId(), SelfId(), nullptr, 0));
     }
 
