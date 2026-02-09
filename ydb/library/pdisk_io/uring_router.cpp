@@ -24,7 +24,19 @@ public:
     void* ThreadProc() override {
         SetCurrentThreadName("UringCmpl");
 
+        // With IOPOLL (and no SQPOLL), the kernel does not post CQEs via
+        // interrupts.  We must call io_uring_enter(IORING_ENTER_GETEVENTS)
+        // to trigger the kernel to poll the block device for completions.
+        // With SQPOLL, the kernel SQPOLL thread handles reaping internally.
+        const bool needIoPollReap = Owner.Config.UseIOPoll && !Owner.Config.UseSQPoll;
+
         while (Owner.Running.load(std::memory_order_acquire)) {
+            // For IOPOLL without SQPOLL, ask the kernel to reap polled
+            // completions before we peek the CQ ring.
+            if (needIoPollReap) {
+                io_uring_enter(Owner.Ring->ring_fd, 0, 0, IORING_ENTER_GETEVENTS, nullptr);
+            }
+
             unsigned head;
             unsigned count = 0;
             struct io_uring_cqe* cqe;
@@ -194,15 +206,14 @@ bool TUringRouter::WriteFixed(const void* buf, ui64 size, ui64 offset, ui16 bufI
 }
 
 void TUringRouter::Flush() {
-    if (Config.UseSQPoll) {
-        // With SQPOLL, the kernel thread picks up SQEs automatically.
-        // We only need to wake it if it went to sleep.
-        if (IO_URING_READ_ONCE(*Ring->sq.kflags) & IORING_SQ_NEED_WAKEUP) {
-            io_uring_enter(Ring->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr);
-        }
-    } else {
-        io_uring_submit(Ring);
-    }
+    // Always call io_uring_submit().  It does two things:
+    // 1. Flushes the SQ ring tail (__io_uring_flush_sq) so the kernel (or
+    //    the SQPOLL thread) can see newly prepared SQEs.  Without this,
+    //    io_uring_get_sqe() only updates an internal userspace counter;
+    //    the kernel-visible *sq->ktail stays stale.
+    // 2. Calls io_uring_enter() when needed: always for non-SQPOLL,
+    //    and only for SQPOLL wakeup when IORING_SQ_NEED_WAKEUP is set.
+    io_uring_submit(Ring);
 }
 
 void TUringRouter::Stop() {

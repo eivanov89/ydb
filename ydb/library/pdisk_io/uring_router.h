@@ -73,10 +73,10 @@ public:
     bool ReadFixed(void* buf, ui32 size, ui64 offset, ui16 bufIndex, TUringOperation* op);
     bool WriteFixed(const void* buf, ui64 size, ui64 offset, ui16 bufIndex, TUringOperation* op);
 
-    // Ensure all prepared SQEs are visible to the kernel.
-    // With SQPOLL, this is typically a no-op; if the SQPOLL thread is sleeping,
-    // this wakes it up via io_uring_enter().
-    // Without SQPOLL, this calls io_uring_submit().
+    // Flush the SQ ring tail and submit prepared SQEs to the kernel.
+    // Calls io_uring_submit() which advances the kernel-visible SQ tail
+    // and, when needed, calls io_uring_enter() (always for non-SQPOLL;
+    // only for wakeup with SQPOLL).
     void Flush();
 
     // --- Lifecycle ---
