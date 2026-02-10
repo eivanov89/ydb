@@ -109,6 +109,8 @@ private:
     struct io_uring_sqe* GetSqe();
     void PrepareSqe(struct io_uring_sqe* sqe, bool isRead, void* buf, ui32 size,
                     ui64 offset, TUringOperation* op);
+    // Submit a NOP to wake the completion poller blocked in io_uring_wait_cqe.
+    void WakePoller();
 };
 
 } // namespace NKikimr::NPDisk

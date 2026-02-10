@@ -29,6 +29,7 @@ public:
         // to trigger the kernel to poll the block device for completions.
         // With SQPOLL, the kernel SQPOLL thread handles reaping internally.
         const bool needIoPollReap = Owner.Config.UseIOPoll && !Owner.Config.UseSQPoll;
+        const bool useIOPoll = Owner.Config.UseIOPoll;
 
         while (Owner.Running.load(std::memory_order_acquire)) {
             // For IOPOLL without SQPOLL, ask the kernel to reap polled
@@ -54,13 +55,28 @@ public:
 
             if (count > 0) {
                 io_uring_cq_advance(Owner.Ring, count);
+            } else if (useIOPoll) {
+                // IOPOLL mode (with or without SQPOLL): tight spin with a CPU
+                // pause hint.  The poller thread is dedicated, so burning one
+                // core gives the lowest possible completion latency.
+                __builtin_ia32_pause();
             } else {
-                // No completions available -- sleep briefly before retrying.
-                // We deliberately avoid io_uring_wait_cqe_timeout here because
-                // on kernels < 5.11 (lacking IORING_ENTER_EXT_ARG) it submits
-                // a timeout SQE internally, racing with SQ submissions from
-                // the main thread.
-                usleep(100); // 100 us
+                // Interrupt-driven mode: block in the kernel until a CQE
+                // arrives.  Zero CPU waste, zero latency penalty -- the thread
+                // wakes as soon as the device interrupt posts a CQE.
+                // On shutdown, Stop() submits a NOP to wake this call.
+                struct io_uring_cqe* waitCqe = nullptr;
+                int ret = io_uring_wait_cqe(Owner.Ring, &waitCqe);
+                if (ret == 0 && waitCqe) {
+                    auto* op = reinterpret_cast<TUringOperation*>(io_uring_cqe_get_data(waitCqe));
+                    if (op) {
+                        op->Result = waitCqe->res;
+                        if (op->OnComplete) {
+                            op->OnComplete(op, Owner.ActorSystem);
+                        }
+                    }
+                    io_uring_cq_advance(Owner.Ring, 1);
+                }
             }
         }
 
@@ -216,10 +232,28 @@ void TUringRouter::Flush() {
     io_uring_submit(Ring);
 }
 
+void TUringRouter::WakePoller() {
+    // Submit a NOP with null user_data to produce a CQE that unblocks the
+    // completion poller if it is waiting in io_uring_wait_cqe().
+    // The poller already handles null op (skips OnComplete), so this is safe.
+    struct io_uring_sqe* sqe = io_uring_get_sqe(Ring);
+    if (sqe) {
+        io_uring_prep_nop(sqe);
+        io_uring_sqe_set_data(sqe, nullptr);
+        io_uring_submit(Ring);
+    }
+}
+
 void TUringRouter::Stop() {
     bool expected = true;
     if (!Running.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
         return; // Already stopped
+    }
+
+    // In interrupt-driven mode (no IOPOLL), the poller may be blocked in
+    // io_uring_wait_cqe().  Submit a NOP to wake it so it can see Running==false.
+    if (!Config.UseIOPoll) {
+        WakePoller();
     }
 
     if (Poller) {
