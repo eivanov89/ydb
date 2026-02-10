@@ -47,8 +47,8 @@ int main(int argc, char **argv) {
     opts.AddLongOption("output-format", "wiki|human|json").DefaultValue("wiki");
     opts.AddLongOption("mon-port", "port for monitoring http page").DefaultValue("0");
     opts.AddLongOption("run-count", "number of times to run each test").DefaultValue("1");
-    opts.AddLongOption("inflight-from", "override InFlight starting value (PDisk/DDisk tests only)").DefaultValue("0");
-    opts.AddLongOption("inflight-to", "override InFlight ending value (PDisk/DDisk tests only)").DefaultValue("0");
+    opts.AddLongOption("inflight-from", "override InFlight starting value (PDisk/DDisk/UringRouter tests)").DefaultValue("0");
+    opts.AddLongOption("inflight-to", "override InFlight ending value (PDisk/DDisk/UringRouter tests)").DefaultValue("0");
     opts.AddLongOption("no-logo", "disable logo printing on start").NoArgument();
     opts.AddLongOption("disable-file-lock", "disable file locking before test").NoArgument().DefaultValue("0");
     TOptsParseResult res(&opts, argc, argv);
@@ -97,10 +97,6 @@ int main(int argc, char **argv) {
             Cerr << "Error: --inflight-from/--inflight-to are not supported for TrimTest" << Endl;
             return 1;
         }
-        if (protoTests.UringRouterTestListSize() > 0) {
-            Cerr << "Error: --inflight-from/--inflight-to are not supported for UringRouterTest" << Endl;
-            return 1;
-        }
         if (protoTests.HasDriveEstimatorTest()) {
             Cerr << "Error: --inflight-from/--inflight-to are not supported for DriveEstimatorTest" << Endl;
             return 1;
@@ -132,10 +128,21 @@ int main(int argc, char **argv) {
 
     for (ui32 i = 0; i < protoTests.UringRouterTestListSize(); ++i) {
         NDevicePerfTest::TUringRouterTest testProto = protoTests.GetUringRouterTestList(i);
-        for (ui32 run = 0; run < config.RunCount; ++run) {
-            THolder<NKikimr::TPerfTest> test(new NKikimr::TUringRouterTest(config, testProto));
-            test->SetPrinter(printer);
-            test->RunTest();
+        if (config.HasInFlightOverride()) {
+            for (ui32 inFlight = config.InFlightFrom; inFlight <= config.InFlightTo; inFlight *= 2) {
+                testProto.SetQueueDepth(inFlight);
+                for (ui32 run = 0; run < config.RunCount; ++run) {
+                    THolder<NKikimr::TPerfTest> test(new NKikimr::TUringRouterTest(config, testProto));
+                    test->SetPrinter(printer);
+                    test->RunTest();
+                }
+            }
+        } else {
+            for (ui32 run = 0; run < config.RunCount; ++run) {
+                THolder<NKikimr::TPerfTest> test(new NKikimr::TUringRouterTest(config, testProto));
+                test->SetPrinter(printer);
+                test->RunTest();
+            }
         }
     }
     printer->EndTest();
