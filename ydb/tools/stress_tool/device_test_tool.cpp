@@ -9,6 +9,7 @@
 #include "device_test_tool_driveestimator.h"
 #include "device_test_tool_pdisk_test.h"
 #include "device_test_tool_trim_test.h"
+#include "device_test_tool_uring_router_test.h"
 
 namespace NKikimr {
 namespace NPDisk {
@@ -66,6 +67,7 @@ int main(int argc, char **argv) {
     if (config.RunCount > 1) {
         ui32 totalTests = 0;
         totalTests += protoTests.AioTestListSize();
+        totalTests += protoTests.UringRouterTestListSize();
         totalTests += protoTests.TrimTestListSize();
         // For PDiskTest, count the inner PDiskTestList items
         for (ui32 i = 0; i < protoTests.PDiskTestListSize(); ++i) {
@@ -93,6 +95,10 @@ int main(int argc, char **argv) {
         }
         if (protoTests.TrimTestListSize() > 0) {
             Cerr << "Error: --inflight-from/--inflight-to are not supported for TrimTest" << Endl;
+            return 1;
+        }
+        if (protoTests.UringRouterTestListSize() > 0) {
+            Cerr << "Error: --inflight-from/--inflight-to are not supported for UringRouterTest" << Endl;
             return 1;
         }
         if (protoTests.HasDriveEstimatorTest()) {
@@ -123,6 +129,17 @@ int main(int argc, char **argv) {
         }
     }
     printer->EndTest();
+
+    for (ui32 i = 0; i < protoTests.UringRouterTestListSize(); ++i) {
+        NDevicePerfTest::TUringRouterTest testProto = protoTests.GetUringRouterTestList(i);
+        for (ui32 run = 0; run < config.RunCount; ++run) {
+            THolder<NKikimr::TPerfTest> test(new NKikimr::TUringRouterTest(config, testProto));
+            test->SetPrinter(printer);
+            test->RunTest();
+        }
+    }
+    printer->EndTest();
+
     for (ui32 i = 0; i < protoTests.TrimTestListSize(); ++i) {
         NDevicePerfTest::TTrimTest testProto = protoTests.GetTrimTestList(i);
         for (ui32 run = 0; run < config.RunCount; ++run) {
