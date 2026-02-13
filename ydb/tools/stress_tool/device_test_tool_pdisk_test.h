@@ -291,6 +291,7 @@ struct TPDiskTest : public TPerfTest {
         pDiskConfig->UseNoopScheduler = true;
         pDiskConfig->FeatureFlags.SetEnableSeparateSubmitThreadForPDisk(true);
         pDiskConfig->FeatureFlags.SetEnablePDiskDataEncryption(!Cfg.DisablePDiskDataEncryption);
+        pDiskConfig->FeatureFlags.SetEnablePDiskIoUring(true);
         if (Cfg.SectorMap) {
             pDiskConfig->SectorMap = Cfg.SectorMap;
         }

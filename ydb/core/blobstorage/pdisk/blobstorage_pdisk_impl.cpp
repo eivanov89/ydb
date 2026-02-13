@@ -45,7 +45,7 @@ TPDisk::TPDisk(std::shared_ptr<TPDiskCtx> pCtx, const TIntrusivePtr<TPDiskConfig
     , Keeper(Mon, cfg)
     , CostLimitNs(cfg->CostLimitNs)
     , PDiskThread(*this)
-    , BlockDevice(cfg->UseUringRouter
+    , BlockDevice(cfg->FeatureFlags.GetEnablePDiskIoUring()
                     ? CreateUringBlockDevice(cfg->GetDevicePath(), Mon, cfg->DeviceInFlight, this, cfg->ReadOnly)
                     : CreateRealBlockDevice(cfg->GetDevicePath(), Mon,
                         HPCyclesMs(ReorderingMs), DriveModel.SeekTimeNs(), cfg->DeviceInFlight,

@@ -2003,6 +2003,7 @@ public:
             return;
         }
 
+        completionAction->SetResult(EIoResult::Ok);
         completionAction->OperationIdx = flightIdx;
         completionAction->GetTime = HPNow();
 
