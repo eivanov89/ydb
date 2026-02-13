@@ -1250,6 +1250,27 @@ public:
         InitError("io error");
     }
 
+    void Handle(NPDisk::TEvDeviceIoCompletion::TPtr &ev) {
+        auto *msg = ev->Get();
+        TCompletionAction *action = msg->Action;
+        if (!action) {
+            return;
+        }
+        if (msg->IsError) {
+            TString errorReason = action->ErrorReason;
+            action->Release(TlsActivationContext->ExecutorThread.ActorSystem);
+            P_LOG(PRI_ERROR, BSP01, "Device I/O completion error", (Reason, errorReason));
+        } else {
+            if (action->CanHandleResult()) {
+                action->Exec(TlsActivationContext->ExecutorThread.ActorSystem);
+            } else {
+                TString errorReason = action->ErrorReason;
+                action->Release(TlsActivationContext->ExecutorThread.ActorSystem);
+                P_LOG(PRI_ERROR, BSP01, "Device I/O completion cannot handle result", (Reason, errorReason));
+            }
+        }
+    }
+
     void Handle(TEvBlobStorage::TEvAskWardenRestartPDiskResult::TPtr &ev) {
         bool restartAllowed = ev->Get()->RestartAllowed;
 
@@ -1520,6 +1541,7 @@ public:
             hFunc(NMon::TEvHttpInfo, InitHandle);
             cFunc(TEvents::TSystem::Wakeup, HandleWakeup);
             hFunc(NPDisk::TEvDeviceError, Handle);
+            hFunc(NPDisk::TEvDeviceIoCompletion, Handle);
             hFunc(TEvBlobStorage::TEvAskWardenRestartPDiskResult, Handle);
             hFunc(NPDisk::TEvFormatReencryptionFinish, InitHandle);
             hFunc(NPDisk::TEvShredPDisk, InitHandle);
@@ -1569,6 +1591,7 @@ public:
             hFunc(NMon::TEvHttpInfo, Handle);
             cFunc(TEvents::TSystem::Wakeup, HandleWakeup);
             hFunc(NPDisk::TEvDeviceError, Handle);
+            hFunc(NPDisk::TEvDeviceIoCompletion, Handle);
             hFunc(TEvBlobStorage::TEvAskWardenRestartPDiskResult, Handle);
 
             hFunc(TEvReadMetadata, Handle);
@@ -1609,6 +1632,7 @@ public:
             hFunc(NMon::TEvHttpInfo, Handle);
             cFunc(TEvents::TSystem::Wakeup, HandleWakeup);
             hFunc(NPDisk::TEvDeviceError, Handle);
+            hFunc(NPDisk::TEvDeviceIoCompletion, Handle);
             hFunc(TEvBlobStorage::TEvAskWardenRestartPDiskResult, Handle);
 
             hFunc(TEvReadMetadata, Handle);

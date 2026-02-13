@@ -840,6 +840,7 @@ struct TEvBlobStorage {
         EvChangeExpectedSlotCountResult,
         EvChunkReadRawResult,
         EvChunkWriteRawResult,
+        EvDeviceIoCompletion,
 
         // internal proxy interface
         EvUnusedLocal1 = EvPut + 10 * 512, // Not used.    /// 268 637 184

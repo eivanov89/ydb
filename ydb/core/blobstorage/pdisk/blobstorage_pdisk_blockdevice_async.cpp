@@ -2,6 +2,7 @@
 #include <ydb/library/pdisk_io/buffers.h>
 #include "blobstorage_pdisk_completion_impl.h"
 #include "blobstorage_pdisk_impl.h"
+#include "blobstorage_pdisk_internal_interface.h"
 #include "blobstorage_pdisk_log_cache.h"
 #include "blobstorage_pdisk_mon.h"
 #include "blobstorage_pdisk_util_atomicblockcounter.h"
@@ -16,6 +17,7 @@
 #include <ydb/library/yverify_stream/yverify_stream.h>
 #include <ydb/library/pdisk_io/aio.h>
 #include <ydb/library/pdisk_io/spdk_state.h>
+#include <ydb/library/pdisk_io/uring_router.h>
 #include <ydb/library/pdisk_io/wcache.h>
 
 #include <ydb/library/actors/core/log.h>
@@ -29,6 +31,9 @@
 #include <util/system/sanitizers.h>
 #include <util/system/spinlock.h>
 #include <util/system/thread.h>
+
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 
 namespace NKikimr {
 namespace NPDisk {
@@ -1511,6 +1516,643 @@ IBlockDevice* CreateRealBlockDeviceWithDefaults(const TString &path, TPDiskMon &
     IBlockDevice *device = CreateRealBlockDevice(path, mon, 0, 0, 4, flags, 8, 1, sectorMap, pdisk, readOnly);
     device->Initialize(std::make_shared<TPDiskCtx>(actorSystem));
     return device;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TUringBlockDevice -- Option B: direct TUringRouter submission, no submit/get/completion threads.
+// Completions arrive via TEvDeviceIoCompletion actor events.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+class TUringBlockDevice : public IBlockDevice {
+    ////////////////////////////////////////////////////////
+    // TUringOp -- bridge between TUringOperation and TCompletionAction
+    ////////////////////////////////////////////////////////
+    struct TUringOp : TUringOperation {
+        TCompletionAction *Action = nullptr;
+        IAsyncIoOperation::EType Type = IAsyncIoOperation::EType::PRead;
+        ui64 Size = 0;
+        ui64 Offset = 0;
+        ui64 FlightIdx = 0;
+        NHPTimer::STime SubmitTime = 0;
+        TUringBlockDevice *Device = nullptr;
+        bool ExecuteInline = false; // If true, call Exec() directly on completion poller thread (for sync ops)
+
+        static void OnCompleteStatic(TUringOperation *op, TActorSystem *actorSystem) noexcept {
+            auto *self = static_cast<TUringOp *>(op);
+            TUringBlockDevice &device = *self->Device;
+
+            NHPTimer::STime eventGotAtCycle = HPNow();
+            AtomicSet(device.Mon.LastDoneOperationTimestamp, eventGotAtCycle);
+
+            TCompletionAction *action = self->Action;
+            Y_DEBUG_ABORT_UNLESS(action);
+
+            // Fill completion action result
+            EIoResult ioResult = (self->Result >= 0) ? EIoResult::Ok : EIoResult::IOError;
+            action->SetResult(ioResult);
+            action->GetTime = eventGotAtCycle;
+            if (ioResult != EIoResult::Ok) {
+                action->SetErrorReason(TStringBuilder()
+                        << " type# " << self->Type
+                        << " offset# " << self->Offset
+                        << " size# " << self->Size
+                        << " Result# " << self->Result);
+                ++*device.Mon.DeviceIoErrors;
+            }
+
+            // Monitoring
+            if (self->Size > 0) {
+                double duration = HPMilliSecondsFloat(eventGotAtCycle - self->SubmitTime);
+                if (self->Type == IAsyncIoOperation::EType::PRead) {
+                    NSan::Unpoison(self->Iov.iov_base, self->Size);
+                    device.Mon.DeviceReadDuration.Increment(duration);
+                    (*device.Mon.DeviceInFlightBytesRead) -= self->Size;
+                    device.Mon.DeviceInFlightReads->Dec();
+                    (*device.Mon.DeviceBytesRead) += self->Size;
+                    device.Mon.DeviceReads->Inc();
+                } else {
+                    device.Mon.DeviceWriteDuration.Increment(duration);
+                    (*device.Mon.DeviceInFlightBytesWrite) -= self->Size;
+                    device.Mon.DeviceInFlightWrites->Dec();
+                    (*device.Mon.DeviceBytesWritten) += self->Size;
+                    device.Mon.DeviceWrites->Inc();
+                }
+                device.Mon.DeviceLandings->Inc();
+            }
+
+            device.QuitCounter.Decrement();
+            device.FlightControl.MarkComplete(self->FlightIdx);
+
+            // Handle flush ordering: if this op has a FlushAction, store it in WaitingNoops
+            if (action->FlushAction) {
+                ui64 flushIdx = action->FlushAction->OperationIdx;
+                device.WaitingNoops[flushIdx % MaxWaitingNoops].store(action->FlushAction,
+                        std::memory_order_release);
+                action->FlushAction = nullptr;
+            }
+
+            // Return the op to the pool
+            bool executeInline = self->ExecuteInline;
+            self->Action = nullptr;
+            device.OpPool.Push(self);
+
+            // Deliver the completion
+            bool isError = (ioResult != EIoResult::Ok);
+            if (executeInline) {
+                // Sync operations: execute directly on the completion poller thread
+                // (avoids deadlock when caller blocks waiting for completion)
+                if (action->CanHandleResult()) {
+                    action->Exec(actorSystem);
+                } else {
+                    action->Release(actorSystem);
+                }
+            } else if (actorSystem && device.PCtx) {
+                // Async operations: send event to PDisk actor
+                actorSystem->Send(device.PCtx->PDiskActor,
+                        new TEvDeviceIoCompletion(action, isError));
+            }
+
+            // Drain WaitingNoops up to FirstIncompleteIdx
+            ui64 firstIncomplete = device.FlightControl.FirstIncompleteIdx();
+            while (device.NextPossibleNoop < firstIncomplete) {
+                ui64 i = device.NextPossibleNoop % MaxWaitingNoops;
+                TCompletionAction *waiting = device.WaitingNoops[i].load(std::memory_order_acquire);
+                if (waiting && waiting->OperationIdx == device.NextPossibleNoop) {
+                    device.WaitingNoops[i].store(nullptr, std::memory_order_release);
+                    if (actorSystem && device.PCtx) {
+                        actorSystem->Send(device.PCtx->PDiskActor,
+                                new TEvDeviceIoCompletion(waiting, false));
+                    }
+                }
+                ++device.NextPossibleNoop;
+            }
+        }
+    };
+
+    ////////////////////////////////////////////////////////
+    // TTrimThread (simplified, uses ioctl directly)
+    // Uses a pointer-based queue: each trim request is represented
+    // by a TCompletionAction* with size/offset stored in OperationIdx/SubmitTime.
+    ////////////////////////////////////////////////////////
+    class TTrimThread : public TThread {
+        // We store pointers (TrimRequest*) in the queue so TCountedQueueOneOne is happy
+        struct TTrimRequest {
+            ui32 Size;
+            ui64 Offset;
+            TCompletionAction *Action;
+        };
+
+        TCountedQueueOneOne<TTrimRequest*, 4 << 10> TrimOps;
+        TUringBlockDevice &Device;
+
+    public:
+        TTrimThread(TUringBlockDevice &device)
+            : TThread(&ThreadProc, this)
+            , Device(device)
+        {}
+
+        static void *ThreadProc(void *_this) {
+            SetCurrentThreadName("PdTrim");
+            static_cast<TTrimThread *>(_this)->Exec();
+            return nullptr;
+        }
+
+        void Exec() {
+            while (true) {
+                TAtomicBase count = TrimOps.GetWaitingSize();
+                if (count > 0) {
+                    for (TAtomicBase idx = 0; idx < count; ++idx) {
+                        TTrimRequest *req = TrimOps.Pop();
+                        if (!req) {
+                            return; // Stop signal (nullptr pushed)
+                        }
+                        if (Device.IsTrimEnabled && Device.TrimFd.IsOpen()) {
+                            ui64 range[2] = {req->Offset, req->Size};
+                            errno = 0;
+                            if (ioctl(static_cast<FHANDLE>(Device.TrimFd), BLKDISCARD, &range) == -1) {
+                                int errorId = errno;
+                                if (errorId == EOPNOTSUPP || errorId == ENOTTY) {
+                                    Device.IsTrimEnabled = false;
+                                }
+                            }
+                        }
+                        TCompletionAction *action = req->Action;
+                        delete req;
+                        action->SetResult(EIoResult::Ok);
+                        if (Device.PCtx && Device.PCtx->ActorSystem) {
+                            Device.PCtx->ActorSystem->Send(Device.PCtx->PDiskActor,
+                                    new TEvDeviceIoCompletion(action, false));
+                        }
+                    }
+                } else {
+                    TrimOps.ProducedWaitI();
+                }
+            }
+        }
+
+        void Schedule(ui32 size, ui64 offset, TCompletionAction *action) {
+            auto *req = new TTrimRequest{size, offset, action};
+            TrimOps.Push(req);
+        }
+
+        void StopWork() {
+            TrimOps.Push(nullptr);
+        }
+    };
+
+    ////////////////////////////////////////////////////////
+    // Members
+    ////////////////////////////////////////////////////////
+    std::shared_ptr<TPDiskCtx> PCtx;
+    TPDiskMon &Mon;
+    TString Path;
+
+    std::unique_ptr<TUringRouter> Router;
+    TFlightControl FlightControl;
+    TPool<TUringOp, 1024> OpPool;
+    TAtomicBlockCounter QuitCounter;
+
+    // Flush ordering -- WaitingNoops is written from PDisk actor (FlushAsync) and
+    // read/drained from UringCmpl thread (OnCompleteStatic). We use atomics for safe access.
+    static constexpr ui64 MaxWaitingNoops = 256;
+    std::atomic<TCompletionAction *> WaitingNoops[MaxWaitingNoops] = {};
+    ui64 NextPossibleNoop = 0; // Only accessed from UringCmpl thread
+
+    THolder<TTrimThread> TrimThread;
+    TFileHandle MainFd; // Kept open for TUringRouter's lifetime
+    TFileHandle TrimFd; // Separate fd for trim ioctl
+
+    ui64 DeviceInFlight;
+    bool IsFileOpened = false;
+    bool IsInitialized = false;
+    bool IsTrimEnabled = true;
+    bool ReadOnly;
+
+    std::optional<TDriveData> DriveData;
+
+public:
+    TUringBlockDevice(const TString &path, TPDiskMon &mon, ui64 deviceInFlight,
+            TPDisk * /*pdisk*/, bool readOnly)
+        : Mon(mon)
+        , Path(path)
+        , FlightControl(CountTrailingZeroBits(FastClp2(deviceInFlight)))
+        , DeviceInFlight(FastClp2(deviceInFlight))
+        , ReadOnly(readOnly)
+    {}
+
+    ~TUringBlockDevice() override {
+        Stop();
+    }
+
+    void Initialize(std::shared_ptr<TPDiskCtx> pCtx) override {
+        PCtx = std::move(pCtx);
+        Y_VERIFY(PCtx);
+        FlightControl.Initialize(PCtx->PDiskLogPrefix);
+
+        // Open the file and get fd for TUringRouter
+        MainFd = TFileHandle(Path.c_str(), OpenExisting | RdWr | DirectAligned | Sync);
+        if (!MainFd.IsOpen()) {
+            IsFileOpened = false;
+            return;
+        }
+
+        int ret = MainFd.Flock(LOCK_EX | LOCK_NB);
+        if (ret != 0) {
+            IsFileOpened = false;
+            return;
+        }
+
+        IsFileOpened = true;
+
+        // Duplicate fd for trim operations
+        TrimFd = TFileHandle(MainFd.Duplicate());
+
+        // Create TUringRouter with the fd (TUringRouter does NOT own the fd)
+        TUringRouterConfig config;
+        config.QueueDepth = DeviceInFlight;
+        config.UseSQPoll = false;  // Start conservatively, SQPOLL needs CAP_SYS_ADMIN
+        config.UseIOPoll = false;  // IOPOLL needs polled block device
+        config.SqThreadIdleMs = 2000;
+
+        Router = std::make_unique<TUringRouter>(
+                static_cast<FHANDLE>(MainFd), PCtx->ActorSystem, config);
+
+        // Register file for reduced per-I/O overhead
+        Router->RegisterFile();
+
+        // Start the completion poller thread
+        Router->Start();
+
+        // Start trim thread
+        TrimThread = MakeHolder<TTrimThread>(*this);
+        TrimThread->Start();
+
+        IsInitialized = true;
+    }
+
+    bool IsGood() override {
+        return IsFileOpened && IsInitialized;
+    }
+
+    int GetLastErrno() override {
+        return errno;
+    }
+
+    ////////////////////////////////////////////////////////
+    // Synchronous interface
+    ////////////////////////////////////////////////////////
+    void PwriteSync(const void *data, ui64 size, ui64 offset, TReqId reqId,
+            NWilson::TTraceId *traceId) override {
+        TSignalEvent doneEvent;
+        PwriteAsyncImpl(data, size, offset, new TCompletionSignal(&doneEvent), reqId, traceId, /*executeInline=*/ true);
+        doneEvent.WaitI();
+    }
+
+    void PreadSync(void *data, ui32 size, ui64 offset, TReqId reqId,
+            NWilson::TTraceId *traceId) override {
+        TSignalEvent doneEvent;
+        PreadAsyncImpl(data, size, offset, new TCompletionSignal(&doneEvent), reqId, traceId, /*executeInline=*/ true);
+        doneEvent.WaitI();
+    }
+
+    void TrimSync(ui32 size, ui64 offset) override {
+        Y_VERIFY_S(!ReadOnly, PCtx->PDiskLogPrefix);
+        if (IsTrimEnabled && TrimFd.IsOpen()) {
+            ui64 range[2] = {offset, size};
+            errno = 0;
+            if (ioctl(static_cast<FHANDLE>(TrimFd), BLKDISCARD, &range) == -1) {
+                int errorId = errno;
+                if (errorId == EOPNOTSUPP || errorId == ENOTTY) {
+                    IsTrimEnabled = false;
+                }
+            }
+        }
+    }
+
+    ////////////////////////////////////////////////////////
+    // Asynchronous interface -- direct submission to TUringRouter
+    ////////////////////////////////////////////////////////
+    void PreadAsync(void *data, ui32 size, ui64 offset, TCompletionAction *completionAction,
+            TReqId reqId, NWilson::TTraceId *traceId) override {
+        PreadAsyncImpl(data, size, offset, completionAction, reqId, traceId, /*executeInline=*/ false);
+    }
+
+    void PwriteAsync(const void *data, ui64 size, ui64 offset, TCompletionAction *completionAction,
+            TReqId reqId, NWilson::TTraceId *traceId) override {
+        PwriteAsyncImpl(data, size, offset, completionAction, reqId, traceId, /*executeInline=*/ false);
+    }
+
+private:
+    void PreadAsyncImpl(void *data, ui32 size, ui64 offset, TCompletionAction *completionAction,
+            TReqId /*reqId*/, NWilson::TTraceId * /*traceId*/, bool executeInline) {
+        Y_VERIFY_S(completionAction, PCtx->PDiskLogPrefix);
+        if (!IsInitialized) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+        if (QuitCounter.IsBlocked()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        if (data && size) {
+            Y_VERIFY_S(intptr_t(data) % 512 == 0, PCtx->PDiskLogPrefix);
+        }
+
+        if (!QuitCounter.Increment()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        ui64 flightIdx = FlightControl.TrySchedule();
+        if (flightIdx == 0) {
+            QuitCounter.Decrement();
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        completionAction->OperationIdx = flightIdx;
+        if (completionAction->FlushAction) {
+            completionAction->FlushAction->OperationIdx = flightIdx;
+        }
+        completionAction->SubmitTime = HPNow();
+        if (completionAction->FlushAction) {
+            completionAction->FlushAction->SubmitTime = completionAction->SubmitTime;
+        }
+
+        // Monitoring
+        (*Mon.DeviceInFlightBytesRead) += size;
+        Mon.DeviceInFlightReads->Inc();
+        Mon.DeviceTakeoffs->Inc();
+
+        TUringOp *op = static_cast<TUringOp *>(OpPool.Pop());
+        op->Action = completionAction;
+        op->Type = IAsyncIoOperation::EType::PRead;
+        op->Size = size;
+        op->Offset = offset;
+        op->FlightIdx = flightIdx;
+        op->SubmitTime = completionAction->SubmitTime;
+        op->Device = this;
+        op->OnComplete = TUringOp::OnCompleteStatic;
+        op->ExecuteInline = executeInline;
+
+        bool ok = Router->Read(data, size, offset, op);
+        if (!ok) {
+            // SQ ring full
+            OpPool.Push(op);
+            (*Mon.DeviceInFlightBytesRead) -= size;
+            Mon.DeviceInFlightReads->Dec();
+            QuitCounter.Decrement();
+            FlightControl.MarkComplete(flightIdx);
+            completionAction->SetResult(EIoResult::TryAgain);
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+        Router->Flush();
+    }
+
+    void PwriteAsyncImpl(const void *data, ui64 size, ui64 offset, TCompletionAction *completionAction,
+            TReqId /*reqId*/, NWilson::TTraceId * /*traceId*/, bool executeInline) {
+        Y_VERIFY_S(completionAction, PCtx->PDiskLogPrefix);
+        Y_VERIFY_S(!ReadOnly, PCtx->PDiskLogPrefix);
+        if (!IsInitialized) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+        if (QuitCounter.IsBlocked()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        if (data && size) {
+            Y_VERIFY_S(intptr_t(data) % 512 == 0, PCtx->PDiskLogPrefix);
+        }
+
+        if (!QuitCounter.Increment()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        ui64 flightIdx = FlightControl.TrySchedule();
+        if (flightIdx == 0) {
+            QuitCounter.Decrement();
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        completionAction->OperationIdx = flightIdx;
+        if (completionAction->FlushAction) {
+            completionAction->FlushAction->OperationIdx = flightIdx;
+        }
+        completionAction->SubmitTime = HPNow();
+        if (completionAction->FlushAction) {
+            completionAction->FlushAction->SubmitTime = completionAction->SubmitTime;
+        }
+
+        // Monitoring
+        (*Mon.DeviceInFlightBytesWrite) += size;
+        Mon.DeviceInFlightWrites->Inc();
+        Mon.DeviceTakeoffs->Inc();
+
+        TUringOp *op = static_cast<TUringOp *>(OpPool.Pop());
+        op->Action = completionAction;
+        op->Type = IAsyncIoOperation::EType::PWrite;
+        op->Size = size;
+        op->Offset = offset;
+        op->FlightIdx = flightIdx;
+        op->SubmitTime = completionAction->SubmitTime;
+        op->Device = this;
+        op->OnComplete = TUringOp::OnCompleteStatic;
+        op->ExecuteInline = executeInline;
+
+        bool ok = Router->Write(data, size, offset, op);
+        if (!ok) {
+            OpPool.Push(op);
+            (*Mon.DeviceInFlightBytesWrite) -= size;
+            Mon.DeviceInFlightWrites->Dec();
+            QuitCounter.Decrement();
+            FlightControl.MarkComplete(flightIdx);
+            completionAction->SetResult(EIoResult::TryAgain);
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+        Router->Flush();
+    }
+
+public:
+
+    void FlushAsync(TCompletionAction *completionAction, TReqId /*reqId*/) override {
+        Y_VERIFY_S(completionAction, PCtx->PDiskLogPrefix);
+        Y_VERIFY_S(!ReadOnly, PCtx->PDiskLogPrefix);
+        if (!IsInitialized || QuitCounter.IsBlocked()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+
+        // Flush is a software barrier, not a real I/O.
+        // Assign a FlightControl index and store the action in WaitingNoops.
+        // It will fire once all preceding operations complete.
+        ui64 flightIdx = FlightControl.TrySchedule();
+        if (flightIdx == 0) {
+            // Cannot schedule -- deliver immediately (best effort)
+            completionAction->SetResult(EIoResult::Ok);
+            if (PCtx && PCtx->ActorSystem) {
+                PCtx->ActorSystem->Send(PCtx->PDiskActor,
+                        new TEvDeviceIoCompletion(completionAction, false));
+            }
+            return;
+        }
+
+        completionAction->OperationIdx = flightIdx;
+        completionAction->GetTime = HPNow();
+
+        // Immediately mark complete in FlightControl since there's no actual I/O
+        FlightControl.MarkComplete(flightIdx);
+
+        // Store in WaitingNoops for ordering (drained by OnCompleteStatic on UringCmpl thread,
+        // or drained below if all prior ops already finished)
+        WaitingNoops[flightIdx % MaxWaitingNoops].store(completionAction, std::memory_order_release);
+
+        // The UringCmpl thread will drain WaitingNoops on the next completion event
+        // (via OnCompleteStatic). We don't drain from the PDisk actor thread to avoid
+        // data races on NextPossibleNoop.
+    }
+
+    void NoopAsync(TCompletionAction *completionAction, TReqId /*reqId*/) override {
+        Y_VERIFY_S(completionAction, PCtx->PDiskLogPrefix);
+        if (!IsInitialized || QuitCounter.IsBlocked()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+        // No completion threads -- execute directly on the calling thread
+        completionAction->SetResult(EIoResult::Ok);
+        completionAction->Exec(PCtx->ActorSystem);
+    }
+
+    void NoopAsyncHackForLogReader(TCompletionAction *completionAction, TReqId /*reqId*/) override {
+        Y_VERIFY_S(completionAction, PCtx->PDiskLogPrefix);
+        if (!IsInitialized || QuitCounter.IsBlocked()) {
+            completionAction->Release(PCtx->ActorSystem);
+            return;
+        }
+        completionAction->SetResult(EIoResult::Ok);
+        completionAction->Exec(PCtx->ActorSystem);
+    }
+
+    void CachedPreadAsync(void *data, ui32 size, ui64 offset, TCompletionAction *completionAction,
+            TReqId reqId, NWilson::TTraceId *traceId) override {
+        // No read cache in TUringBlockDevice -- fall through to regular read
+        PreadAsync(data, size, offset, completionAction, reqId, traceId);
+    }
+
+    void ClearCache() override {
+        // No cache
+    }
+
+    void EraseCacheRange(ui64 /*begin*/, ui64 /*end*/) override {
+        // No cache
+    }
+
+    void TrimAsync(ui32 size, ui64 offset, TCompletionAction *completionAction, TReqId /*reqId*/) override {
+        Y_VERIFY_S(completionAction, PCtx->PDiskLogPrefix);
+        if (!IsInitialized || QuitCounter.IsBlocked()) {
+            return;
+        }
+        TrimThread->Schedule(size, offset, completionAction);
+    }
+
+    bool GetIsTrimEnabled() override {
+        return IsTrimEnabled;
+    }
+
+    TDriveData GetDriveData() override {
+        if (!DriveData) {
+            TStringStream details;
+            if (DriveData = ::NKikimr::NPDisk::GetDriveData(Path, &details)) {
+                P_LOG(PRI_NOTICE, BPD01, "Gathered DriveData", (Data, DriveData->ToString(false)),
+                    (Details, details.Str()));
+            } else {
+                P_LOG(PRI_WARN, BPD01, "Error on gathering DriveData", (Details, details.Str()));
+            }
+        }
+        return DriveData.value_or(TDriveData());
+    }
+
+    ui32 GetPDiskId() override {
+        return PCtx ? PCtx->PDiskId : 0;
+    }
+
+    void SetWriteCache(bool isEnable) override {
+        if (MainFd.IsOpen()) {
+            TStringStream details;
+            EWriteCacheResult res = NKikimr::NPDisk::SetWriteCache(MainFd, Path, isEnable, &details);
+            if (res != WriteCacheResultOk) {
+                P_LOG(PRI_WARN, BPD01, "Error on setting write cache", (Details, details.Str()));
+            }
+        }
+    }
+
+    TFileHandle DuplicateFd() override {
+        if (MainFd.IsOpen()) {
+            return TFileHandle(MainFd.Duplicate());
+        }
+        return {};
+    }
+
+    TString DebugInfo() override {
+        TStringStream str;
+        str << " Path# " << Path.Quote();
+        str << " IsFileOpened# " << IsFileOpened;
+        str << " IsInitialized# " << IsInitialized;
+        str << " Backend# UringRouter";
+        return str.Str();
+    }
+
+    void Stop() override {
+        TAtomicBlockCounter::TResult res;
+        QuitCounter.BlockA(res);
+        if (res.PrevA ^ res.A) { // Toggled
+            if (IsInitialized) {
+                // Stop trim thread
+                if (TrimThread) {
+                    TrimThread->StopWork();
+                    TrimThread->Join();
+                }
+
+                // Stop TUringRouter (stops completion poller, tears down io_uring)
+                if (Router) {
+                    Router->Stop();
+                }
+
+                // Release any pending WaitingNoops
+                for (ui64 idx = 0; idx < MaxWaitingNoops; ++idx) {
+                    TCompletionAction *action = WaitingNoops[idx].load(std::memory_order_acquire);
+                    if (action) {
+                        action->Release(PCtx ? PCtx->ActorSystem : nullptr);
+                        WaitingNoops[idx].store(nullptr, std::memory_order_release);
+                    }
+                }
+
+                IsInitialized = false;
+            }
+
+            if (IsFileOpened) {
+                if (TrimFd.IsOpen()) {
+                    TrimFd.Close();
+                }
+                if (MainFd.IsOpen()) {
+                    MainFd.Flock(LOCK_UN);
+                    MainFd.Close();
+                }
+                IsFileOpened = false;
+            }
+        }
+    }
+};
+
+IBlockDevice* CreateUringBlockDevice(const TString &path, TPDiskMon &mon,
+        ui64 deviceInFlight, TPDisk * const pdisk, bool readOnly) {
+    return new TUringBlockDevice(path, mon, deviceInFlight, pdisk, readOnly);
 }
 
 } // NPDisk

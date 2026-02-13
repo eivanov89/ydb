@@ -87,7 +87,7 @@ namespace NKikimr::NDDisk {
             TRcBuf DataHolder;                  // keeps aligned buffer alive until completion
             std::atomic<ui32>* InFlightCount = nullptr; // shared with DDisk actor
 
-            static void OnDirectIoComplete(NPDisk::TUringOperation* baseOp, NActors::TActorSystem* actorSystem);
+            static void OnDirectIoComplete(NPDisk::TUringOperation* baseOp, NActors::TActorSystem* actorSystem) noexcept;
         };
 
         std::unique_ptr<NPDisk::TUringRouter> UringRouter;

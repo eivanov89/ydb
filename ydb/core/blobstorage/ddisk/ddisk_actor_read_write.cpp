@@ -55,6 +55,12 @@ namespace NKikimr::NDDisk {
 
 #if defined(__linux__)
         if (UringRouter) {
+            auto span = std::move(NWilson::TSpan(TWilson::DDiskTopLevel, std::move(ev->TraceId), "DDisk.Write",
+                    NWilson::EFlags::NONE, TActivationContext::ActorSystem())
+                .Attribute("tablet_id", static_cast<long>(creds.TabletId))
+                .Attribute("vchunk_index", static_cast<long>(selector.VChunkIndex))
+                .Attribute("offset_in_bytes", selector.OffsetInBytes)
+                .Attribute("size", selector.Size));
             if (InFlightCount.load(std::memory_order_relaxed) >= MaxInFlight) {
                 span.End();
                 Counters.Interface.Write.Reply(false);
@@ -211,7 +217,7 @@ namespace NKikimr::NDDisk {
 #if defined(__linux__)
 
     void TDDiskActor::TDirectIoOp::OnDirectIoComplete(NPDisk::TUringOperation* baseOp,
-            NActors::TActorSystem* actorSystem) {
+            NActors::TActorSystem* actorSystem) noexcept {
         auto* op = static_cast<TDirectIoOp*>(baseOp);
         std::unique_ptr<TDirectIoOp> guard(op); // ensures delete at scope exit
 

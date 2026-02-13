@@ -203,6 +203,27 @@ struct TEvDeviceError : public TEventLocal<TEvDeviceError, TEvBlobStorage::EvDev
     {}
 };
 
+////////////////////////////////////////////////////////////////////////////
+// This event is sent from TUringBlockDevice's completion poller thread
+// to the PDisk actor when an I/O operation completes.
+////////////////////////////////////////////////////////////////////////////
+
+struct TEvDeviceIoCompletion : public TEventLocal<TEvDeviceIoCompletion, TEvBlobStorage::EvDeviceIoCompletion> {
+    TCompletionAction *Action;
+    bool IsError;
+
+    TEvDeviceIoCompletion(TCompletionAction *action, bool isError)
+        : Action(action)
+        , IsError(isError)
+    {}
+
+    TString ToString() const {
+        TStringStream str;
+        str << "{EvDeviceIoCompletion IsError# " << IsError << "}";
+        return str.Str();
+    }
+};
+
 struct TEvFormatReencryptionFinish : public TEventLocal<TEvFormatReencryptionFinish, TEvBlobStorage::EvFormatReencryptionFinish> {
     bool Success;
     TString ErrorReason;

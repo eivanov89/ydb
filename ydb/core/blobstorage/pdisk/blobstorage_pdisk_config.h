@@ -142,6 +142,7 @@ struct TPDiskConfig : public TThrRefBase {
     ui32 BufferPoolBufferCount;
     ui32 MaxQueuedCompletionActions;
     bool UseSpdkNvmeDriver;
+    bool UseUringRouter = false; // Use TUringRouter-based IBlockDevice (Option B: no submit/completion threads)
 
     // Next 2 are either user-defined or inferred from drive size
     ui32 ExpectedSlotCount = 0;

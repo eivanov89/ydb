@@ -77,5 +77,10 @@ IBlockDevice* CreateRealBlockDevice(const TString &path, TPDiskMon &mon,
 IBlockDevice* CreateRealBlockDeviceWithDefaults(const TString &path, TPDiskMon &mon, TDeviceMode::TFlags flags,
         TIntrusivePtr<TSectorMap> sectorMap, TActorSystem *actorSystem, TPDisk * const pdisk = nullptr, bool readOnly = false);
 
+// Creates an IBlockDevice backed by TUringRouter (Option B: direct submission from PDisk actor,
+// no submit/get/completion threads, completions sent back as TEvDeviceIoCompletion actor events).
+IBlockDevice* CreateUringBlockDevice(const TString &path, TPDiskMon &mon,
+        ui64 deviceInFlight, TPDisk * const pdisk = nullptr, bool readOnly = false);
+
 } // NPDisk
 } // NKikimr
