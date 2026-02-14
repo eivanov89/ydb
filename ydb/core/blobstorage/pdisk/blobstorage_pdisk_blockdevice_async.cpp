@@ -1770,8 +1770,8 @@ public:
         // Create TUringRouter with the fd (TUringRouter does NOT own the fd)
         TUringRouterConfig config;
         config.QueueDepth = DeviceInFlight;
-        config.UseSQPoll = false;  // Start conservatively, SQPOLL needs CAP_SYS_ADMIN
-        config.UseIOPoll = false;  // IOPOLL needs polled block device
+        config.UseSQPoll = true;   // Kernel thread polls SQ ring -- eliminates io_uring_enter() per submit
+        config.UseIOPoll = true;   // Polled completions -- eliminates interrupt latency on NVMe
         config.SqThreadIdleMs = 2000;
 
         Router = std::make_unique<TUringRouter>(

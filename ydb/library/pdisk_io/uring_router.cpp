@@ -33,16 +33,22 @@ public:
     void* ThreadProc() override {
         SetCurrentThreadName("UringCmpl");
 
-        // With IOPOLL (and no SQPOLL), the kernel does not post CQEs via
-        // interrupts.  We must call io_uring_enter(IORING_ENTER_GETEVENTS)
-        // to trigger the kernel to poll the block device for completions.
-        // With SQPOLL, the kernel SQPOLL thread handles reaping internally.
-        const bool needIoPollReap = Owner.Config.UseIOPoll && !Owner.Config.UseSQPoll;
+        // With IOPOLL the kernel does not post CQEs via interrupts.
+        // We must call io_uring_enter(IORING_ENTER_GETEVENTS) to trigger
+        // the kernel to poll the block device for completions.
+        //
+        // Even when SQPOLL is also enabled, we still call io_uring_enter()
+        // ourselves: on kernel 5.4.x the SQPOLL thread does not reliably
+        // reap IOPOLL completions, causing a hang.  The call is non-blocking
+        // (min_complete=0) and serialises with the SQPOLL thread via the
+        // kernel uring_lock, so it is safe and at worst redundant on newer
+        // kernels where SQPOLL already handles reaping.
+        const bool needIoPollReap = Owner.Config.UseIOPoll;
         const bool useIOPoll = Owner.Config.UseIOPoll;
 
         while (!Owner.IsStopping.load(std::memory_order_acquire)) {
-            // For IOPOLL without SQPOLL, ask the kernel to reap polled
-            // completions before we peek the CQ ring.
+            // Ask the kernel to reap polled completions before we peek
+            // the CQ ring.
             if (needIoPollReap) {
                 // note, it's not blocking
                 io_uring_enter(Owner.Ring->ring_fd, 0, 0, IORING_ENTER_GETEVENTS, nullptr);
