@@ -476,6 +476,7 @@ class TAsyncIoContextLiburing : public IAsyncIoContext {
     TPool<TAsyncIoOperationLiburing, 1024> Pool;
     THolder<TFileHandle> File;
     int LastErrno = 0;
+    ui32 PendingSubmissions = 0;
 
     TPDiskDebugInfo PDiskInfo;
     struct io_uring Ring;
@@ -514,11 +515,15 @@ public:
         return EIoResult::Ok;
     }
 
-    i64 GetEvents(ui64 numEvents, ui64, TAsyncIoOperationResult *events, TDuration timeout) override {
-        struct io_uring_cqe *cqes = nullptr;
+    i64 GetEvents(ui64 minEvents, ui64 maxEvents, TAsyncIoOperationResult *events, TDuration timeout) override {
+        if (maxEvents == 0) {
+            return 0;
+        }
+
+        struct io_uring_cqe *waitCqe = nullptr;
         struct __kernel_timespec ts = { (time_t)timeout.Seconds(), timeout.NanoSecondsOfSecond() };
 
-        int ret = io_uring_wait_cqes(&Ring, &cqes, numEvents, &ts, nullptr);
+        int ret = io_uring_wait_cqes(&Ring, &waitCqe, minEvents, &ts, nullptr);
         if (ret < 0) {
             if (-ret == ETIME) {
                 return 0;
@@ -526,15 +531,22 @@ public:
             return -static_cast<i64>(RetErrnoToContextError(ret, "io_uring_wait_cqes"));
         }
 
-        for (auto i = 0u; i < numEvents; ++i) {
-            auto *op = reinterpret_cast<TAsyncIoOperationLiburing*>(io_uring_cqe_get_data(&cqes[i]));
-            events[i].Operation = op;
-            events[i].Result = RetErrnoToContextError(cqes[i].res, "cqes[]->res");
-            events[i].Operation->ExecCallback(&events[i]);
+        unsigned head = 0;
+        ui64 count = 0;
+        struct io_uring_cqe *cqe = nullptr;
+        io_uring_for_each_cqe(&Ring, head, cqe) {
+            auto *op = reinterpret_cast<TAsyncIoOperationLiburing*>(io_uring_cqe_get_data(cqe));
+            events[count].Operation = op;
+            events[count].Result = RetErrnoToContextError(cqe->res, "cqes[]->res");
+            events[count].Operation->ExecCallback(&events[count]);
+            ++count;
+            if (count == maxEvents) {
+                break;
+            }
         }
 
-        io_uring_cq_advance(&Ring, numEvents);
-        return numEvents;
+        io_uring_cq_advance(&Ring, count);
+        return count;
     }
 
     EIoResult RetErrnoToContextError(i64 ret, const char *info) {
@@ -699,11 +711,24 @@ public:
         }
 
         io_uring_sqe_set_data(sqe, op);
-        int ret = io_uring_submit(&Ring);
-        if (ret < 0) {
-            LastErrno = -ret;
+        ++PendingSubmissions;
+        return EIoResult::Ok;
+    }
+
+    EIoResult Flush() override {
+        while (PendingSubmissions > 0) {
+            int ret = io_uring_submit(&Ring);
+            if (ret < 0) {
+                LastErrno = -ret;
+                return RetErrnoToContextError(ret, "io_uring_submit");
+            }
+            if (ret == 0) {
+                return EIoResult::TryAgain;
+            }
+            Y_ABORT_UNLESS(static_cast<ui32>(ret) <= PendingSubmissions);
+            PendingSubmissions -= ret;
         }
-        return RetErrnoToContextError(ret, "io_uring_submit");
+        return EIoResult::Ok;
     }
 
     void SetActorSystem(TActorSystem *actorSystem) override {
@@ -731,8 +756,11 @@ public:
     CreateAsyncIoContextReal
 */
 std::unique_ptr<IAsyncIoContext> CreateAsyncIoContextReal(const TString &path, ui32 pDiskId, TDeviceMode::TFlags flags) {
-    // TODO: choose TAsyncIoContextLibaio or TAsyncIoContextLiburing here
+#if defined(_musl_)
     return std::make_unique<TAsyncIoContextLibaio>(path, pDiskId, flags);
+#else
+    return std::make_unique<TAsyncIoContextLiburing>(path, pDiskId, flags);
+#endif
 }
 
 } // NPDisk

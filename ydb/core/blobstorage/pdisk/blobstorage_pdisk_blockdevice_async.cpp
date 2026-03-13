@@ -279,6 +279,8 @@ class TRealBlockDevice : public IBlockDevice {
     // TSubmitThread
     ////////////////////////////////////////////////////////
     class TSubmitThread : public TSubmitThreadBase {
+        static constexpr ui32 FlushBatchSize = 8;
+
     public:
         TSubmitThread(TRealBlockDevice &device)
             : TSubmitThreadBase(device, &ThreadProc, this)
@@ -297,7 +299,28 @@ class TRealBlockDevice : public IBlockDevice {
             Device.IdleCounter.Decrement();
         }
 
-        void Submit(IAsyncIoOperation *op) {
+        bool FlushPending(ui32& pendingForFlush) {
+            if (pendingForFlush == 0) {
+                return true;
+            }
+
+            EIoResult ret = EIoResult::TryAgain;
+            while (ret == EIoResult::TryAgain) {
+                ret = Device.IoContext->Flush();
+                if (ret == EIoResult::Ok) {
+                    pendingForFlush = 0;
+                    return true;
+                }
+                if (Device.QuitCounter.IsBlocked()) {
+                    return false;
+                }
+            }
+
+            Device.BecomeErrorState(TStringBuilder() << " Flush error, reason# " << ret);
+            return false;
+        }
+
+        bool Submit(IAsyncIoOperation *op) {
             TCompletionAction *action = static_cast<TCompletionAction*>(op->GetCookie());
             const ui64 opSize = op->GetSize();
 
@@ -305,7 +328,7 @@ class TRealBlockDevice : public IBlockDevice {
                 Device.FreeOperation(op);
                 TGuard<TMutex> guard(SubmitMtx);
                 SubmitCondVar.Signal();
-                return;
+                return false;
             }
 
             double blockedMs = 0;
@@ -333,20 +356,22 @@ class TRealBlockDevice : public IBlockDevice {
                 ret = Device.IoContext->Submit(op, Device.SharedCallback.Get());
 
                 if (ret == EIoResult::Ok) {
-                    return;
+                    return true;
                 }
                 if (Device.QuitCounter.IsBlocked()) {
                     ReleaseOp(op);
-                    return;
+                    return false;
                 }
             }
             // IoError happend
             ReleaseOp(op);
             Device.BecomeErrorState(TStringBuilder() << " Submit error, reason# " << ret);
+            return false;
         }
 
         void Exec() {
             auto prevCycleEnd = HPNow();
+            ui32 pendingForFlush = 0;
             while(!SubmitQuitCounter.IsBlocked() || SubmitQuitCounter.Get()) {
                 TAtomicBase ops = OperationsToBeSubmit.GetWaitingSize();
                 if (ops > 0) {
@@ -355,14 +380,21 @@ class TRealBlockDevice : public IBlockDevice {
                         SubmitQuitCounter.Decrement();
                         if (op) {
                             ui64 size = op->GetSize(); // op may be deleted after submit
-                            Submit(op);
+                            if (Submit(op)) {
+                                ++pendingForFlush;
+                                if (pendingForFlush >= FlushBatchSize) {
+                                    FlushPending(pendingForFlush);
+                                }
+                            }
                             TGuard<TMutex> guard(SubmitMtx);
                             if (AtomicSub(SubmitInFlightBytes, size) <= SubmitInFlightBytesMax) {
                                 SubmitCondVar.Signal();
                             }
                         }
                     }
+                    FlushPending(pendingForFlush);
                 } else {
+                    FlushPending(pendingForFlush);
                     *Device.Mon.SubmitThreadCPU = ThreadCPUTime();
                     OperationsToBeSubmit.ProducedWaitI();
                 }
@@ -374,6 +406,7 @@ class TRealBlockDevice : public IBlockDevice {
                 }
                 prevCycleEnd = cycleEnd;
             }
+            FlushPending(pendingForFlush);
             Y_VERIFY_S(OperationsToBeSubmit.GetWaitingSize() == 0, PCtx->PDiskLogPrefix);
         }
     };
@@ -582,6 +615,7 @@ class TRealBlockDevice : public IBlockDevice {
     // TSubmitGetThread
     ////////////////////////////////////////////////////////
     class TSubmitGetThread : public TSubmitThreadBase {
+        static constexpr ui32 FlushBatchSize = 8;
         NHPTimer::STime OpScheduleFailedTime = 0;
 
     public:
@@ -607,7 +641,29 @@ class TRealBlockDevice : public IBlockDevice {
             Device.IdleCounter.Decrement();
         }
 
-        bool Submit(IAsyncIoOperation *op, i64 *inFlight) {
+        bool FlushPending(ui32& pendingForFlush) {
+            if (pendingForFlush == 0) {
+                return true;
+            }
+
+            EIoResult ret = EIoResult::TryAgain;
+            while (ret == EIoResult::TryAgain) {
+                ret = Device.IoContext->Flush();
+                if (ret == EIoResult::Ok) {
+                    pendingForFlush = 0;
+                    return true;
+                }
+                if (Device.QuitCounter.IsBlocked()) {
+                    return false;
+                }
+            }
+
+            Device.BecomeErrorState(TStringBuilder() << " Flush error, reason# " << ret);
+            return false;
+        }
+
+        bool Submit(IAsyncIoOperation *op, i64 *inFlight, bool *submittedToDevice) {
+            *submittedToDevice = false;
             TCompletionAction *action = static_cast<TCompletionAction*>(op->GetCookie());
             const ui64 opSize = op->GetSize();
 
@@ -659,6 +715,7 @@ class TRealBlockDevice : public IBlockDevice {
                 }
                 ret = Device.IoContext->Submit(op, Device.SharedCallback.Get());
                 if (ret == EIoResult::Ok) {
+                    *submittedToDevice = true;
                     return true;
                 }
                 if (Device.QuitCounter.IsBlocked()) {
@@ -676,6 +733,7 @@ class TRealBlockDevice : public IBlockDevice {
         void Exec() {
             i64 inFlight = 0;
             bool isExiting = false;
+            ui32 pendingForFlush = 0;
 
             TAsyncIoOperationResult events[MaxEvents];
 
@@ -691,15 +749,25 @@ class TRealBlockDevice : public IBlockDevice {
                                 OperationsToBeSubmit.Pop();
                                 SubmitQuitCounter.Decrement();
                                 Device.FreeOperation(op);
-                            } else if (Submit(op, &inFlight)) {
-                                OperationsToBeSubmit.Pop();
-                                SubmitQuitCounter.Decrement();
-                                ++inFlight;
-                                TGuard<TMutex> guard(SubmitMtx);
-                                AtomicSub(SubmitInFlightBytes, opSize);
-                                SubmitCondVar.Signal();
                             } else {
-                                break;
+                                bool submittedToDevice = false;
+                                if (Submit(op, &inFlight, &submittedToDevice)) {
+                                    OperationsToBeSubmit.Pop();
+                                    SubmitQuitCounter.Decrement();
+                                    ++inFlight;
+                                    TGuard<TMutex> guard(SubmitMtx);
+                                    AtomicSub(SubmitInFlightBytes, opSize);
+                                    SubmitCondVar.Signal();
+
+                                    if (submittedToDevice) {
+                                        ++pendingForFlush;
+                                        if (pendingForFlush >= FlushBatchSize) {
+                                            FlushPending(pendingForFlush);
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
                         } else {
                             OperationsToBeSubmit.Pop();
@@ -707,7 +775,9 @@ class TRealBlockDevice : public IBlockDevice {
                             isExiting = true;
                         }
                     }
+                    FlushPending(pendingForFlush);
                 } else if (inFlight == 0) {
+                    FlushPending(pendingForFlush);
                     if (isExiting) {
                         break;
                     } else {
@@ -728,6 +798,7 @@ class TRealBlockDevice : public IBlockDevice {
                 } while (inFlight == (i64)Device.DeviceInFlight || isExiting && inFlight > 0);
             }
 
+            FlushPending(pendingForFlush);
             Y_VERIFY_S(OperationsToBeSubmit.GetWaitingSize() == 0, PCtx->PDiskLogPrefix);
         }
     };

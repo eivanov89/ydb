@@ -309,6 +309,14 @@ public:
                 }
             }
             Y_VERIFY_S(res == NPDisk::EIoResult::Ok, "Error in IoContext->Submit, error# " << res);
+            NPDisk::EIoResult flushRes = IoContext->Flush();
+            while (flushRes == NPDisk::EIoResult::TryAgain) {
+                flushRes = IoContext->Flush();
+                if (HPSecondsFloat(HPNow() - submitStartTime) > 60.0) {
+                    Y_ABORT("Device is not working, could not flush requests in 60 seconds");
+                }
+            }
+            Y_VERIFY_S(flushRes == NPDisk::EIoResult::Ok, "Error in IoContext->Flush, error# " << flushRes);
             AtomicIncrement(CurrentInFlight);
         }
     }

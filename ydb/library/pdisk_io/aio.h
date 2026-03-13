@@ -129,6 +129,9 @@ public:
     virtual EIoResult Setup(ui64 maxevents, bool doLock) = 0;
     virtual void InitializeMonitoring(TPDiskMon &mon) = 0;
     virtual EIoResult Submit(IAsyncIoOperation *op, ICallback *callback) = 0;
+    virtual EIoResult Flush() {
+        return EIoResult::Ok;
+    }
     virtual void SetActorSystem(TActorSystem *actorSystem) = 0;
     virtual int GetLastErrno() = 0;
     virtual TString GetPDiskInfo() = 0;
