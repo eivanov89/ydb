@@ -78,6 +78,8 @@ class TCompletionChunkWrite : public TCompletionAction {
     NWilson::TSpan Span;
 
 public:
+    // Keeps TEvChunkWrite payload storage alive until async completion.
+    // Tailroom fast path relies on this ownership for direct PwriteAsync buffers.
     TEvChunkWrite::TPartsPtr Parts;
     std::optional<TAlignedData> Buffer;
 

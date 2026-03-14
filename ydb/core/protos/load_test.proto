@@ -139,6 +139,7 @@ message TEvLoadTestRequest {
         optional bool Reuse = 12 [default = false];
         optional bool IsWardenlessTest = 13 [default = false];
         optional uint32 DelayBeforeMeasurementsSeconds = 14 [default = 15];
+        optional bool UseChunkWriteTailroom = 15 [default = true];
     }
     message TDDiskWriteLoad {
         // In a most simple case there is a single TWriteArea.

@@ -976,6 +976,61 @@ bool TPDisk::ChunkWritePiece(TChunkWrite *evChunkWrite, ui32 pieceShift, ui32 pi
         TChunkState &state = ChunkState[chunkIdx];
         state.CurrentNonce = state.Nonce + (ui64)desiredSectorIdx;
 
+        const ui32 sectorPayloadSize = Format.SectorPayloadSize();
+        const ui32 footerAndCanarySize = CanarySize + sizeof(TDataSectorFooter);
+        NPDisk::TEvChunkWrite::IParts::TMutableDataRef mutablePart;
+        const bool hasSinglePart = evChunkWrite->PartsPtr->Size() == 1;
+        const auto firstPart = hasSinglePart ? (*evChunkWrite->PartsPtr)[0] : NPDisk::TEvChunkWrite::IParts::TDataRef(nullptr, 0);
+        const bool useTailroomFastPath =
+            !Cfg->FeatureFlags.GetEnablePDiskDataEncryption() &&
+            pieceShift == 0 &&
+            pieceSize == sectorPayloadSize &&
+            evChunkWrite->TotalSize == sectorPayloadSize &&
+            evChunkWrite->RemainingSize == sectorPayloadSize &&
+            evChunkWrite->CurrentPart == 0 &&
+            evChunkWrite->CurrentPartOffset == 0 &&
+            hasSinglePart &&
+            firstPart.first != nullptr &&
+            firstPart.second == sectorPayloadSize &&
+            evChunkWrite->PartsPtr->TryGetMutableData(0, mutablePart) &&
+            mutablePart.Data != nullptr &&
+            mutablePart.Data == firstPart.first &&
+            mutablePart.Size == sectorPayloadSize &&
+            mutablePart.Capacity >= Format.SectorSize &&
+            Format.SectorSize == sectorPayloadSize + footerAndCanarySize &&
+            reinterpret_cast<uintptr_t>(mutablePart.Data) % 512 == 0;
+        if (useTailroomFastPath) {
+            ui8 *sector = mutablePart.Data;
+            const ui64 diskOffset = Format.Offset(chunkIdx, desiredSectorIdx);
+
+            // Encryption is disabled for this path, so canary is copied as-is.
+            memcpy(sector + sectorPayloadSize, &Canary, CanarySize);
+            TDataSectorFooter *footer = reinterpret_cast<TDataSectorFooter *>(
+                sector + Format.SectorSize - sizeof(TDataSectorFooter));
+            footer->SetVersionAndEncryption(false);
+            footer->Nonce = state.CurrentNonce;
+            TPDiskHashCalculator hash;
+            footer->Hash = hash.HashSector(diskOffset, Format.MagicDataChunk, sector, Format.SectorSize, evChunkWrite->BlobId);
+
+            *Mon.BandwidthPChunkPayload += sectorPayloadSize;
+            *Mon.BandwidthPChunkSectorFooter += sizeof(TDataSectorFooter);
+
+            evChunkWrite->CurrentPart = 1;
+            evChunkWrite->CurrentPartOffset = 0;
+            evChunkWrite->RemainingSize = 0;
+            evChunkWrite->BytesWritten += sectorPayloadSize;
+            ++state.CurrentNonce;
+
+            auto traceId = evChunkWrite->Span.GetTraceId();
+            evChunkWrite->Completion->Orbit = std::move(evChunkWrite->Orbit);
+            guard.Release();
+            BlockDevice->PwriteAsync(sector, Format.SectorSize, diskOffset, evChunkWrite->Completion.Release(),
+                    evChunkWrite->ReqId, &traceId);
+            evChunkWrite->IsReplied = true;
+            LWTRACK(PDiskChunkWriteLastPieceSendToDevice, evChunkWrite->Orbit, PCtx->PDiskId, evChunkWrite->Owner, chunkIdx, pieceShift, pieceSize);
+            return true;
+        }
+
         ui32 dataChunkSizeSectors = Format.ChunkSize / Format.SectorSize;
         TChunkWriter writer(Mon, *BlockDevice.Get(), Format, state.CurrentNonce, Format.ChunkKey, BufferPool.Get(),
                 desiredSectorIdx, dataChunkSizeSectors, Format.MagicDataChunk, chunkIdx, nullptr, desiredSectorIdx,

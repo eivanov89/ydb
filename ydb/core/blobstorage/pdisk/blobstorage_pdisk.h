@@ -15,6 +15,7 @@
 #include <util/generic/map.h>
 #include <util/system/file.h>
 #include <util/system/fhandle.h>
+#include <cstdint>
 
 
 namespace NKikimr {
@@ -1053,9 +1054,21 @@ struct TEvChunkWrite : TEventLocal<TEvChunkWrite, TEvBlobStorage::EvChunkWrite> 
         // A special case is a pointer equal to nullptr, which means padding, i.e. write X zero bytes
         // A very special case is nullptr with Size = 0, which means nothing, just ignore such entries
         typedef std::pair<const void *, ui32> TDataRef;
+        struct TMutableDataRef {
+            ui8 *Data = nullptr;
+            ui32 Size = 0;
+            ui32 Capacity = 0;
+        };
         virtual ~IParts() {}
         virtual TDataRef operator[] (ui32) const = 0;
         virtual ui32 Size() const = 0; // returns number of elements in 'vector' addressable via [] operator
+        // Optional capability: return a writable contiguous region with tailroom.
+        // Implementations that do not own mutable storage should return false.
+        virtual bool TryGetMutableData(ui32 index, TMutableDataRef& data) const {
+            Y_UNUSED(index);
+            data = {};
+            return false;
+        }
         virtual ui64 ByteSize() const {
             ui32 size = Size();
             ui64 byteSize = 0;
@@ -1168,6 +1181,60 @@ struct TEvChunkWrite : TEventLocal<TEvChunkWrite, TEvBlobStorage::EvChunkWrite> 
                 Y_VERIFY_DEBUG(padding);
                 return std::make_pair(nullptr, padding);
             }
+        }
+    };
+
+    ///////////////////// TAlignedDataPartWithTailroom //////////////////////////////
+    class TAlignedDataPartWithTailroom : public IParts {
+        static constexpr size_t DefaultAlignment = 4096;
+
+        TArrayHolder<ui8> RawData;
+        ui8 *AlignedData = nullptr;
+        ui32 DataSize = 0;
+        ui32 DataCapacity = 0;
+
+    public:
+        TAlignedDataPartWithTailroom(ui32 dataSize, ui32 tailroom)
+            : TAlignedDataPartWithTailroom(dataSize, tailroom, DefaultAlignment)
+        {}
+
+        TAlignedDataPartWithTailroom(ui32 dataSize, ui32 tailroom, size_t alignment)
+            : RawData(new ui8[dataSize + tailroom + alignment - 1])
+            , DataSize(dataSize)
+            , DataCapacity(dataSize + tailroom)
+        {
+            Y_VERIFY_DEBUG(alignment && (alignment & (alignment - 1)) == 0);
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(RawData.Get());
+            const uintptr_t alignedPtr = (ptr + alignment - 1) & ~(alignment - 1);
+            AlignedData = reinterpret_cast<ui8 *>(alignedPtr);
+        }
+
+        ui8* MutableData() const {
+            return AlignedData;
+        }
+
+        ui32 Capacity() const {
+            return DataCapacity;
+        }
+
+        ui32 Size() const override {
+            return 1;
+        }
+
+        TDataRef operator[] (ui32 index) const override {
+            Y_VERIFY_DEBUG(index == 0);
+            return std::make_pair(AlignedData, DataSize);
+        }
+
+        bool TryGetMutableData(ui32 index, TMutableDataRef& data) const override {
+            if (index != 0) {
+                data = {};
+                return false;
+            }
+            data.Data = AlignedData;
+            data.Size = DataSize;
+            data.Capacity = DataCapacity;
+            return true;
         }
     };
 

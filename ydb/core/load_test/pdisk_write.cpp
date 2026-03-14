@@ -3,12 +3,15 @@
 #include "util.h"
 #include <ydb/core/base/counters.h>
 #include <ydb/core/blobstorage/pdisk/blobstorage_pdisk.h>
+#include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_data.h>
 #include <ydb/core/blobstorage/base/blobstorage_events.h>
 #include <ydb/core/control/lib/dynamic_control_board_impl.h>
 #include <library/cpp/monlib/service/pages/templates.h>
 #include <library/cpp/time_provider/time_provider.h>
+#include <google/protobuf/descriptor.h>
 #include <util/random/fast.h>
 #include <util/generic/queue.h>
+#include <cstring>
 
 namespace NKikimr {
 
@@ -101,6 +104,7 @@ class TPDiskWriterLoadTestActor : public TActorBootstrapped<TPDiskWriterLoadTest
     bool Sequential;
     bool Reuse;
     bool IsWardenlessTest;
+    bool UseChunkWriteTailroom = true;
     bool Harakiri = false;
     bool TestStarted = false;
 
@@ -167,6 +171,12 @@ public:
         Sequential = cmd.GetSequential();
         Reuse = cmd.GetReuse();
         IsWardenlessTest = cmd.GetIsWardenlessTest();
+        UseChunkWriteTailroom = true;
+        if (const auto *descriptor = cmd.GetDescriptor()) {
+            if (const auto *field = descriptor->FindFieldByName("UseChunkWriteTailroom")) {
+                UseChunkWriteTailroom = cmd.GetReflection()->GetBool(cmd, field);
+            }
+        }
 
         for (const auto& chunk : cmd.GetChunks()) {
             if (!chunk.HasSlots() || !chunk.HasWeight() || !chunk.GetSlots() || !chunk.GetWeight()) {
@@ -425,9 +435,21 @@ public:
             // like the parallel mode, but log is treated already written
             bool isLogWritten = (LogMode == NKikimr::TEvLoadTestRequest::LOG_NONE);
             ui64 requestIdx = NewTRequestInfo(size, chunkIdx, now, now, false, isLogWritten);
+            const ui32 randomOffsetLimit = DataBuffer.size() > size ? DataBuffer.size() - size : 0;
+            const ui32 randomOffset = randomOffsetLimit ? Rng() % randomOffsetLimit : 0;
+            const char *source = DataBuffer.data() + randomOffset;
+            NPDisk::TEvChunkWrite::TPartsPtr partsPtr;
+            if (UseChunkWriteTailroom && size == PDiskParams->AppendBlockSize) {
+                constexpr ui32 tailroom = NPDisk::CanarySize + sizeof(NPDisk::TDataSectorFooter);
+                auto *parts = new NPDisk::TEvChunkWrite::TAlignedDataPartWithTailroom(size, tailroom);
+                memcpy(parts->MutableData(), source, size);
+                partsPtr = parts;
+            } else {
+                partsPtr = new TParts{source, size};
+            }
             SendRequest(ctx, std::make_unique<NPDisk::TEvChunkWrite>(PDiskParams->Owner, PDiskParams->OwnerRound,
                     chunkIdx, offset,
-                    new TParts{DataBuffer.data() + Rng() % (DataBuffer.size() - size), size},
+                    std::move(partsPtr),
                     reinterpret_cast<void*>(requestIdx), true, NPriWrite::HullHugeAsyncBlob, Sequential));
             ++ChunkWrite_RequestsSent;
 
