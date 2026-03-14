@@ -223,7 +223,7 @@ class TRealBlockDevice : public IBlockDevice {
         TRealBlockDevice &Device;
         std::shared_ptr<TPDiskCtx> &PCtx;
         TCountedQueueOneOne<IAsyncIoOperation*, 4 << 10> OperationsToBeSubmit;
-        static constexpr TAtomicBase SubmitInFlightBytesMax = 1ull << 15;
+        static constexpr TAtomicBase SubmitInFlightBytesMax = 4ull << 20;
         TMutex SubmitMtx;
         TCondVar SubmitCondVar;
         TAtomicBlockCounter SubmitQuitCounter;
@@ -279,7 +279,7 @@ class TRealBlockDevice : public IBlockDevice {
     // TSubmitThread
     ////////////////////////////////////////////////////////
     class TSubmitThread : public TSubmitThreadBase {
-        static constexpr ui32 FlushBatchSize = 8;
+        static constexpr ui32 FlushBatchSize = 64;
 
     public:
         TSubmitThread(TRealBlockDevice &device)
@@ -615,7 +615,7 @@ class TRealBlockDevice : public IBlockDevice {
     // TSubmitGetThread
     ////////////////////////////////////////////////////////
     class TSubmitGetThread : public TSubmitThreadBase {
-        static constexpr ui32 FlushBatchSize = 8;
+        static constexpr ui32 FlushBatchSize = 64;
         NHPTimer::STime OpScheduleFailedTime = 0;
 
     public:
