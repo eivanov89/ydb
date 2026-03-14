@@ -686,6 +686,7 @@ public:
 
         struct io_uring_params params;
         memset(&params, 0, sizeof(params));
+        params.flags |= IORING_SETUP_SQPOLL;
         int ret = io_uring_queue_init_params(512, &Ring, &params);
         if (ret < 0) {
             LastErrno = -ret;
@@ -716,18 +717,21 @@ public:
     }
 
     EIoResult Flush() override {
-        while (PendingSubmissions > 0) {
-            int ret = io_uring_submit(&Ring);
-            if (ret < 0) {
-                LastErrno = -ret;
-                return RetErrnoToContextError(ret, "io_uring_submit");
-            }
-            if (ret == 0) {
-                return EIoResult::TryAgain;
-            }
-            Y_ABORT_UNLESS(static_cast<ui32>(ret) <= PendingSubmissions);
-            PendingSubmissions -= ret;
+        if (PendingSubmissions == 0) {
+            return EIoResult::Ok;
         }
+
+        int ret = io_uring_submit(&Ring);
+        if (ret < 0) {
+            LastErrno = -ret;
+            return RetErrnoToContextError(ret, "io_uring_submit");
+        }
+
+        // SQPOLL mode may report submitted entries based on shared SQ state
+        // (tail - khead), which can include entries beyond our local batch.
+        // For this context PendingSubmissions tracks "locally queued since last
+        // explicit flush", so any successful submit call clears it.
+        PendingSubmissions = 0;
         return EIoResult::Ok;
     }
 
