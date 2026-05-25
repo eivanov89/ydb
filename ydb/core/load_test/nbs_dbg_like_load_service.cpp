@@ -1147,7 +1147,8 @@ void RenderTabletForm(IOutputStream& str, const TString& nbsTabletListHtml) {
                         read_ratio_pct:          nbsTabletTrim($("#nbs-run-read-ratio").val()) || "0",
                         read_write_size_kib:     nbsTabletTrim($("#nbs-run-size-kib").val()) || "4",
                         sequential:              $("#nbs-run-sequential").is(":checked") ? "1" : "0",
-                        num_dbg_to_use:          nbsTabletTrim($("#nbs-run-num-dbg").val()) || "0"
+                        num_dbg_to_use:          nbsTabletTrim($("#nbs-run-num-dbg").val()) || "0",
+                        disable_replication:     $("#nbs-run-disable-replication").is(":checked") ? "1" : "0"
                     };
                     $.ajax({
                         url: "",
@@ -1518,6 +1519,14 @@ void RenderTabletForm(IOutputStream& str, const TString& nbsTabletListHtml) {
                                         <label>
                                             <input id='nbs-run-sequential' type='checkbox' />
                                             Sequential (round-robin address space instead of random)
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class='form-group'>
+                                    <div class='checkbox'>
+                                        <label>
+                                            <input id='nbs-run-disable-replication' type='checkbox' />
+                                            Disable replication (single-PB write, skip DDisk flush)
                                         </label>
                                     </div>
                                 </div>
