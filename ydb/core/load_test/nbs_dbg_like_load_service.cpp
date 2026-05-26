@@ -936,6 +936,15 @@ void RenderTabletForm(IOutputStream& str, const TString& nbsTabletListHtml) {
                     .replace(/"/g, "\\\"");
             }
 
+            function nbsRunDisableReplicationChanged(cb) {
+                const readRatio = $("#nbs-run-read-ratio");
+                if (cb.checked) {
+                    readRatio.val("0").prop("disabled", true);
+                } else {
+                    readRatio.prop("disabled", false);
+                }
+            }
+
             function nbsTabletFieldInt(fieldId, fieldLabel, minValue) {
                 const raw = nbsTabletTrim($("#" + fieldId).val());
                 if (raw === "") {
@@ -1144,7 +1153,7 @@ void RenderTabletForm(IOutputStream& str, const TString& nbsTabletListHtml) {
                         duration_seconds:        nbsTabletTrim($("#nbs-run-duration").val()) || "0",
                         delay_before_seconds:    nbsTabletTrim($("#nbs-run-delay-before").val()) || "15",
                         max_in_flight:           String(maxInFlight),
-                        read_ratio_pct:          nbsTabletTrim($("#nbs-run-read-ratio").val()) || "0",
+                        read_ratio_pct:          $("#nbs-run-disable-replication").is(":checked") ? "0" : (nbsTabletTrim($("#nbs-run-read-ratio").val()) || "0"),
                         read_write_size_kib:     nbsTabletTrim($("#nbs-run-size-kib").val()) || "4",
                         sequential:              $("#nbs-run-sequential").is(":checked") ? "1" : "0",
                         num_dbg_to_use:          nbsTabletTrim($("#nbs-run-num-dbg").val()) || "0",
@@ -1525,7 +1534,7 @@ void RenderTabletForm(IOutputStream& str, const TString& nbsTabletListHtml) {
                                 <div class='form-group'>
                                     <div class='checkbox'>
                                         <label>
-                                            <input id='nbs-run-disable-replication' type='checkbox' />
+                                            <input id='nbs-run-disable-replication' type='checkbox' onchange='nbsRunDisableReplicationChanged(this)' />
                                             Disable replication (single-PB write, skip DDisk flush)
                                         </label>
                                     </div>
