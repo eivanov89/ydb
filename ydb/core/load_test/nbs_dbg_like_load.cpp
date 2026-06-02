@@ -38,7 +38,7 @@ constexpr ui32 kPipeRetryLimit = 3;
 
 // Latency histogram bounds (spec §15.1). Up to ~134s, microsecond precision.
 constexpr i64 kLatencyHistMaxUs = 134'000'000;
-constexpr i32 kLatencyHistPrecision = 2;
+constexpr i32 kLatencyHistPrecision = 4;
 
 TRope BuildWritePayload(ui32 size, TFastRng64& rng) {
     TString data;
@@ -75,8 +75,8 @@ public:
         , Config(cmd.GetWorkloadConfig())
         , Rng(TInstant::Now().GetValue() ^ tag)
         , Counters(std::move(counters))
-        , WriteLatencyUs(kLatencyHistMaxUs, kLatencyHistPrecision)
-        , ReadLatencyUs(kLatencyHistMaxUs, kLatencyHistPrecision)
+        , MeasuredWriteLatencyUs(kLatencyHistMaxUs, kLatencyHistPrecision)
+        , MeasuredReadLatencyUs(kLatencyHistMaxUs, kLatencyHistPrecision)
     {}
 
     void Bootstrap() {
@@ -275,6 +275,20 @@ private:
         return NActors::TActivationContext::Monotonic();
     }
 
+    bool InMeasurementWindow() const {
+        return !Draining && MonotonicNow() >= MeasurementStartTime;
+    }
+
+    void BeginDraining() {
+        if (Draining) {
+            return;
+        }
+        Draining = true;
+        if (MeasurementEndTime == NActors::TMonotonic::Zero()) {
+            MeasurementEndTime = MonotonicNow();
+        }
+    }
+
     ui64 PickAddress(ui32 sizeBytes) {
         Y_ABORT_UNLESS(AddressSpaceIoUnits != 0);
         ui64 unit;
@@ -374,6 +388,7 @@ private:
 
         const ui64 latencyUs = (MonotonicNow() - e.SentAt).MicroSeconds();
         const bool ok = ev->Get()->Record.GetStatus() == 0;
+        const bool measure = InMeasurementWindow();
         LOG_T("HandleWriteResult Cookie# " << cookie << " Status# " << ev->Get()->Record.GetStatus() << " LatencyUs# " << latencyUs << " WriteInFlight# " << WriteInFlight);
 
         if (WriteInFlight > 0) {
@@ -385,28 +400,33 @@ private:
         if (ok) {
             ++WritesOk;
             WriteBytes += e.SizeBytes;
-            const ui32 stopCount = Config.GetStopOnWritesDoneCount();
-            if (stopCount > 0 && WritesOk >= stopCount && !Draining) {
-                LOG_N("StopOnWritesDoneCount reached Tag# " << Tag << " WritesOk# " << WritesOk);
-                Draining = true;
-                Schedule(kDrainTimeout, new TEvents::TEvWakeup(kWakeupDrainTimeoutTag));
-            }
             if (Writes.ReplyOk) {
                 Writes.ReplyOk->Inc();
             }
             if (Writes.Bytes) {
                 *Writes.Bytes += e.SizeBytes;
             }
-            if (MonotonicNow() >= MeasurementStartTime) {
-                WriteLatencyUs.RecordValue(static_cast<i64>(latencyUs));
+            if (measure) {
+                ++MeasuredWritesOk;
+                MeasuredWriteBytes += e.SizeBytes;
+                MeasuredWriteLatencyUs.RecordValue(static_cast<i64>(latencyUs));
+            }
+            const ui32 stopCount = Config.GetStopOnWritesDoneCount();
+            if (stopCount > 0 && WritesOk >= stopCount && !Draining) {
+                LOG_N("StopOnWritesDoneCount reached Tag# " << Tag << " WritesOk# " << WritesOk);
+                BeginDraining();
+                Schedule(kDrainTimeout, new TEvents::TEvWakeup(kWakeupDrainTimeoutTag));
             }
         } else {
             if (Writes.ReplyErr) {
                 Writes.ReplyErr->Inc();
             }
+            if (measure) {
+                ++MeasuredWriteErrors;
+            }
         }
-        if (Writes.ResponseTimeMs) {
-            Writes.ResponseTimeMs->Collect(latencyUs / 1000);
+        if (Writes.ResponseTimeUs) {
+            Writes.ResponseTimeUs->Collect(static_cast<double>(latencyUs));
         }
 
         CheckDrainComplete();
@@ -429,6 +449,7 @@ private:
 
         const ui64 latencyUs = (MonotonicNow() - e.SentAt).MicroSeconds();
         const bool ok = ev->Get()->Record.GetStatus() == 0;
+        const bool measure = InMeasurementWindow();
         LOG_T("HandleReadResult Cookie# " << cookie << " Status# " << ev->Get()->Record.GetStatus() << " LatencyUs# " << latencyUs << " ReadInFlight# " << ReadInFlight);
         // Payload is on the actor event as a TRope; we don't validate it
         // beyond observing the status — the worker already checked sizes.
@@ -449,16 +470,21 @@ private:
             if (Reads.Bytes) {
                 *Reads.Bytes += e.SizeBytes;
             }
-            if (MonotonicNow() >= MeasurementStartTime) {
-                ReadLatencyUs.RecordValue(static_cast<i64>(latencyUs));
+            if (measure) {
+                ++MeasuredReadsOk;
+                MeasuredReadBytes += e.SizeBytes;
+                MeasuredReadLatencyUs.RecordValue(static_cast<i64>(latencyUs));
             }
         } else {
             if (Reads.ReplyErr) {
                 Reads.ReplyErr->Inc();
             }
+            if (measure) {
+                ++MeasuredReadErrors;
+            }
         }
-        if (Reads.ResponseTimeMs) {
-            Reads.ResponseTimeMs->Collect(latencyUs / 1000);
+        if (Reads.ResponseTimeUs) {
+            Reads.ResponseTimeUs->Collect(static_cast<double>(latencyUs));
         }
 
         CheckDrainComplete();
@@ -474,7 +500,7 @@ private:
         LOG_N("Drain start Tag# " << Tag
             << " WriteInFlight# " << WriteInFlight
             << " ReadInFlight# " << ReadInFlight);
-        Draining = true;
+        BeginDraining();
         Schedule(kDrainTimeout, new TEvents::TEvWakeup(kWakeupDrainTimeoutTag));
         CheckDrainComplete();
     }
@@ -510,7 +536,7 @@ private:
         }
         // Enter drain: in-flight requests are orphaned, drain timeout will fire.
         if (!Draining) {
-            Draining = true;
+            BeginDraining();
             Schedule(kDrainTimeout, new TEvents::TEvWakeup(kWakeupDrainTimeoutTag));
             CheckDrainComplete();
         }
@@ -540,17 +566,18 @@ private:
         const NActors::TMonotonic now = MonotonicNow();
         const ui64 durationMs = (TestStartTime != NActors::TMonotonic::Zero() && now > TestStartTime)
             ? (now - TestStartTime).MilliSeconds() : 0;
-        const ui64 measuredMs = (MeasurementStartTime != NActors::TMonotonic::Zero()
-                                  && now > MeasurementStartTime)
-            ? (now - MeasurementStartTime).MilliSeconds() : 0;
+        const ui64 measuredMs = (MeasurementEndTime != NActors::TMonotonic::Zero()
+                                  && MeasurementEndTime > MeasurementStartTime)
+            ? (MeasurementEndTime - MeasurementStartTime).MilliSeconds() : 0;
+        const double measuredSec = measuredMs > 0 ? measuredMs / 1000.0 : 1.0;
 
         // Compute percentiles before moving histograms into WorkerStats.
-        const ui64 writeP50Us = WriteLatencyUs.GetValueAtPercentile(50.0);
-        const ui64 writeP95Us = WriteLatencyUs.GetValueAtPercentile(95.0);
-        const ui64 writeP99Us = WriteLatencyUs.GetValueAtPercentile(99.0);
-        const ui64 readP50Us  = ReadLatencyUs.GetValueAtPercentile(50.0);
-        const ui64 readP95Us  = ReadLatencyUs.GetValueAtPercentile(95.0);
-        const ui64 readP99Us  = ReadLatencyUs.GetValueAtPercentile(99.0);
+        const ui64 writeP50Us = MeasuredWriteLatencyUs.GetValueAtPercentile(50.0);
+        const ui64 writeP95Us = MeasuredWriteLatencyUs.GetValueAtPercentile(95.0);
+        const ui64 writeP99Us = MeasuredWriteLatencyUs.GetValueAtPercentile(99.0);
+        const ui64 readP50Us  = MeasuredReadLatencyUs.GetValueAtPercentile(50.0);
+        const ui64 readP95Us  = MeasuredReadLatencyUs.GetValueAtPercentile(95.0);
+        const ui64 readP99Us  = MeasuredReadLatencyUs.GetValueAtPercentile(99.0);
 
         LOG_I("Run finished Tag# " << Tag
             << " Status# " << (ErrorReason.empty() ? "OK" : ErrorReason)
@@ -558,18 +585,22 @@ private:
             << " MeasuredMs# " << measuredMs
             << " WritesIssued# " << WritesIssued
             << " WritesOk# " << WritesOk
+            << " MeasuredWritesOk# " << MeasuredWritesOk
             << " WriteBytes# " << WriteBytes
+            << " MeasuredWriteBytes# " << MeasuredWriteBytes
             << " WriteLatencyP50Us# " << writeP50Us
             << " WriteLatencyP99Us# " << writeP99Us
             << " ReadsIssued# " << ReadsIssued
             << " ReadsOk# " << ReadsOk
+            << " MeasuredReadsOk# " << MeasuredReadsOk
             << " ReadBytes# " << ReadBytes
+            << " MeasuredReadBytes# " << MeasuredReadBytes
             << " ReadLatencyP50Us# " << readP50Us
             << " ReadLatencyP99Us# " << readP99Us);
 
         auto report = MakeIntrusive<TEvLoad::TLoadReport>();
         report->Duration = TDuration::MilliSeconds(durationMs);
-        report->Size = WriteBytes + ReadBytes;
+        report->Size = MeasuredWriteBytes + MeasuredReadBytes;
         report->InFlight = Config.GetMaxInFlight();
         report->LoadType = TEvLoad::TLoadReport::LOAD_WRITE;
 
@@ -580,31 +611,30 @@ private:
 
         // Build a minimal JsonResult compatible with service_actor's aggregation.
         // The service actor will further enrich this from WorkerStats below.
-        const double durationSec = durationMs > 0 ? durationMs / 1000.0 : 1.0;
-        const ui64 writeErrors = WritesIssued >= WritesOk ? (WritesIssued - WritesOk) : 0;
-        const ui64 readErrors  = ReadsIssued  >= ReadsOk  ? (ReadsIssued  - ReadsOk)  : 0;
-        finishEv->JsonResult["txs"] = static_cast<ui64>(WritesOk + ReadsOk);
-        finishEv->JsonResult["rps"] = (WritesOk + ReadsOk) / durationSec;
-        finishEv->JsonResult["errors"] = static_cast<double>(writeErrors + readErrors) / durationSec;
-        finishEv->JsonResult["percentile"]["50"] = static_cast<double>(writeP50Us) / 1000.0;
-        finishEv->JsonResult["percentile"]["95"] = static_cast<double>(writeP95Us) / 1000.0;
-        finishEv->JsonResult["percentile"]["99"] = static_cast<double>(writeP99Us) / 1000.0;
+        const ui64 measuredTxs = MeasuredWritesOk + MeasuredReadsOk;
+        const ui64 measuredErrors = MeasuredWriteErrors + MeasuredReadErrors;
+        finishEv->JsonResult["txs"] = measuredTxs;
+        finishEv->JsonResult["rps"] = measuredTxs / measuredSec;
+        finishEv->JsonResult["errors"] = static_cast<double>(measuredErrors) / measuredSec;
+        finishEv->JsonResult["percentile"]["50"] = static_cast<double>(writeP50Us);
+        finishEv->JsonResult["percentile"]["95"] = static_cast<double>(writeP95Us);
+        finishEv->JsonResult["percentile"]["99"] = static_cast<double>(writeP99Us);
 
         // Populate typed WorkerStats so the service actor can enrich JsonResult
         // with split write/read keys consumed by the sweep table.
         {
             TNbsDbgLikeFinishStats stats;
             stats.WritesIssued  = WritesIssued;
-            stats.WritesOk      = WritesOk;
-            stats.WritesErr     = writeErrors;
-            stats.WriteBytes    = WriteBytes;
-            stats.ReadsPbOk     = ReadsOk;   // load actor measures all reads together
+            stats.WritesOk      = MeasuredWritesOk;
+            stats.WritesErr     = MeasuredWriteErrors;
+            stats.WriteBytes    = MeasuredWriteBytes;
+            stats.ReadsPbOk     = MeasuredReadsOk;   // load actor measures all reads together
             stats.ReadsDDiskOk  = 0;
             stats.RunningMs     = durationMs;
             stats.MeasuredMs    = measuredMs;
             stats.MaxInFlight   = Config.GetMaxInFlight();
-            stats.WriteE2eUs    = std::move(WriteLatencyUs);
-            stats.ReadPbUs      = std::move(ReadLatencyUs);
+            stats.WriteE2eUs    = std::move(MeasuredWriteLatencyUs);
+            stats.ReadPbUs      = std::move(MeasuredReadLatencyUs);
             SetNbsDbgLikeFinishStats(*finishEv, std::move(stats));
         }
 
@@ -616,12 +646,14 @@ private:
                 << "TabletId: " << TabletId << "<br/>"
                 << "MaxInFlight: " << Config.GetMaxInFlight() << "<br/>"
                 << "Duration: " << durationMs << " ms (measured: " << measuredMs << " ms)<br/>"
-                << "WritesIssued: " << WritesIssued << " WritesOk: " << WritesOk
-                << " WriteBytes: " << WriteBytes << "<br/>"
+                << "WritesIssued: " << WritesIssued << " (total ok: " << WritesOk
+                << ") MeasuredWritesOk: " << MeasuredWritesOk
+                << " MeasuredWriteBytes: " << MeasuredWriteBytes << "<br/>"
                 << "WriteLatency p50=" << writeP50Us << "us p95=" << writeP95Us
                 << "us p99=" << writeP99Us << "us<br/>"
-                << "ReadsIssued: " << ReadsIssued << " ReadsOk: " << ReadsOk
-                << " ReadBytes: " << ReadBytes << "<br/>"
+                << "ReadsIssued: " << ReadsIssued << " (total ok: " << ReadsOk
+                << ") MeasuredReadsOk: " << MeasuredReadsOk
+                << " MeasuredReadBytes: " << MeasuredReadBytes << "<br/>"
                 << "ReadLatency p50=" << readP50Us << "us p95=" << readP95Us
                 << "us p99=" << readP99Us << "us<br/>";
             if (!ErrorReason.empty()) {
@@ -666,7 +698,7 @@ private:
         ::NMonitoring::TDynamicCounters::TCounterPtr ReplyErr;
         ::NMonitoring::TDynamicCounters::TCounterPtr Bytes;
         ::NMonitoring::TDynamicCounters::TCounterPtr BytesInFlight;
-        ::NMonitoring::THistogramPtr ResponseTimeMs;
+        ::NMonitoring::THistogramPtr ResponseTimeUs;
 
         void Init(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& g) {
             Requests       = g->GetCounter("Requests", true);
@@ -674,12 +706,9 @@ private:
             ReplyErr       = g->GetCounter("ReplyErr", true);
             Bytes          = g->GetCounter("Bytes", true);
             BytesInFlight  = g->GetCounter("BytesInFlight", false);
-            // 1 ms .. ~32 s, geometric.
-            static const TVector<double> kBoundsMs = {
-                1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 32000
-            };
-            ResponseTimeMs = g->GetHistogram(
-                "ResponseTimeMs", NMonitoring::ExplicitHistogram(kBoundsMs));
+            ResponseTimeUs = g->GetHistogram(
+                "ResponseTimeUs",
+                NMonitoring::ExplicitHistogram(LoadActorResponseTimeUsBounds()));
         }
     };
 
@@ -723,11 +752,19 @@ private:
     ui64 ReadsOk      = 0;
     ui64 ReadBytes    = 0;
 
-    NHdr::THistogram WriteLatencyUs;
-    NHdr::THistogram ReadLatencyUs;
+    ui64 MeasuredWritesOk = 0;
+    ui64 MeasuredWriteBytes = 0;
+    ui64 MeasuredReadsOk = 0;
+    ui64 MeasuredReadBytes = 0;
+    ui64 MeasuredWriteErrors = 0;
+    ui64 MeasuredReadErrors = 0;
+
+    NHdr::THistogram MeasuredWriteLatencyUs;
+    NHdr::THistogram MeasuredReadLatencyUs;
 
     NActors::TMonotonic TestStartTime;
     NActors::TMonotonic MeasurementStartTime;
+    NActors::TMonotonic MeasurementEndTime;
 
     bool Draining = false;
     bool Finished = false;
