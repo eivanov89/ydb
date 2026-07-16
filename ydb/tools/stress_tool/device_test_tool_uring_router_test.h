@@ -125,7 +125,6 @@ class TUringRouterTest : public TPerfTest {
     const bool UseAlignedData;
     const ui32 NumberOfRandomRefills;
     const bool UseWriteFixed;
-    const bool UseSharedSQPoll;
 
     TVector<THolder<TDeviceState>> DeviceStates;
 
@@ -134,15 +133,6 @@ class TUringRouterTest : public TPerfTest {
     std::atomic<bool> GoSignal{false};
 
 public:
-    template <class TProto>
-    static bool GetUseSharedSQPollValue(const TProto& testProto) {
-        if constexpr (requires { testProto.GetUseSharedSQPoll(); }) {
-            return testProto.GetUseSharedSQPoll();
-        } else {
-            return false;
-        }
-    }
-
     TUringRouterTest(const TPerfTestConfig& cfg, const NDevicePerfTest::TUringRouterTest& testProto)
         : TPerfTest(cfg)
         , QueueDepth(testProto.GetQueueDepth() != 0 ? FastClp2(testProto.GetQueueDepth()) : 128)
@@ -151,7 +141,6 @@ public:
         , UseAlignedData(testProto.GetUseAlignedData())
         , NumberOfRandomRefills(testProto.GetNumberOfRandomRefills())
         , UseWriteFixed(testProto.GetUseWriteFixed())
-        , UseSharedSQPoll(GetUseSharedSQPollValue(testProto))
     {
     }
 
@@ -270,12 +259,9 @@ private:
         dev.File = MakeHolder<TFileHandle>(path.c_str(), openFlags);
 
         NPDisk::TUringRouterConfig cfg;
-        cfg.QueueDepth = QueueDepth * 2; // sq + cq
-        cfg.UseSQPoll = true;
-        cfg.UseIOPoll = false;
-        cfg.UseSharedSQPoll = UseSharedSQPoll;
+        cfg.QueueDepth = QueueDepth;
         dev.Router = MakeHolder<NPDisk::TUringRouter>(static_cast<FHANDLE>(*dev.File), nullptr, cfg);
-        Y_VERIFY_S(dev.Router->RegisterFile(), "TUringRouter::RegisterFile failed for device " << deviceIdx);
+        dev.Router->RegisterFile();
 
         dev.Ops.resize(QueueDepth);
         dev.Buffers.resize(QueueDepth);
@@ -309,10 +295,16 @@ private:
                 iovs[i].iov_base = dev.Buffers[i];
                 iovs[i].iov_len = BuffSize;
             }
-            Y_VERIFY_S(dev.Router->RegisterBuffers(iovs.data(), iovs.size()), "TUringRouter::RegisterBuffers failed");
+            // iovs must stay alive until Start() returns: registration
+            // happens on the I/O thread as part of its Start() handshake.
+            dev.Router->RegisterBuffers(iovs.data(), iovs.size());
+            dev.Router->Start();
+            Y_VERIFY_S(dev.Router->AreBuffersRegistered(), "TUringRouter::RegisterBuffers failed");
+        } else {
+            dev.Router->Start();
         }
 
-        dev.Router->Start();
+        Y_VERIFY_S(dev.Router->IsFileRegistered(), "TUringRouter::RegisterFile failed for device " << deviceIdx);
     }
 
     void RunDevice(TDeviceState& dev) {
@@ -401,7 +393,6 @@ private:
         Printer->AddResult("QueueDepth", QueueDepth);
         Printer->AddResult("AlignedData", UseAlignedData ? "true" : "false");
         Printer->AddResult("WriteFixed", UseWriteFixed ? "true" : "false");
-        Printer->AddResult("SharedSQPoll", UseSharedSQPoll ? "true" : "false");
         Printer->AddResult("Speed", Sprintf("%.1f MB/s", speedMBps));
         Printer->AddResult("IOPS", ui64(iops));
         Printer->AddSpeedAndIops(TSpeedAndIops(speedMBps, iops));
@@ -436,7 +427,6 @@ private:
         Printer->AddResult("QueueDepth", QueueDepth);
         Printer->AddResult("AlignedData", UseAlignedData ? "true" : "false");
         Printer->AddResult("WriteFixed", UseWriteFixed ? "true" : "false");
-        Printer->AddResult("SharedSQPoll", UseSharedSQPoll ? "true" : "false");
         Printer->AddResult("Speed", Sprintf("%.1f MB/s", totalSpeed));
         Printer->AddResult("IOPS", ui64(totalIops));
         Printer->AddSpeedAndIops(TSpeedAndIops(totalSpeed, totalIops));

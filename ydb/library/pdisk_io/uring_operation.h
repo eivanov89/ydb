@@ -63,6 +63,9 @@ public:
     void SetOperationType(EOperationType opType) { OperationType = opType; }
     EOperationType GetOperationType() const { return OperationType; }
 
+    bool IsFixedBuffer() const { return FixedBuffer; }
+    ui16 GetBufIndex() const { return BufIndex; }
+
     // Returns the number of bytes remaining in the current (possibly partially
     // advanced) iovec window — used by OnComplete to detect short I/O.
     // Invariant: GetOperationBytes() == TotalSize - BytesProcessed.
@@ -99,6 +102,8 @@ public:
         OperationType = ENOT_SET;
         TotalSize = 0;
         DiskOffset = 0;
+        FixedBuffer = false;
+        BufIndex = 0;
 #if defined(__linux__)
         Iov.clear();
         IovBegin = 0;
@@ -116,6 +121,12 @@ public:
 #endif
 
 private:
+    // Set by TUringRouter::ReadFixed/WriteFixed before submission.
+    void SetFixedBuffer(ui16 bufIndex) {
+        FixedBuffer = true;
+        BufIndex = bufIndex;
+    }
+
     // Filled by TUringRouter on completion
     i32 Result = 0;  // io_uring cqe->res: bytes transferred on success, -errno on failure
 
@@ -129,6 +140,12 @@ private:
     ui64 TotalSize = 0;
 
     ui64 DiskOffset = 0;
+
+    // Fixed-buffer (registered-buffer) I/O: set by TUringRouter::ReadFixed/
+    // WriteFixed. BufIndex indexes into the buffer set passed to
+    // RegisterBuffers(). Fixed-buffer ops do not support scatter-gather.
+    bool FixedBuffer = false;
+    ui16 BufIndex = 0;
 
 #if defined(__linux__)
     // Iovec array for readv/writev submissions.  Supports scatter-gather: holds one
