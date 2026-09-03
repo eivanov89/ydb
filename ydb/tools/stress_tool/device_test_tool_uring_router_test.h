@@ -64,7 +64,6 @@ class TUringRouterTest : public TPerfTest {
     struct alignas(64) TDeviceState {
         ui32 BuffSize = 0;
         ui64 DeviceSizeBytes = 0;
-        THolder<TFileHandle> File;
         THolder<NPDisk::TUringRouter> Router;
 
         TVector<TOp> Ops;
@@ -258,11 +257,12 @@ private:
         if (UseAlignedData || UseWriteFixed) {
             openFlags = static_cast<EOpenMode>(openFlags | DirectAligned);
         }
-        dev.File = MakeHolder<TFileHandle>(path.c_str(), openFlags);
+        TFileHandle file(path.c_str(), openFlags);
+        Y_VERIFY_S(file.IsOpen(), "Failed to open device " << deviceIdx << " path# " << path.Quote());
 
         NPDisk::TUringRouterConfig cfg;
         cfg.QueueDepth = QueueDepth;
-        dev.Router = MakeHolder<NPDisk::TUringRouter>(static_cast<FHANDLE>(*dev.File), nullptr, cfg);
+        dev.Router = MakeHolder<NPDisk::TUringRouter>(std::move(file), nullptr, cfg);
         dev.Router->RegisterFile();
 
         dev.Ops.resize(QueueDepth);

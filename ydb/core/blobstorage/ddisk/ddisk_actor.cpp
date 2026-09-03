@@ -109,14 +109,19 @@ namespace {
     TDDiskActor::TDDiskActor(TVDiskConfig::TBaseInfo&& baseInfo, TIntrusivePtr<TBlobStorageGroupInfo> info,
             TPersistentBufferFormat&& pbFormat, TDDiskConfig&& ddiskConfig,
             TIntrusivePtr<NMonitoring::TDynamicCounters> counters, const std::vector<ui32>& initPersistentBufferChunks,
-            ui64 persistentBufferUniqueId, TIntrusivePtr<TPDiskParams> pDiskParams, NPDisk::TDiskFormatPtr diskFormat,
-            TFileHandle&& diskFd)
+            ui64 persistentBufferUniqueId, TIntrusivePtr<TPDiskParams> pDiskParams, NPDisk::TDiskFormatPtr diskFormat
+#if defined(__linux__)
+            , std::shared_ptr<NPDisk::IUringRouterClient> uringRouter
+#endif
+            )
         : TDDiskActor(std::move(baseInfo), std::move(info), std::move(pbFormat), std::move(ddiskConfig), counters, true)
     {
         PersistentBufferUniqueId = persistentBufferUniqueId;
         PDiskParams = pDiskParams;
         DiskFormat = std::move(diskFormat);
-        DiskFd = std::move(diskFd);
+#if defined(__linux__)
+        UringRouter = std::move(uringRouter);
+#endif
         InitPersistentBuffer();
         for (auto idx : initPersistentBufferChunks) {
             auto [it, inserted] = PersistentBufferSectorsChecksum.insert({idx, {}});
@@ -243,18 +248,8 @@ namespace {
                 COUNTER(DirectIO, ShortReads, true)
                 COUNTER(DirectIO, ShortWrites, true)
 
-                COUNTER(DirectIO, RegularUringCount, false)
-                COUNTER(DirectIO, FallbackUringCount, false)
-                COUNTER(DirectIO, FallbackPDiskCount, false)
-
                 COUNTER(DirectIO, RunningCount, false)
             },
-#if defined(__linux__)
-            .UringCounters = {
-                COUNTER(DirectIO, CompletionThreadCPU, true)
-                COUNTER(DirectIO, CompletionThreadBusyTimeNs, true)
-            },
-#endif
             .PersistentBuffer = {
                 COUNTER(PersistentBuffer, AllocatedChunks, false)
                 COUNTER(PersistentBuffer, TotalBytes, false)
@@ -285,16 +280,6 @@ namespace {
     }
 
     TDDiskActor::~TDDiskActor() {
-#if defined(__linux__)
-        // Actor-system hard shutdown may destroy the actor without calling PassAway().
-        // Join the router while every field reachable from completion/sample callbacks
-        // is still alive; the router destructor would otherwise run too late in member
-        // destruction order.
-        if (UringRouter) {
-            UringRouter->Stop();
-            UringRouter.reset();
-        }
-#endif
         [[maybe_unused]] constexpr size_t CompleteTypeGuard = sizeof(TDirectIoOpBase);
     }
 
@@ -690,31 +675,12 @@ namespace {
     }
 
     void TDDiskActor::PassAway() {
+        // FIXME: we need to wait for our I/O and only then passaway
         if (IsPersistentBufferActor) {
             Send(WritePersistentBuffersActor, new NActors::TEvents::TEvPoison());
         } else {
             Send(PersistentBufferActorId, new NActors::TEvents::TEvPoison());
         }
-#if defined(__linux__)
-        if (UringRouter) {
-            // FIXME: This synchronous teardown runs in a System/User actor handler and violates
-            // the actor contract by sleeping and then blocking in Stop()/Join(). GetInflight()
-            // covers router work only: OnComplete() may enqueue TEvShortIO or another DDisk result
-            // and then let the router decrement its count while this mailbox is blocked. A queued
-            // TEvShortIO is not counted at all, so zero inflight does not mean actor-level work is
-            // drained; detaching the mailbox can drop client-visible completion and accounting.
-            // A stuck device can also make Stop() wait indefinitely for its IO_DRAIN barrier despite
-            // the one-second pre-loop bound. Both the DDisk and PersistentBuffer actor paths need a
-            // separate asynchronous, multi-phase shutdown that closes admission, keeps the actor
-            // alive to drain/fail completion events, waits for the router thread off the mailbox,
-            // and detaches only after actor-level work is drained.
-            for (int i = 0; i < 1000 && UringRouter->GetInflight() > 0; ++i) {
-                usleep(1000);
-            }
-            UringRouter->Stop();
-            UringRouter.reset();
-        }
-#endif
         CountersBase->RemoveSubgroupChain(CountersChain);
         if (!IsPersistentBufferActor) {
             Send(MakeBlobStorageNodeWardenID(SelfId().NodeId()), new TEvents::TEvGone());

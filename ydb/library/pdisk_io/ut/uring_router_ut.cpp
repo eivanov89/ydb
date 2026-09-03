@@ -208,12 +208,18 @@ void PrepareReadOp(TUringOperationBase& op, void* buf, ui32 size, ui64 offset) {
     op.PrepareIov(buf, size, offset);
 }
 
+TFileHandle DupOwned(const TFile& f) {
+    const FHANDLE dup = ::dup(f.GetHandle());
+    Y_ABORT_UNLESS(dup != INVALID_FHANDLE);
+    return TFileHandle(dup);
+}
+
 void DoCreateAndDestroy(TUringRouterConfig config) {
     SKIP_IF_NO_URING(config);
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20); // 1 MB
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.Start();
     router.Stop();
 }
@@ -223,7 +229,7 @@ void DoWriteAndReadBack(TUringRouterConfig config, bool registerFile = true) {
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     if (registerFile) {
         router.RegisterFile();
     }
@@ -272,7 +278,7 @@ void DoMultipleConcurrentOps(TUringRouterConfig config) {
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -344,7 +350,7 @@ void DoOverloadBeyondQueueDepth(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -376,7 +382,7 @@ void DoRegisterBuffersAndFixedIO(TUringRouterConfig config) {
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
 
     constexpr ui32 size = 4096;
     TAlignedBuf writeBuf(size);
@@ -430,7 +436,7 @@ void DoSubmitDirect(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -455,7 +461,7 @@ void DoLargeMultiPageIO(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     constexpr ui32 size = 256 * 1024; // 256 KB
     f.Resize(size);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -498,7 +504,7 @@ void DoNonZeroOffsets(TUringRouterConfig config) {
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -551,7 +557,7 @@ void DoDoubleStop(TUringRouterConfig config) {
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -566,7 +572,7 @@ void DoFlushWithNothingPending(TUringRouterConfig config) {
     TTempFile tmp(MakeTempName(nullptr, "uring_test"));
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -600,7 +606,7 @@ void DoErrorResultPropagation(TUringRouterConfig config) {
     constexpr ui32 fileSize = 4096;
     f.Resize(fileSize);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -633,7 +639,7 @@ void DoStopAfterFlush(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -666,7 +672,7 @@ void DoStopWithoutFlush(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -697,7 +703,7 @@ void DoStopAfterIdle(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -746,7 +752,7 @@ void DoStopWhileCallbackRunning(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -805,7 +811,7 @@ void DoDeviceSampleSink(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
 
     TDeviceIoSample sample;
@@ -848,7 +854,7 @@ void DoFixedShortRetrySampling(TUringRouterConfig config) {
     constexpr ui32 bufferSize = 8192;
     f.Resize(fileSize);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
 
     TAlignedBuf buf(bufferSize);
@@ -910,7 +916,7 @@ void DoScatterGatherShortRetrySampling(TUringRouterConfig config) {
     constexpr ui32 segmentSize = 4096;
     f.Resize(fileSize);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
 
     TDeviceIoSample samples[2];
@@ -969,7 +975,7 @@ void DoSubmissionLifecycle(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
 
     constexpr ui32 size = 4096;
@@ -1004,7 +1010,7 @@ void DoWakeAfterIdle(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -1035,7 +1041,7 @@ void DoMultiProducerConcurrentSubmit(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -1087,7 +1093,7 @@ void DoSubmitStopRace(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -1157,7 +1163,7 @@ void DoConcurrentStop(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(1 << 20);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -1214,7 +1220,7 @@ void DoScatterGatherWriteReadBack(TUringRouterConfig config) {
     constexpr ui32 totalSize = N * segSize;
     f.Resize(totalSize);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -1268,7 +1274,7 @@ void DoScatterGatherSingleIovec(TUringRouterConfig config) {
     constexpr ui32 size = 4096;
     f.Resize(size);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 
@@ -1310,7 +1316,7 @@ void DoScatterGatherErrorPropagation(TUringRouterConfig config) {
     TFile f(tmp.Name(), CreateAlways | RdWr);
     f.Resize(4096);
 
-    TUringRouter router(f.GetHandle(), nullptr, config);
+    TUringRouter router(DupOwned(f), nullptr, config);
     router.RegisterFile();
     router.Start();
 

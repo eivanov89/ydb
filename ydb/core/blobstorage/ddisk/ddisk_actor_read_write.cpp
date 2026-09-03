@@ -709,10 +709,6 @@ namespace NKikimr::NDDisk {
                 ProcessDeallocatePersistentBufferChunk(true);
                 break;
             }
-            case EWakeupTag::WakeupFlushDeviceOverestimationSamples: {
-                FlushDeviceOverestimationSamples();
-                break;
-            }
         }
     }
 

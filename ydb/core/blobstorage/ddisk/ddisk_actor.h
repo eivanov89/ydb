@@ -21,11 +21,10 @@
 #include <ydb/library/wilson_ids/wilson.h>
 
 #if defined(__linux__)
-#include <ydb/library/pdisk_io/uring_router.h>
+#include <ydb/library/pdisk_io/uring_router_client.h>
 #endif
 
 #include <ydb/library/pdisk_io/uring_operation.h>
-#include <ydb/library/pdisk_io/device_io_sample.h>
 
 #include <ydb/core/util/spsc_circular_queue.h>
 
@@ -35,7 +34,6 @@
 #include <queue>
 
 #include <util/generic/hash_set.h>
-#include <util/system/mutex.h>
 
 #include <library/cpp/containers/absl/flat_hash_map.h>
 #include <library/cpp/containers/absl/flat_hash_set.h>
@@ -92,8 +90,6 @@ namespace NKikimr::NDDisk {
         TIntrusivePtr<NMonitoring::TDynamicCounters> CountersBase;
         std::vector<std::pair<TString, TString>> CountersChain;
         ui64 DDiskInstanceGuid = RandomNumber<ui64>();
-
-        static constexpr ui32 MaxInFlight = 256; // TODO: make configurable
 
         class TDirectIoOpBase;
         class TDDiskIoOp;
@@ -206,16 +202,8 @@ namespace NKikimr::NDDisk {
                 NMonitoring::TDynamicCounters::TCounterPtr ShortReads;
                 NMonitoring::TDynamicCounters::TCounterPtr ShortWrites;
 
-                NMonitoring::TDynamicCounters::TCounterPtr RegularUringCount;
-                NMonitoring::TDynamicCounters::TCounterPtr FallbackUringCount;
-                NMonitoring::TDynamicCounters::TCounterPtr FallbackPDiskCount;
-
                 NMonitoring::TDynamicCounters::TCounterPtr RunningCount;
             } DirectIO;
-
-#if defined(__linux__)
-            NPDisk::TUringCounters UringCounters;
-#endif
 
             struct {
                 NMonitoring::TDynamicCounters::TCounterPtr AllocatedChunks;
@@ -243,50 +231,8 @@ namespace NKikimr::NDDisk {
         TCounters Counters;
 
 #if defined(__linux__)
-        // we share Counters with UringRouter, so that
-        // UringRouter must be after the counters to have a
-        // proper destruction order
-        std::unique_ptr<NPDisk::TUringRouter> UringRouter;
+        std::shared_ptr<NPDisk::IUringRouterClient> UringRouter;
 #endif
-
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // The io_uring I/O thread (via UringRouter's sample sink)
-        // pushes raw TDeviceIoSample-s into DeviceOverestimationSamples under
-        // DeviceOverestimationSamplesMutex. Periodically (WakeupFlushDeviceOverestimationSamples)
-        // the actor thread drains the buffer and forwards a batch to the owning
-        // PDisk actor (BaseInfo.PDiskActorID), which merges it with samples from
-        // other sources (PDisk's own block device, other DDisk/PB slots on the
-        // same PDisk) sharing the same physical device.
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-        static constexpr size_t MaxBufferedDeviceOverestimationSamples = 4096;
-        static constexpr TDuration DeviceOverestimationFlushPeriod = TDuration::Seconds(5);
-
-        TMutex DeviceOverestimationSamplesMutex;
-        std::vector<NPDisk::TDeviceIoSample> DeviceOverestimationSamples;
-
-        // Flat cost-estimation constants derived once from PDiskParams (seek
-        // time, read/write speed) in InitUring(). Deliberately reuses PDisk's
-        // measured constants for the first iteration; IO_URING may warrant
-        // its own calibrated constants later.
-        ui64 DeviceOverestimationReadSpeedBps = 0;
-        ui64 DeviceOverestimationWriteSpeedBps = 0;
-
-        static constexpr ui64 NanosecondsPerSecond = 1'000'000'000ull;
-
-        // Estimates the cost of an operation excluding any seek cost (the
-        // owning PDisk actor's aggregator applies seek cost itself based on
-        // the merged, cross-source stream).
-        ui64 EstimateDeviceIoBaseCostNs(bool isWrite, ui64 size) const {
-            const ui64 speedBps = isWrite ? DeviceOverestimationWriteSpeedBps : DeviceOverestimationReadSpeedBps;
-            if (speedBps == 0) {
-                return 0;
-            }
-            return size * NanosecondsPerSecond / speedBps;
-        }
-
-        void OnDeviceIoSample(const NPDisk::TDeviceIoSample& sample);
-        void FlushDeviceOverestimationSamples();
 
     public:
         struct TEvPrivate {
@@ -519,7 +465,6 @@ namespace NKikimr::NDDisk {
             WakeupCollectPbStats = 3,
             WakeupProcessPersistentBufferBatchWrite = 4,
             WakeupProcessDeallocatePersistentBufferChunk = 5,
-            WakeupFlushDeviceOverestimationSamples = 6,
         };
 
         struct TPbOpSnapshot {
@@ -560,8 +505,11 @@ namespace NKikimr::NDDisk {
         TDDiskActor(TVDiskConfig::TBaseInfo&& baseInfo, TIntrusivePtr<TBlobStorageGroupInfo> info,
             TPersistentBufferFormat&& pbFormat, TDDiskConfig&& ddiskConfig,
             TIntrusivePtr<NMonitoring::TDynamicCounters> counters, const std::vector<ui32>& initPersistentBufferChunks,
-            ui64 persistentBufferUniqueId, TIntrusivePtr<TPDiskParams> pDiskParams, NPDisk::TDiskFormatPtr diskFormat,
-            TFileHandle&& diskFd);
+            ui64 persistentBufferUniqueId, TIntrusivePtr<TPDiskParams> pDiskParams, NPDisk::TDiskFormatPtr diskFormat
+#if defined(__linux__)
+            , std::shared_ptr<NPDisk::IUringRouterClient> uringRouter
+#endif
+            );
 
         ~TDDiskActor();
         void Bootstrap();
@@ -611,7 +559,6 @@ namespace NKikimr::NDDisk {
 
         THashMap<ui64, THashMap<ui64, TChunkRef>> ChunkRefs; // TabletId -> (VChunkIndex -> ChunkIdx)
         TIntrusivePtr<TPDiskParams> PDiskParams;
-        TFileHandle DiskFd;
         std::vector<TChunkIdx> OwnedChunksOnBoot;
         ui64 ChunkMapSnapshotLsn = Max<ui64>();
         std::queue<TPendingEvent> PendingQueries;

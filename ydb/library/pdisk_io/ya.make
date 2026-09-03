@@ -55,6 +55,7 @@ SRCS(
     sector_map.h
     uring_operation.h
     uring_operation.cpp
+    uring_router_client.h
     wcache.cpp
     wcache.h
 )

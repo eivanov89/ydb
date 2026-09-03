@@ -130,8 +130,8 @@ public:
             }
 
             auto accountBusy = [&] {
-                if (Owner.Counters) {
-                    *Owner.Counters->CompletionThreadBusyTimeNs += HPNanoSeconds(HPNow() - cycleStart);
+                if (Owner.Counters.CompletionThreadBusyTimeNs) {
+                    *Owner.Counters.CompletionThreadBusyTimeNs += HPNanoSeconds(HPNow() - cycleStart);
                 }
             };
 
@@ -186,11 +186,11 @@ TUringOperationBase* TUringRouter::QueueStopSentinel() {
     return reinterpret_cast<TUringOperationBase*>(&QueueStopSentinelStorage);
 }
 
-TUringRouter::TUringRouter(FHANDLE fd, TActorSystem* actorSystem, TUringRouterConfig config, TUringCounters* counters)
-    : Fd(fd)
+TUringRouter::TUringRouter(TFileHandle fd, TActorSystem* actorSystem, TUringRouterConfig config, TUringCounters counters)
+    : Fd(std::move(fd))
     , ActorSystem(actorSystem)
     , Config(config)
-    , Counters(counters)
+    , Counters(std::move(counters))
     , Ring(new struct io_uring())
     , WakeEventFd(CreateWakeEventFd())
 {
@@ -250,7 +250,7 @@ void TUringRouter::InitializeOnIoThread() {
         "io_uring_enable_rings failed: %s (errno %d)", strerror(-ret), -ret);
 
     if (WantRegisterFile) {
-        int fd = Fd;
+        int fd = static_cast<FHANDLE>(Fd);
         do {
             ret = io_uring_register_files(Ring.get(), &fd, 1);
         } while (ret == -EINTR);
@@ -282,7 +282,7 @@ struct io_uring_sqe* TUringRouter::GetSqe() {
 void TUringRouter::PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op) {
     // Use vectored SQEs for genuine scatter-gather and oversized singleton
     // requests; scalar SQEs take an unsigned byte count and would narrow the latter.
-    const int fd = FixedFdIndex >= 0 ? FixedFdIndex : Fd;
+    const int fd = FixedFdIndex >= 0 ? FixedFdIndex : static_cast<FHANDLE>(Fd);
     Y_ABORT_UNLESS(op->IovBegin < op->Iov.size(),
         "PrepareSqe called with empty iovec window");
     const unsigned iovCount = static_cast<unsigned>(op->Iov.size() - op->IovBegin);
@@ -530,8 +530,8 @@ ui32 TUringRouter::ReapCompletions() {
         ++count;
     }
 
-    if (count > 0 && Counters) {
-        *Counters->CompletionThreadCPU = ThreadCPUTime();
+    if (count > 0 && Counters.CompletionThreadCPU) {
+        *Counters.CompletionThreadCPU = ThreadCPUTime();
     }
     return count;
 }

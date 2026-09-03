@@ -33,7 +33,13 @@
 #include <util/system/condvar.h>
 #include <util/system/mutex.h>
 
+#include <atomic>
+#include <memory>
 #include <queue>
+
+#if defined(__linux__)
+#include <ydb/library/pdisk_io/uring_router.h>
+#endif
 
 namespace NKikimr {
 namespace NPDisk {
@@ -216,6 +222,13 @@ public:
     // Incapsulated components
     TPDiskThread PDiskThread;
     THolder<IBlockDevice> BlockDevice;
+#if defined(__linux__)
+    // Owns the duplicated disk fd. DDisk/PB hold IUringRouterClient copies of
+    // this pointer; only PDisk Stop()s it, and only when it is the last owner.
+    std::shared_ptr<TUringRouter> SharedUringRouter;
+    std::shared_ptr<std::atomic<TDeviceOverestimationAggregator*>> UringSampleAggregator;
+#endif
+    bool SharedUringCreateAttempted = false;
     THolder<TLogWriter> CommonLogger;
     THolder<TSysLogWriter> SysLogger;
 
@@ -390,6 +403,8 @@ public:
     bool YardInitStart(TYardInit &evYardInit);
     void YardInitFinish(TYardInit &evYardInit);
     bool YardInitForKnownVDisk(TYardInit &evYardInit, TOwner owner);
+    void AttachSharedUringRouter(const TYardInit& evYardInit, TEvYardInitResult& result);
+    void EnsureSharedUringRouter();
     void YardResize(TYardResize &evYardResize);
     void ProcessChangeExpectedSlotCount(TChangeExpectedSlotCount& request);
     void NormalizeExpectedSlotSettings();

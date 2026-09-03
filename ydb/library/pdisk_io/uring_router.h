@@ -1,6 +1,7 @@
 #pragma once
 
 #include "uring_operation.h"
+#include "uring_router_client.h"
 #include "device_io_sample.h"
 
 #include <library/cpp/monlib/dynamic_counters/counters.h>
@@ -8,6 +9,7 @@
 
 #include <util/generic/string.h>
 #include <util/system/event.h>
+#include <util/system/file.h>
 #include <util/system/fhandle.h>
 
 #include <sys/uio.h>
@@ -31,33 +33,21 @@ enum class EUringFavor {
     FallbackPDisk,  // io_uring unavailable at all; caller routes I/O through PDisk instead
 };
 
-struct TUringRouterConfig {
-    // Target SQ ring size (number of submission slots). The kernel creates a
-    // CQ of twice this size by default. Typical devices have hardware queue
-    // depth around 128; using 256 entries gives additional headroom to reduce
-    // the risk of SQ exhaustion and improve device utilization. Submissions
-    // beyond this cap are absorbed by the submit queue (see Submit()).
-    ui32 QueueDepth = 256;
-
-    // How long (in microseconds) the dedicated I/O thread busy-polls the
-    // submission queue and completion ring before parking when idle. Lower
-    // values trade CPU for submit-wakeup latency.
-    ui32 IdleSpinUs = 200;
-
-    TString ToString() const;
-};
-
 struct TUringCounters {
     NMonitoring::TDynamicCounters::TCounterPtr CompletionThreadCPU;
     NMonitoring::TDynamicCounters::TCounterPtr CompletionThreadBusyTimeNs;
 };
 
-// TUringRouter owns one io_uring instance for one device. Submit(), Read(),
-// Write(), ReadFixed(), and WriteFixed() are safe to call concurrently: callers
-// only publish operations to an MPSC queue. One dedicated I/O thread is the
-// ring's sole submitter and reaper, as required by IORING_SETUP_SINGLE_ISSUER
-// and IORING_SETUP_DEFER_TASKRUN. It batches submissions, reaps completions,
-// and invokes operation callbacks.
+// TUringRouter owns one io_uring instance for one device, including the
+// duplicated disk fd passed to the constructor. Submit(), Read(), Write(),
+// ReadFixed(), and WriteFixed() are safe to call concurrently: callers only
+// publish operations to an MPSC queue. One dedicated I/O thread is the ring's
+// sole submitter and reaper, as required by IORING_SETUP_SINGLE_ISSUER and
+// IORING_SETUP_DEFER_TASKRUN. It batches submissions, reaps completions, and
+// invokes operation callbacks.
+//
+// DDisk and PersistentBuffer should hold IUringRouterClient, not TUringRouter,
+// so they cannot Start()/Stop() a shared ring.
 //
 // RegisterFile(), RegisterBuffers(), SetSampleSink(), and Start() are setup
 // operations and must be called by one thread before concurrent submission.
@@ -70,17 +60,18 @@ struct TUringCounters {
 // The sink must be cheap and thread-safe on its own.
 using TDeviceIoSampleSink = std::function<void(const TDeviceIoSample&)>;
 
-class TUringRouter {
+class TUringRouter : public IUringRouterClient {
 public:
     TUringRouter(
-        FHANDLE fd,
+        TFileHandle fd,
         NActors::TActorSystem* actorSystem,
         TUringRouterConfig config = {},
-        TUringCounters* counters = nullptr);
+        TUringCounters counters = {});
+    TUringRouter(FHANDLE, NActors::TActorSystem*, TUringRouterConfig = {}, TUringCounters = {}) = delete;
 
-    ~TUringRouter();
+    ~TUringRouter() override;
 
-    const TUringRouterConfig& GetConfig() const {
+    const TUringRouterConfig& GetConfig() const override {
         return Config;
     }
 
@@ -118,8 +109,8 @@ public:
     // callback before Stop() returns.
     bool Submit(TUringOperationBase* op);
 
-    bool Read(TUringOperationBase* op);
-    bool Write(TUringOperationBase* op);
+    bool Read(TUringOperationBase* op) override;
+    bool Write(TUringOperationBase* op) override;
 
     // Fixed-buffer variants require successful RegisterBuffers() during Start().
     bool ReadFixed(void* buf, ui32 size, ui64 offset, ui16 bufIndex, TUringOperationBase* op);
@@ -176,10 +167,10 @@ private:
     static TUringOperationBase* QueueStopSentinel();
 
 private:
-    FHANDLE Fd;
+    TFileHandle Fd;
     NActors::TActorSystem* ActorSystem;
     TUringRouterConfig Config;
-    TUringCounters* Counters;
+    TUringCounters Counters;
     TDeviceIoSampleSink SampleSink;
 
     std::unique_ptr<struct io_uring> Ring;
