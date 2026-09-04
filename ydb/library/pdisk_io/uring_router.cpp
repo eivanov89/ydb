@@ -35,6 +35,22 @@ alignas(void*) char StopCqeMarker;
 // CQE marker for the eventfd poll used to wake a parked I/O thread.
 alignas(void*) char WakePollMarker;
 
+TUringOperationBase* QueueStopSentinel() {
+    return reinterpret_cast<TUringOperationBase*>(&QueueStopSentinelStorage);
+}
+
+void WakeIoThreadIfParked(std::atomic<bool>& parked, int wakeEventFd) {
+    if (parked.load(std::memory_order_seq_cst)) {
+        ui64 one = 1;
+        ssize_t written;
+        do {
+            written = write(wakeEventFd, &one, sizeof(one));
+        } while (written < 0 && errno == EINTR);
+        // EAGAIN only means an earlier wake is already retained in eventfd.
+        Y_DEBUG_ABORT_UNLESS(written == static_cast<ssize_t>(sizeof(one)) || errno == EAGAIN);
+    }
+}
+
 // The eventfd poll is the normal wakeup path. This timeout only bounds a
 // missed-wakeup race and is deliberately much longer than the idle spin.
 constexpr ui32 ParkSafetyNetUs = 5000;
@@ -170,22 +186,6 @@ private:
 // TUringRouter
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-ui64 TUringRouter::PackLifecycle(ui32 state, ui32 producers) {
-    return (static_cast<ui64>(state) << 32) | producers;
-}
-
-ui32 TUringRouter::UnpackLifecycle(ui64 value) {
-    return static_cast<ui32>(value >> 32);
-}
-
-ui32 TUringRouter::UnpackProducers(ui64 value) {
-    return static_cast<ui32>(value);
-}
-
-TUringOperationBase* TUringRouter::QueueStopSentinel() {
-    return reinterpret_cast<TUringOperationBase*>(&QueueStopSentinelStorage);
-}
-
 TUringRouter::TUringRouter(TFileHandle fd, TActorSystem* actorSystem, TUringRouterConfig config, TUringCounters counters)
     : Fd(std::move(fd))
     , ActorSystem(actorSystem)
@@ -205,21 +205,21 @@ TUringRouter::TUringRouter(TFileHandle fd, TActorSystem* actorSystem, TUringRout
 }
 
 TUringRouter::~TUringRouter() {
-    Stop();
+    SyncStop();
     if (WakeEventFd >= 0) {
         close(WakeEventFd);
     }
 }
 
 void TUringRouter::RegisterFile() {
-    Y_ABORT_UNLESS(UnpackLifecycle(Lifecycle.load(std::memory_order_acquire)) == LifecycleCreated,
+    Y_ABORT_UNLESS(State.load(std::memory_order_acquire) == EUringRouterState::Created,
         "RegisterFile() must be called before Start()");
     Y_ABORT_UNLESS(!IoThread);
     WantRegisterFile = true;
 }
 
 void TUringRouter::RegisterBuffers(const struct iovec* iovs, unsigned count) {
-    Y_ABORT_UNLESS(UnpackLifecycle(Lifecycle.load(std::memory_order_acquire)) == LifecycleCreated,
+    Y_ABORT_UNLESS(State.load(std::memory_order_acquire) == EUringRouterState::Created,
         "RegisterBuffers() must be called before Start()");
     Y_ABORT_UNLESS(!IoThread);
     PendingIovs = iovs;
@@ -228,17 +228,63 @@ void TUringRouter::RegisterBuffers(const struct iovec* iovs, unsigned count) {
 }
 
 void TUringRouter::Start() {
-    Y_ABORT_UNLESS(UnpackLifecycle(Lifecycle.load(std::memory_order_acquire)) == LifecycleCreated,
-        "Start() must be called exactly once before Stop()");
+    Y_ABORT_UNLESS(State.load(std::memory_order_acquire) == EUringRouterState::Created,
+        "Start() must be called exactly once before AsyncStop()");
     Y_ABORT_UNLESS(!IoThread);
 
     IoThread = std::make_unique<TIoThread>(*this);
     IoThread->Start();
     ReadyEvent.WaitI();
 
-    ui64 expected = PackLifecycle(LifecycleCreated, 0);
-    Y_ABORT_UNLESS(Lifecycle.compare_exchange_strong(expected, PackLifecycle(LifecycleRunning, 0),
+    EUringRouterState expected = EUringRouterState::Created;
+    Y_ABORT_UNLESS(State.compare_exchange_strong(expected, EUringRouterState::Running,
         std::memory_order_release, std::memory_order_relaxed));
+}
+
+void TUringRouter::AsyncStop() {
+    EUringRouterState state = State.load(std::memory_order_acquire);
+    for (;;) {
+        switch (state) {
+        case EUringRouterState::Created:
+        case EUringRouterState::Running:
+            if (State.compare_exchange_weak(state, EUringRouterState::Stopping,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                WakeIoThreadIfParked(Parked, WakeEventFd);
+                return;
+            }
+            break;
+        case EUringRouterState::Stopping:
+        case EUringRouterState::Stopped:
+            return;
+        default:
+            Y_ABORT("Unknown io_uring router state: %u", static_cast<unsigned>(state));
+        }
+    }
+}
+
+void TUringRouter::SyncStop() {
+    if (State.load(std::memory_order_acquire) == EUringRouterState::Stopped) {
+        return;
+    }
+    AsyncStop();
+
+    while (InFlightCount.load(std::memory_order_acquire) != 0) {
+        Sleep(TDuration::MilliSeconds(10));
+    }
+
+    if (IoThread) {
+        Queue.Push(QueueStopSentinel());
+        WakeIoThreadIfParked(Parked, WakeEventFd);
+        IoThread->Join();
+        IoThread.reset();
+    }
+
+    if (Ring) {
+        io_uring_queue_exit(Ring.get());
+        Ring.reset();
+    }
+
+    State.store(EUringRouterState::Stopped, std::memory_order_release);
 }
 
 void TUringRouter::InitializeOnIoThread() {
@@ -341,37 +387,8 @@ void TUringRouter::PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op)
     NSan::Release(op);
 }
 
-bool TUringRouter::BeginSubmit() {
-    ui64 current = Lifecycle.load(std::memory_order_acquire);
-    while (UnpackLifecycle(current) == LifecycleRunning) {
-        Y_ABORT_UNLESS(UnpackProducers(current) != Max<ui32>(),
-            "too many concurrent io_uring producers");
-        if (Lifecycle.compare_exchange_weak(current, current + 1,
-                std::memory_order_acquire, std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void TUringRouter::EndSubmit() {
-    const ui64 previous = Lifecycle.fetch_sub(1, std::memory_order_release);
-    Y_DEBUG_ABORT_UNLESS(UnpackProducers(previous) > 0);
-    if (UnpackLifecycle(previous) == LifecycleStopping && UnpackProducers(previous) == 1) {
-        SubmittersDrained.Signal();
-    }
-}
-
-void TUringRouter::WakeIoThreadIfParked() {
-    if (Parked.load(std::memory_order_seq_cst)) {
-        ui64 one = 1;
-        ssize_t written;
-        do {
-            written = write(WakeEventFd, &one, sizeof(one));
-        } while (written < 0 && errno == EINTR);
-        // EAGAIN only means an earlier wake is already retained in eventfd.
-        Y_DEBUG_ABORT_UNLESS(written == static_cast<ssize_t>(sizeof(one)) || errno == EAGAIN);
-    }
+ui64 TUringRouter::GetInflight() const {
+    return InFlightCount.load(std::memory_order_relaxed);
 }
 
 bool TUringRouter::Submit(TUringOperationBase* op) {
@@ -379,15 +396,15 @@ bool TUringRouter::Submit(TUringOperationBase* op) {
     Y_ABORT_UNLESS(op->GetOperationType() != TUringOperationBase::ENOT_SET,
         "Submit() called with an unprepared operation");
 
-    if (!BeginSubmit()) {
+    if (State.load(std::memory_order_seq_cst) != EUringRouterState::Running) {
         return false;
     }
 
     InFlightCount.fetch_add(1, std::memory_order_relaxed);
+
     NSan::Release(op);
     Queue.Push(op);
-    WakeIoThreadIfParked();
-    EndSubmit();
+    WakeIoThreadIfParked(Parked, WakeEventFd);
     return true;
 }
 
@@ -419,9 +436,6 @@ bool TUringRouter::WriteFixed(const void* buf, ui32 size, ui64 offset, ui16 bufI
     return Submit(op);
 }
 
-void TUringRouter::Flush() {
-}
-
 bool TUringRouter::DrainSubmitQueue() {
     bool didWork = false;
     for (;;) {
@@ -440,6 +454,12 @@ bool TUringRouter::DrainSubmitQueue() {
             NSan::Acquire(op);
         }
 
+        if (State.load(std::memory_order_acquire) != EUringRouterState::Running) {
+            DropOperation(op);
+            didWork = true;
+            continue;
+        }
+
         struct io_uring_sqe* sqe = GetSqe();
         if (!sqe) {
             PendingSubmit = op;
@@ -451,7 +471,43 @@ bool TUringRouter::DrainSubmitQueue() {
     return didWork;
 }
 
-void TUringRouter::SubmitPendingSqes() {
+void TUringRouter::DropOperation(TUringOperationBase* op) {
+    op->OnDrop();
+    const ui64 previous = InFlightCount.fetch_sub(1, std::memory_order_release);
+    Y_DEBUG_ABORT_UNLESS(previous > 0);
+}
+
+void TUringRouter::DropPendingSqes() {
+    auto& sq = Ring->sq;
+    const unsigned head = sq.sqe_head;
+    const unsigned tail = sq.sqe_tail;
+
+    // These entries have been acquired with io_uring_get_sqe(), but have not
+    // yet been exposed to the kernel by io_uring_submit(). Rewind the local
+    // tail first so callbacks cannot observe stale pending SQEs.
+    sq.sqe_tail = head;
+
+    for (unsigned index = head; index != tail; ++index) {
+        struct io_uring_sqe* sqe = &sq.sqes[
+            (index & sq.ring_mask) << io_uring_sqe_shift(Ring.get())];
+        auto* op = reinterpret_cast<TUringOperationBase*>(static_cast<uintptr_t>(sqe->user_data));
+        Y_ABORT_UNLESS(op && op != QueueStopSentinel()
+                && static_cast<void*>(op) != &StopCqeMarker
+                && static_cast<void*>(op) != &WakePollMarker,
+            "non-operation SQE found in the shutdown drop batch");
+        NSan::Acquire(op);
+        DropOperation(op);
+    }
+}
+
+void TUringRouter::SubmitPendingSqes(bool allowWhileStopping) {
+    if (!allowWhileStopping
+            && State.load(std::memory_order_acquire) != EUringRouterState::Running
+            && Ring->sq.sqe_head != Ring->sq.sqe_tail) {
+        DropPendingSqes();
+        return;
+    }
+
     while (io_uring_sq_ready(Ring.get()) > 0) {
         int ret;
         do {
@@ -522,7 +578,7 @@ ui32 TUringRouter::ReapCompletions() {
             }
 
             op->OnComplete(ActorSystem);
-            const ui32 previous = InFlightCount.fetch_sub(1, std::memory_order_release);
+            const ui64 previous = InFlightCount.fetch_sub(1, std::memory_order_release);
             Y_DEBUG_ABORT_UNLESS(previous > 0);
         }
 
@@ -573,7 +629,7 @@ void TUringRouter::HandleStop() {
     struct io_uring* ring = Ring.get();
 
     while (PendingSubmit) {
-        SubmitPendingSqes();
+        SubmitPendingSqes(/*allowWhileStopping=*/true);
         if (struct io_uring_sqe* sqe = GetSqe()) {
             PrepareSqe(sqe, PendingSubmit);
             PendingSubmit = nullptr;
@@ -603,7 +659,7 @@ void TUringRouter::HandleStop() {
 
     struct io_uring_sqe* sqe = nullptr;
     while (!(sqe = GetSqe())) {
-        SubmitPendingSqes();
+        SubmitPendingSqes(/*allowWhileStopping=*/true);
         if (ReapCompletions() == 0) {
             WaitForCqe(ring);
         }
@@ -612,7 +668,7 @@ void TUringRouter::HandleStop() {
     io_uring_prep_nop(sqe);
     sqe->flags |= IOSQE_IO_DRAIN;
     io_uring_sqe_set_data(sqe, &StopCqeMarker);
-    SubmitPendingSqes();
+    SubmitPendingSqes(/*allowWhileStopping=*/true);
 
     SawStopCqeMarker = false;
     while (!SawStopCqeMarker) {
@@ -623,50 +679,6 @@ void TUringRouter::HandleStop() {
 
     Y_ABORT_UNLESS(!Queue.Pop(),
         "operation found behind io_uring stop sentinel");
-}
-
-void TUringRouter::Stop() {
-    ui64 closedState = 0;
-    for (;;) {
-        ui64 current = Lifecycle.load(std::memory_order_acquire);
-        switch (UnpackLifecycle(current)) {
-        case LifecycleStopped:
-            return;
-        case LifecycleStopping:
-            StoppedEvent.WaitI();
-            return;
-        case LifecycleCreated:
-        case LifecycleRunning:
-            closedState = PackLifecycle(LifecycleStopping, UnpackProducers(current));
-            if (Lifecycle.compare_exchange_weak(current, closedState,
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                break;
-            }
-            continue;
-        }
-        break;
-    }
-
-    if (UnpackProducers(closedState) != 0) {
-        SubmittersDrained.WaitI();
-    }
-
-    if (IoThread) {
-        Queue.Push(QueueStopSentinel());
-        WakeIoThreadIfParked();
-        IoThread->Join();
-        IoThread.reset();
-    }
-
-    Y_ABORT_UNLESS(InFlightCount.load(std::memory_order_acquire) == 0,
-        "io_uring stopped with operations still in flight");
-    if (Ring) {
-        io_uring_queue_exit(Ring.get());
-        Ring.reset();
-    }
-
-    Lifecycle.store(PackLifecycle(LifecycleStopped, 0), std::memory_order_release);
-    StoppedEvent.Signal();
 }
 
 bool TUringRouter::IsFileRegistered() const {
@@ -687,10 +699,6 @@ int TUringRouter::GetRegisterBuffersErrno() const {
 
 EUringFavor TUringRouter::GetUringFavor() const {
     return UsedModernFlags ? EUringFavor::SingleIssuer : EUringFavor::Plain;
-}
-
-ui32 TUringRouter::GetInflight() const {
-    return InFlightCount.load(std::memory_order_relaxed);
 }
 
 bool TUringRouter::Probe(TUringRouterConfig config) {

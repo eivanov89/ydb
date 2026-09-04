@@ -33,6 +33,13 @@ enum class EUringFavor {
     FallbackPDisk,  // io_uring unavailable at all; caller routes I/O through PDisk instead
 };
 
+enum class EUringRouterState : ui32 {
+    Created = 0,
+    Running,
+    Stopping,
+    Stopped,
+};
+
 struct TUringCounters {
     NMonitoring::TDynamicCounters::TCounterPtr CompletionThreadCPU;
     NMonitoring::TDynamicCounters::TCounterPtr CompletionThreadBusyTimeNs;
@@ -47,13 +54,13 @@ struct TUringCounters {
 // invokes operation callbacks.
 //
 // DDisk and PersistentBuffer should hold IUringRouterClient, not TUringRouter,
-// so they cannot Start()/Stop() a shared ring.
+// so they cannot start or stop a shared ring.
 //
 // RegisterFile(), RegisterBuffers(), SetSampleSink(), and Start() are setup
 // operations and must be called by one thread before concurrent submission.
-// Stop() closes admission, waits for producers already inside Submit(), then
-// drains every accepted operation through OnComplete() before returning. It
-// may run concurrently with Submit() and with another Stop().
+// AsyncStop() closes admission without waiting. The last shared owner destroys
+// the router; its destructor drops accepted operations that have not reached
+// the kernel, drains submitted operations, and stops the I/O thread.
 //
 // Optional device I/O sample sink: if set via SetSampleSink() before Start(),
 // the I/O thread invokes it once per successfully completed Read/Write CQE.
@@ -98,15 +105,40 @@ public:
     // enabled and requested registrations have completed.
     void Start();
 
+    // Close admission without waiting for accepted operations. A Submit() that
+    // already observed Running may still be accepted; it will receive exactly
+    // one terminal callback. The duplicated device fd remains open until the
+    // last owner destroys the router, so a replacement PDisk waits for the old
+    // I/O at flock acquisition.
+    void AsyncStop();
+
+private:
+    // Called only by the destructor. Close admission, wait for every accepted
+    // operation to receive a terminal callback, stop the I/O thread, and tear
+    // down the ring. This temporary implementation polls while waiting; an
+    // actor-friendly asynchronous drain can replace it later.
+    void SyncStop();
+
+public:
     // --- Submission (thread-safe) ---
+
+    // Number of accepted operations that are queued, submitted, or currently
+    // executing their completion callback.
+    ui64 GetInflight() const;
 
     // Enqueue a prepared operation. Publishing transfers its lifetime to the
     // router, and the I/O thread may invoke OnComplete() even before Submit()
     // returns. A caller transferring a smart pointer must therefore release it
     // before this call and restore it only if false is returned. False means
     // the router has not been started or is stopping/stopped and no callback
-    // will be delivered. Every accepted operation gets exactly one OnComplete()
-    // callback before Stop() returns.
+    // will be delivered. Every accepted operation gets exactly one terminal
+    // callback: OnComplete() after kernel submission, or OnDrop() if shutdown
+    // reaches it first.
+    //
+    // Concurrent callers must keep the router alive for the entire call. With
+    // shared ownership, each submitting component therefore retains its own
+    // shared_ptr. Destruction cannot race a Submit() that observed Running and
+    // will see its queue publication without a separate submitter counter.
     bool Submit(TUringOperationBase* op);
 
     bool Read(TUringOperationBase* op) override;
@@ -116,13 +148,6 @@ public:
     bool ReadFixed(void* buf, ui32 size, ui64 offset, ui16 bufIndex, TUringOperationBase* op);
     bool WriteFixed(const void* buf, ui32 size, ui64 offset, ui16 bufIndex, TUringOperationBase* op);
 
-    // Compatibility no-op. The I/O thread owns batching and submission.
-    void Flush();
-
-    // Close admission, drain accepted operations, stop the I/O thread, and
-    // tear down the ring. Safe to call repeatedly and concurrently.
-    void Stop();
-
     bool IsFileRegistered() const;
     bool AreBuffersRegistered() const;
     int GetRegisterFileErrno() const;
@@ -130,20 +155,11 @@ public:
 
     EUringFavor GetUringFavor() const;
 
-    // Number of accepted operations that are queued, submitted, or currently
-    // executing their completion callback.
-    ui32 GetInflight() const;
-
     // Returns true if a disabled io_uring instance can be created and enabled
     // with either the modern flags or the plain fallback configuration.
     static bool Probe(TUringRouterConfig config = {});
 
 private:
-    static constexpr ui32 LifecycleCreated = 0;
-    static constexpr ui32 LifecycleRunning = 1;
-    static constexpr ui32 LifecycleStopping = 2;
-    static constexpr ui32 LifecycleStopped = 3;
-
     class TIoThread;
 
     struct io_uring_sqe* GetSqe();
@@ -153,18 +169,11 @@ private:
     void InitializeOnIoThread();
     bool DrainSubmitQueue();
     ui32 ReapCompletions();
-    void SubmitPendingSqes();
+    void SubmitPendingSqes(bool allowWhileStopping = false);
+    void DropPendingSqes();
+    void DropOperation(TUringOperationBase* op);
     void ParkAndWait();
     void HandleStop();
-
-    bool BeginSubmit();
-    void EndSubmit();
-    void WakeIoThreadIfParked();
-
-    static ui64 PackLifecycle(ui32 state, ui32 producers);
-    static ui32 UnpackLifecycle(ui64 value);
-    static ui32 UnpackProducers(ui64 value);
-    static TUringOperationBase* QueueStopSentinel();
 
 private:
     TFileHandle Fd;
@@ -200,14 +209,10 @@ private:
 
     NThreading::TObstructiveConsumerQueue<TUringOperationBase, /*DeleteItems=*/false> Queue;
 
-    // High 32 bits: lifecycle state. Low 32 bits: producers between admission
-    // and completed queue publication. Stop closes the state, waits for that
-    // count to reach zero, and only then appends the stop sentinel.
-    std::atomic<ui64> Lifecycle{PackLifecycle(LifecycleCreated, 0)};
-    TManualEvent SubmittersDrained;
-    TManualEvent StoppedEvent;
-
-    std::atomic<ui32> InFlightCount{0};
+    // Lifetime ownership makes destruction the synchronization point after the
+    // last possible queue publication; State only controls admission.
+    alignas(64) std::atomic<EUringRouterState> State{EUringRouterState::Created};
+    alignas(64) std::atomic<ui64> InFlightCount{0};
 
     TManualEvent ReadyEvent;
     std::unique_ptr<TIoThread> IoThread;

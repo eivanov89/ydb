@@ -24,14 +24,15 @@ struct TUringRouterConfig {
 };
 
 // Submit-only view of a TUringRouter. DDisk and PersistentBuffer hold this so
-// they can enqueue I/O without access to Start()/Stop()/registration.
+// they can enqueue I/O without access to lifecycle or registration methods.
 //
 // Read() and Write() are thread-safe. Publishing transfers the operation's
-// lifetime to the I/O thread, which may invoke OnComplete() before the call
-// returns. A caller transferring a smart pointer must therefore release it
-// before the call and restore it only if false is returned. False means the
-// router has not been started or is stopping/stopped and no callback will
-// be delivered.
+// lifetime to the I/O thread, which may invoke its terminal callback before
+// the call returns. A caller transferring a smart pointer must therefore
+// release it before the call and restore it only if false is returned. Every
+// accepted operation receives exactly one OnComplete() or OnDrop() callback.
+// False means the router has not been started or is stopping/stopped and no
+// callback will be delivered.
 class IUringRouterClient {
 public:
     virtual ~IUringRouterClient() = default;

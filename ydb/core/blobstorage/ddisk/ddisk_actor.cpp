@@ -349,7 +349,7 @@ namespace {
         }
     }
 
-    void TDDiskActor::FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op) {
+    void TDDiskActor::FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op, TString reason) {
         Counters.DirectIO.RunningCount->Dec();
         switch (op->GetOperationType()) {
             case NPDisk::TUringOperationBase::EREAD:
@@ -361,8 +361,11 @@ namespace {
             default:
                 Y_ABORT("Unknown OperationType");
         }
+        if (!reason) {
+            reason = GetBrokenReason();
+        }
         op->Reply(TActivationContext::ActorSystem(),
-            NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR, GetBrokenReason());
+            NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR, std::move(reason));
     }
 
     void TDDiskActor::EnterBroken(TString reason) {

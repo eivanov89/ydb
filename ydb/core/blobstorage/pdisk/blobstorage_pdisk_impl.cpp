@@ -371,12 +371,13 @@ void TPDisk::Stop() {
     if (UringSampleAggregator) {
         UringSampleAggregator->store(nullptr, std::memory_order_release);
     }
-    // FIXME: a proper shutdown protocol will be implemented later. For now
-    // stop the shared router only when PDisk is the last owner. Zombie DDisks
-    // may still hold a copy and are expected to keep submitting (uring bypasses
-    // PDisk owner-round checks on already-committed chunks).
+    // Do not close admission while DDisk/PB clients still own the shared
+    // router: a zombie DDisk may continue direct I/O until its owner-stamped
+    // PDisk request detects the stale round. The last shared owner performs
+    // the blocking drain in TUringRouter's destructor.
     if (SharedUringRouter && SharedUringRouter.use_count() == 1) {
-        SharedUringRouter->Stop();
+        SharedUringRouter->AsyncStop();
+        SharedUringRouter.reset();
     }
 #endif
 

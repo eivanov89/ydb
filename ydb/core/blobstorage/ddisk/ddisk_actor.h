@@ -495,7 +495,7 @@ namespace NKikimr::NDDisk {
         TString GetBrokenReason() const;
         void EnterBroken(TString reason);
         void FailPendingDDiskQuery(std::unique_ptr<IEventHandle> ev);
-        void FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op);
+        void FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op, TString reason = {});
 
     public:
         TDDiskActor(TVDiskConfig::TBaseInfo&& baseInfo, TIntrusivePtr<TBlobStorageGroupInfo> info,

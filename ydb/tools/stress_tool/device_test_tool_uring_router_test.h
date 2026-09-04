@@ -206,9 +206,6 @@ public:
             if (dev && dev->Router) {
                 dev->Router.Reset();
             }
-            if (dev) {
-                dev->File.Reset();
-            }
         }
     }
 
@@ -348,15 +345,13 @@ private:
                 ok = dev.Router->Write(&op);
             }
             Y_ABORT_UNLESS(ok, "Failed to start write");
-
-            dev.Router->Flush();
         }
 
         while (dev.InFlight.load(std::memory_order_acquire) > 0) {
             SpinLockPause();
         }
 
-        dev.Router->Stop();
+        dev.Router.Reset();
     }
 
     ui64 RandomOffset(TDeviceState& dev) const {

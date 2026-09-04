@@ -223,8 +223,9 @@ public:
     TPDiskThread PDiskThread;
     THolder<IBlockDevice> BlockDevice;
 #if defined(__linux__)
-    // Owns the duplicated disk fd. DDisk/PB hold IUringRouterClient copies of
-    // this pointer; only PDisk Stop()s it, and only when it is the last owner.
+    // DDisk/PB hold IUringRouterClient copies of this pointer. PDisk releases
+    // it during Stop() only when no clients remain; otherwise the final owner
+    // destroys the router, drains accepted I/O, and closes the duplicated fd.
     std::shared_ptr<TUringRouter> SharedUringRouter;
     std::shared_ptr<std::atomic<TDeviceOverestimationAggregator*>> UringSampleAggregator;
 #endif

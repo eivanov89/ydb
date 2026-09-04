@@ -582,18 +582,25 @@ namespace NKikimr::NDDisk {
         TDirectIoOpBase* rawOp = op.release();
         Counters.DirectIO.RunningCount->Inc();
 
-        // this is our main/regular path
+        bool accepted = false;
         switch (rawOp->GetOperationType()) {
         case NPDisk::TUringOperationBase::EREAD:
-            Y_ABORT_UNLESS(UringRouter->Read(rawOp),
-                "live io_uring router rejected a read submission");
+            accepted = UringRouter->Read(rawOp);
             break;
         case NPDisk::TUringOperationBase::EWRITE:
-            Y_ABORT_UNLESS(UringRouter->Write(rawOp),
-                "live io_uring router rejected a write submission");
+            accepted = UringRouter->Write(rawOp);
             break;
         default:
             Y_ABORT("Unknown OperationType");
+        }
+
+        if (Y_UNLIKELY(!accepted)) {
+            // AsyncStop() makes rejection expected while PDisk is shutting
+            // down. Submit() did not take ownership, so restore it and fail on
+            // the actor thread; OnDrop() is reserved for accepted operations
+            // and would violate the I/O-thread producer side of the op pool.
+            op.reset(rawOp);
+            FailDirectIoOp(std::move(op), "io_uring router stopped before submission");
         }
 #else
         Y_UNUSED(op);

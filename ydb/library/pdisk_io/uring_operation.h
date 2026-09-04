@@ -35,17 +35,17 @@ public:
     virtual ~TUringOperationBase();
 
 public:
-    // Callbacks
+    // TUringRouter invokes exactly one terminal callback for every operation
+    // accepted by Submit().
 
     // Called from the dedicated I/O thread outside actor system,
     // thus MUST NOT use TActivationContext, instead should use actorSystem->Send().
     // After OnComplete() returns, TUringRouter will not access object anymore.
     virtual void OnComplete(NActors::TActorSystem* actorSystem) noexcept = 0;
 
-    // Cleanup callback for abortive/failure teardown paths. Graceful
-    // TUringRouter::Stop() drains every accepted operation through OnComplete.
-    // Use this to release operation-owned memory/resources if an owner must
-    // explicitly abandon an operation after a terminal router failure.
+    // Called from the dedicated I/O thread when shutdown drops an accepted
+    // operation before kernel submission. Use this to release
+    // operation-owned memory/resources.
     // After OnDrop() returns, TUringRouter will not access object anymore.
     virtual void OnDrop() noexcept = 0;
 
