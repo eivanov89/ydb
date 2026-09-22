@@ -8,10 +8,13 @@ public:
         return actor.OwnDrainComplete && actor.PersistentBufferGone;
     }
     static bool IsBroken(const TDDiskActor& actor) { return actor.IsBroken(); }
+    static bool IsAllocationPending(const TDDiskActor& actor, ui64 tabletId, ui64 vChunkIndex) {
+        return actor.ChunkRefs.at(tabletId).at(vChunkIndex).AllocationPending;
+    }
     // Called in the actor's mailbox, after setup writes have completed.
     static bool ReservationsSettled(const TDDiskActor& actor) {
-        return actor.LogReplayComplete && !actor.ReserveInFlight
-            && actor.FormattingChunks.empty() && actor.ChunkAllocateQueue.empty()
+        return actor.LogReplayComplete && !actor.ChunkManager.IsReservationInFlight()
+            && actor.FormattingChunks.empty() && !actor.ChunkManager.HasAllocations()
             && actor.DataChunkAllocationsInFlight.empty()
             && !actor.IssuePersistentBufferChunkAllocationInflight
             && actor.PersistentBufferChunks.size() >= actor.PersistentBufferFormat.InitChunks;

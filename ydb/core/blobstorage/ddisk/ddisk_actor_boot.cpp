@@ -1,4 +1,6 @@
 #include "ddisk_actor.h"
+#include <ydb/library/actors/async/async.h>
+#include <ydb/library/actors/async/wait_for_event.h>
 #include <algorithm>
 #include <ydb/core/protos/blobstorage_ddisk_internal.pb.h>
 #include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_data.h>
@@ -261,34 +263,33 @@ namespace NKikimr::NDDisk {
     }
 
     void TDDiskActor::ForgetNextStartupOrphan() {
-        if (Stopping) {
-            return;
+        while (!Stopping && !StartupOrphanChunks.empty()) {
+            auto request = std::make_unique<NPDisk::TEvChunkForget>(PDiskParams->Owner,
+                PDiskParams->OwnerRound, TVector<TChunkIdx>{StartupOrphanChunks.front()});
+            request->IsDDisk = true;
+            const ui64 cookie = NActors::AllocateWaitCookie();
+            Send(BaseInfo.PDiskActorID, request.release(), IEventHandle::FlagTrackDelivery, cookie);
+            auto event = co_await NActors::ActorWaitForEvent<IEventHandle>(cookie);
+            if (Stopping) {
+                co_return;
+            }
+            if (event->GetTypeRewrite() == TEvents::TEvUndelivered::EventType) {
+                BeginStopping("PDisk startup forget request was not delivered");
+                co_return;
+            }
+            Y_ABORT_UNLESS(event->GetTypeRewrite() == NPDisk::TEvChunkForgetResult::EventType);
+            const auto& msg = *event->Get<NPDisk::TEvChunkForgetResult>();
+            if (msg.Status == NKikimrProto::ERROR) {
+                YDB_LOG_WARN("DDisk startup orphan cleanup rejected; preserving chunk",
+                    {"DDiskId", DDiskId}, {"chunk", StartupOrphanChunks.front()}, {"reason", msg.ErrorReason});
+            } else if (!CheckPDiskReply(msg.Status, msg.ErrorReason, "startup orphan cleanup")) {
+                co_return;
+            }
+            StartupOrphanChunks.pop();
         }
-        if (StartupOrphanChunks.empty()) {
+        if (!Stopping) {
             FinishRecovery();
-            return;
         }
-        auto request = std::make_unique<NPDisk::TEvChunkForget>(PDiskParams->Owner,
-            PDiskParams->OwnerRound, TVector<TChunkIdx>{StartupOrphanChunks.front()});
-        request->IsDDisk = true;
-        Send(BaseInfo.PDiskActorID, request.release(), IEventHandle::FlagTrackDelivery, StartupForgetCookie);
-    }
-
-    void TDDiskActor::Handle(NPDisk::TEvChunkForgetResult::TPtr ev) {
-        if (ev->Cookie != StartupForgetCookie || Stopping || StartupOrphanChunks.empty()) {
-            return;
-        }
-        const auto& msg = *ev->Get();
-        if (msg.Status == NKikimrProto::ERROR) {
-            // Chunk validation rejected this orphan (e.g. it is committed). Preserve it
-            // and continue individually so it cannot prevent reclaiming other reservations.
-            YDB_LOG_WARN("DDisk startup orphan cleanup rejected; preserving chunk",
-                {"DDiskId", DDiskId}, {"chunk", StartupOrphanChunks.front()}, {"reason", msg.ErrorReason});
-        } else if (!CheckPDiskReply(msg.Status, msg.ErrorReason, "startup orphan cleanup")) {
-            return;
-        }
-        StartupOrphanChunks.pop();
-        ForgetNextStartupOrphan();
     }
 
     void TDDiskActor::FinishRecovery() {
@@ -301,7 +302,7 @@ namespace NKikimr::NDDisk {
             RestoredIntegrityMapping = {};
             // A durable increment is only logged after formatting, so restored chunks are Ready.
             // Empty integrity chunks (no restored extents) are released here.
-            ReclaimUnusedIntegrityChunks();
+            RunIntegrityReclamation();
         }
         RestoredIntegrityMapping = {};
         CreatePersistentBuffer();
@@ -375,19 +376,19 @@ namespace NKikimr::NDDisk {
         return std::min(ChunkMapSnapshotLsn, PersistentBufferChunkMapSnapshotLsn);
     }
 
-    void TDDiskActor::IssuePDiskLogRecord(TLogSignature signature, TChunkIdx chunkIdxToCommit,
-            const NProtoBuf::Message& data, ui64 *startingPointLsn, std::function<void()> callback,
+    ui64 TDDiskActor::IssuePDiskLogRecord(TLogSignature signature, TChunkIdx chunkIdxToCommit,
+            const NProtoBuf::Message& data, ui64 *startingPointLsn,
             TVector<TChunkIdx> chunksToDelete) {
         TVector<TChunkIdx> chunksToCommit;
         if (chunkIdxToCommit) {
             chunksToCommit.push_back(chunkIdxToCommit);
         }
-        IssuePDiskLogRecord(signature, std::move(chunksToCommit), data, startingPointLsn,
-            std::move(callback), std::move(chunksToDelete));
+        return IssuePDiskLogRecord(signature, std::move(chunksToCommit), data, startingPointLsn,
+            std::move(chunksToDelete));
     }
 
-    void TDDiskActor::IssuePDiskLogRecord(TLogSignature signature, TVector<TChunkIdx> chunksToCommit,
-            const NProtoBuf::Message& data, ui64 *startingPointLsn, std::function<void()> callback,
+    ui64 TDDiskActor::IssuePDiskLogRecord(TLogSignature signature, TVector<TChunkIdx> chunksToCommit,
+            const NProtoBuf::Message& data, ui64 *startingPointLsn,
             TVector<TChunkIdx> chunksToDelete) {
         TString buffer;
         const bool success = data.SerializeToString(&buffer);
@@ -404,13 +405,33 @@ namespace NKikimr::NDDisk {
         cr.CommitChunks = std::move(chunksToCommit);
         cr.DeleteChunks = std::move(chunksToDelete);
 
+        const ui64 cookie = NextCookie++;
         Send(BaseInfo.PDiskActorID, new NPDisk::TEvLog(PDiskParams->Owner, PDiskParams->OwnerRound, signature, cr,
-            TRcBuf(std::move(buffer)), {lsn, lsn}, nullptr, TWriteSource::DDiskBoot));
+            TRcBuf(std::move(buffer)), {lsn, lsn}, nullptr, TWriteSource::DDiskBoot),
+            IEventHandle::FlagTrackDelivery, cookie);
 
-        LogCallbacks.emplace(lsn, TLogCallback{
-            .Callback = std::move(callback),
+        LogWaiters.emplace(lsn, TLogWaiter{
+            .DeliveryCookie = cookie,
             .IsDDisk = signature == TLogSignature::SignatureDDiskChunkMap,
         });
+        return lsn;
+    }
+
+    NActors::async<bool> TDDiskActor::WaitForLog(ui64 lsn) {
+        const bool isDDisk = LogWaiters.at(lsn).IsDDisk;
+        const bool committed = co_await NActors::WithAsyncContinuation<bool>([this, lsn](auto continuation) {
+            LogWaiters.at(lsn).Continuation = std::move(continuation);
+        });
+        co_return committed && !Stopping && (!IsBroken() || !isDDisk);
+    }
+
+    void TDDiskActor::FailLogWaiters(bool ddiskOnly) {
+        for (auto& [lsn, waiter] : LogWaiters) {
+            Y_UNUSED(lsn);
+            if ((!ddiskOnly || waiter.IsDDisk) && waiter.Continuation) {
+                waiter.Continuation.Resume(false);
+            }
+        }
     }
 
     void TDDiskActor::Handle(NPDisk::TEvLogResult::TPtr ev) {
@@ -425,14 +446,12 @@ namespace NKikimr::NDDisk {
         }
 
         for (const auto& result : msg.Results) {
-            auto it = LogCallbacks.find(result.Lsn);
-            Y_ABORT_UNLESS(it != LogCallbacks.end());
-            // Move the callback out before erase: it may IssuePDiskLogRecord, which
-            // emplaces into LogCallbacks and would invalidate `it`.
-            TLogCallback cb = std::move(it->second);
-            LogCallbacks.erase(it);
-            if ((!IsBroken() || !cb.IsDDisk) && cb.Callback) {
-                cb.Callback();
+            auto it = LogWaiters.find(result.Lsn);
+            Y_ABORT_UNLESS(it != LogWaiters.end());
+            auto waiter = std::move(it->second);
+            LogWaiters.erase(it);
+            if (waiter.Continuation) {
+                waiter.Continuation.Resume(!Stopping && (!IsBroken() || !waiter.IsDDisk));
             }
             ++*Counters.RecoveryLog.LogRecordsWritten;
         }

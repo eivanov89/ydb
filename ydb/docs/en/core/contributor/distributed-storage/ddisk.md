@@ -30,7 +30,7 @@ Reads and writes operate on nonempty ranges aligned to the 4 KiB integrity unit 
 
 The `interface/UnalignedWritePayloads` counter counts incoming writes with fragmented payloads or buffer addresses not aligned to the device sector size. Each request is counted once, including when chunk allocation or write serialization delays its execution.
 
-The first write to a virtual chunk can park while data and integrity resources are allocated. With checksums enabled, a write acknowledgment waits for both the data write and the integrity update. Writes to the same integrity extent are serialized through that path; independent extents can proceed concurrently.
+The first write to a virtual chunk can suspend its coroutine while data and integrity resources are allocated. Concurrent requests for that virtual chunk share one allocation. With checksums enabled, a write acknowledgment waits for the data write, integrity update, and durable allocation mapping. Serialized writes and sync segments use FIFO coroutine admission for each integrity extent; independent extents can proceed concurrently.
 
 An unallocated virtual chunk reads as zeroes. Chunk allocation and restored integrity state affect how the implementation recognizes never-written blocks within an allocated chunk; do not treat a successful read as evidence that the range has previously been written.
 
@@ -76,6 +76,9 @@ balances counters and publishes results before the final mailbox barrier.
 Existing completions may finish writes only when their integrity and allocation
 log durability conditions are satisfied; shutdown starts no further I/O.
 
+Chunk-map `TEvLog` requests track delivery; a nondelivery notification correlated
+with an outstanding request by its cookie enters Stopping.
+
 After its own I/O drain and terminal-result processing, DDisk requests release
 of its known reservations through `TEvChunkForget`, provided PDisk initialization
 and log replay have completed. Candidates include unused reserved chunks,
@@ -95,7 +98,7 @@ late replies can trigger further forget requests while the actor remains alive.
 Each chunk is submitted for release at most once per actor incarnation, so
 follow-up requests contain only new IDs, regardless of earlier forget replies.
 
-An outstanding reserve request (`ReserveInFlight`) prevents DDisk from publishing
+An outstanding reserve request (`ChunkManager.IsReservationInFlight()`) prevents DDisk from publishing
 Gone, even after its own drain and PB shutdown finish. Every terminal reserve
 reply clears this barrier; successful replies contribute their chunks to the
 release set, and release waits for the existing I/O barrier. Reserve delivery is
@@ -181,6 +184,7 @@ additional actor-Gone ordering of a requested restart.
 |---|---|---|
 | Actor state and sessions | [ddisk_actor.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_actor.cpp), [ddisk_actor_connect.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_actor_connect.cpp) | `ut/ddisk_actor_ut.cpp` |
 | Boot, log, and chunks | [ddisk_actor_boot.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_actor_boot.cpp), [ddisk_actor_chunks.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_actor_chunks.cpp) | `ut/ddisk_actor_pdisk_ut.cpp` |
+| Reservation bookkeeping and allocation ordering | [chunk_manager.h](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/chunk_manager.h) | `ut/chunk_manager_ut.cpp` |
 | Read/write and I/O adapters | [ddisk_actor_read_write.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_actor_read_write.cpp), [direct_io_op.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/direct_io_op.cpp) | `ut/ddisk_actor_checksum_ut.cpp`, `ut/ddisk_actor_ut.cpp` |
 | Integrity state | [integrity_manager.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/integrity_manager.cpp) | `ut/integrity_manager_ut.cpp` |
 | Synchronization | [ddisk_actor_sync.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_actor_sync.cpp), [segment_manager.cpp](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/segment_manager.cpp) | `ut/ddisk_sync_ut.cpp`, `ut/segment_manager_ut.cpp` |

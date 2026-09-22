@@ -8,7 +8,8 @@ The canonical developer contracts are in the [DDisk](../../../docs/en/core/contr
 | Actor state, completions, and shutdown | `ddisk_actor.h`, `ddisk_actor.cpp` |
 | Session validation | `ddisk_actor_connect.cpp` |
 | PDisk owner recovery and PB child creation | `ddisk_actor_boot.cpp` |
-| Chunk mappings, allocation, and deletion | `ddisk_actor_chunks.cpp` |
+| Reservation bookkeeping and allocation ordering | `chunk_manager.h` |
+| Chunk allocation, formatting, commit, and deletion coroutines | `ddisk_actor_chunks.cpp` |
 | Data read/write | `ddisk_actor_read_write.cpp`, `direct_io_op.{h,cpp}` |
 | Integrity format and state | `ddisk_checksums.{h,cpp}`, `integrity_manager.{h,cpp}` |
 | Unified sync and overlap ordering | `ddisk_actor_sync.cpp`, `segment_manager.{h,cpp}` |
@@ -18,6 +19,15 @@ The canonical developer contracts are in the [DDisk](../../../docs/en/core/contr
 | Monitoring | `ddisk_actor_mon.cpp`, `persistent_buffer_mon.*` |
 
 `ut/` contains focused actor, integrity, sync, batching, barrier, and allocator tests. `ut_large/` contains longer PDisk-backed scenarios. Cross-component allocation and load-actor scenarios live in `../ut_blobstorage/` and `../ut_blobstorage/ut_ddisk/`.
+
+`TChunkManager` owns allocation ordering, reusable reservations, and refill
+accounting. Actor coroutines own asynchronous PDisk requests, formatting,
+placement, durability waits, and startup orphan reconciliation. Allocation
+waiters share one operation per virtual chunk; serialized writes and sync
+segments use FIFO extent admission. `LogWaiters` dispatches batched log results
+by LSN to actor-local continuations. Log submission captures snapshots and
+records commit intent before suspension; direct-I/O completions retain buffer
+ownership through retirement.
 
 Shutdown tests must distinguish the indefinite normal actor drain from the
 60-second `io_stalled` diagnostic and the 10-second forced-destructor deadline.

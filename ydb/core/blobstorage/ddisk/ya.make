@@ -3,6 +3,7 @@ LIBRARY()
     SRCS(
         ddisk.cpp
         ddisk.h
+        chunk_manager.h
         ddisk_checksums.cpp
         ddisk_checksums.h
         ddisk_actor.cpp
@@ -28,6 +29,7 @@ LIBRARY()
         ydb/core/protos
         ydb/core/blobstorage/vdisk/common
         ydb/library/pdisk_io
+        ydb/library/actors/async
         library/cpp/containers/absl
         contrib/libs/xxhash
     )

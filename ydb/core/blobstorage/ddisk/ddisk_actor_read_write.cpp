@@ -54,7 +54,7 @@ namespace NKikimr::NDDisk {
             {"cookie", ev->Cookie});
 
         if (!CheckQuery(*ev, &Counters.Interface.Write)) {
-            return;
+            co_return;
         }
 
         const auto& record = ev->Get()->Record;
@@ -68,7 +68,7 @@ namespace NKikimr::NDDisk {
             SendReply(*ev, std::make_unique<TEvWriteResult>(
                 NKikimrBlobStorage::NDDisk::TReplyStatus::BUSY,
                 "tablet chunk deletion is in flight"));
-            return;
+            co_return;
         }
 
         if (!ev->Get()->PayloadAlignmentChecked && instr.PayloadId) {
@@ -87,7 +87,7 @@ namespace NKikimr::NDDisk {
             SendReply(*ev, std::make_unique<TEvWriteResult>(
                 NKikimrBlobStorage::NDDisk::TReplyStatus::INCORRECT_REQUEST,
                 "write offset and size must be aligned to 4 KiB"));
-            return;
+            co_return;
         }
 
         if (Config.EnableChecksums) {
@@ -100,7 +100,7 @@ namespace NKikimr::NDDisk {
                 SendReply(*ev, std::make_unique<TEvWriteResult>(
                     NKikimrBlobStorage::NDDisk::TReplyStatus::INCORRECT_REQUEST,
                     "one checksum per aligned 4 KiB block is required"));
-                return;
+                co_return;
             }
 
             Y_ABORT_UNLESS(instr.PayloadId, "TEvWrite without a payload, but with checksums");
@@ -127,30 +127,42 @@ namespace NKikimr::NDDisk {
                         {"selectorSize", selector.Size},
                         {"blockIdx", result->MismatchedBlockIdx ? static_cast<i64>(*result->MismatchedBlockIdx) : -1});
                     SendReply(*ev, std::make_unique<TEvWriteResult>(result->Status, result->ErrorReason));
-                    return;
+                    co_return;
                 }
             }
         }
 
-        TChunkRef& chunkRef = ChunkRefs[creds.TabletId][selector.VChunkIndex];
-        if (!chunkRef.PendingEventsForChunk.empty() || !chunkRef.ChunkIdx) {
-            // Park first: IssueChunkAllocation may place the extent synchronously from the
-            // reserve and OpenDataChunkWritePath only drains already-queued events.
-            const bool startAllocation = chunkRef.PendingEventsForChunk.empty() && !chunkRef.ChunkIdx;
-            chunkRef.PendingEventsForChunk.emplace(ev, "WaitChunkAllocation");
-            if (startAllocation) {
-                IssueChunkAllocation(creds.TabletId, selector.VChunkIndex);
+        if (!ChunkRefs[creds.TabletId][selector.VChunkIndex].ChunkIdx) {
+            auto span = NWilson::TSpan(TWilson::DDiskTopLevel, NWilson::TTraceId(ev->TraceId),
+                "WaitChunkAllocation", NWilson::EFlags::AUTO_END, TActivationContext::ActorSystem());
+            NPrivate::AddMessageWaitAttributes(span);
+            co_await WaitForChunk(creds.TabletId, selector.VChunkIndex, true);
+            if (Stopping || IsBroken()) {
+                RejectQuery(*ev, Stopping
+                    ? NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH
+                    : NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR,
+                    Stopping ? TString(StoppingReason) : GetBrokenReason());
+                co_return;
             }
-            return;
-        }
-
-        if (chunkRef.IntegrityExtentWriteInFlight) {
-            chunkRef.PendingSerializedWrites.emplace(ev, "WaitIntegrityExtentWrite");
-            return;
+            // The event belongs to this frame, but the session may have been replaced
+            // while reservation or integrity-extent placement was in progress.
+            if (!CheckQuery(*ev, &Counters.Interface.Write)) {
+                co_return;
+            }
         }
         if (Config.EnableChecksums) {
-            chunkRef.IntegrityExtentWriteInFlight = true;
+            if (!(co_await AcquireIntegrityExtent(creds.TabletId, selector.VChunkIndex))) {
+                RejectQuery(*ev, Stopping ? NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH
+                    : NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR,
+                    Stopping ? TString(StoppingReason) : GetBrokenReason());
+                co_return;
+            }
+            if (!CheckQuery(*ev, &Counters.Interface.Write)) {
+                ReleaseIntegrityExtentWrite(creds.TabletId, selector.VChunkIndex);
+                co_return;
+            }
         }
+        auto& chunkRef = ChunkRefs.at(creds.TabletId).at(selector.VChunkIndex);
 
         Counters.Interface.Write.Request(selector.Size);
         const auto requestStartTs = HPNow();
@@ -194,7 +206,7 @@ namespace NKikimr::NDDisk {
                     .VChunkIndex = selector.VChunkIndex,
                 });
                 MaybeFinishClientWrite(integrityOperationId);
-                return;
+                co_return;
             }
         }
 
@@ -265,7 +277,7 @@ namespace NKikimr::NDDisk {
             {"msg", ev->Get()->Record});
 
         if (!CheckQuery(*ev, &Counters.Interface.Read)) {
-            return;
+            co_return;
         }
 
         const auto& record = ev->Get()->Record;
@@ -279,7 +291,7 @@ namespace NKikimr::NDDisk {
             SendReply(*ev, std::make_unique<TEvReadResult>(
                 NKikimrBlobStorage::NDDisk::TReplyStatus::INCORRECT_REQUEST,
                 "read offset and size must be aligned to the 4 KiB integrity unit"));
-            return;
+            co_return;
         }
 
         if (TabletChunkDeletionsInFlight.contains(creds.TabletId)) {
@@ -288,14 +300,26 @@ namespace NKikimr::NDDisk {
             SendReply(*ev, std::make_unique<TEvReadResult>(
                 NKikimrBlobStorage::NDDisk::TReplyStatus::BUSY,
                 "tablet chunk deletion is in flight"));
-            return;
+            co_return;
         }
 
-        TChunkRef& chunkRef = ChunkRefs[creds.TabletId][selector.VChunkIndex];
-        if (!chunkRef.PendingEventsForChunk.empty()) {
-            chunkRef.PendingEventsForChunk.emplace(ev, "WaitChunkAllocation");
-            return;
+        if (ChunkRefs[creds.TabletId][selector.VChunkIndex].AllocationPending) {
+            auto span = NWilson::TSpan(TWilson::DDiskTopLevel, NWilson::TTraceId(ev->TraceId),
+                "WaitChunkAllocation", NWilson::EFlags::AUTO_END, TActivationContext::ActorSystem());
+            NPrivate::AddMessageWaitAttributes(span);
+            co_await WaitForChunk(creds.TabletId, selector.VChunkIndex, false);
+            if (Stopping || IsBroken()) {
+                RejectQuery(*ev, Stopping
+                    ? NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH
+                    : NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR,
+                    Stopping ? TString(StoppingReason) : GetBrokenReason());
+                co_return;
+            }
+            if (!CheckQuery(*ev, &Counters.Interface.Read)) {
+                co_return;
+            }
         }
+        TChunkRef& chunkRef = ChunkRefs.at(creds.TabletId).at(selector.VChunkIndex);
 
         Counters.Interface.Read.Request(selector.Size);
 
@@ -312,7 +336,7 @@ namespace NKikimr::NDDisk {
             SendReply(*ev, std::make_unique<TEvReadResult>(
                 NKikimrBlobStorage::NDDisk::TReplyStatus::OK, std::nullopt,
                 std::move(result), checksums));
-            return;
+            co_return;
         }
 
         if (Config.EnableChecksums) {

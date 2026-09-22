@@ -13,6 +13,7 @@ PEERDIR(
 )
 
 SRCS(
+    chunk_manager_ut.cpp
     ddisk_actor_ut.cpp
     ddisk_actor_batch_write_ut.cpp
     ddisk_actor_checksum_ut.cpp

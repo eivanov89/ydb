@@ -1,8 +1,10 @@
 #pragma once
 
 #include "defs.h"
+#include <list>
 
 #include "ddisk.h"
+#include "chunk_manager.h"
 #include "integrity_manager.h"
 #include "persistent_buffer.h"
 #include "persistent_buffer_header.h"
@@ -17,6 +19,8 @@
 #include <ydb/core/blobstorage/pdisk/blobstorage_pdisk.h>
 
 #include <ydb/library/actors/core/mon.h>
+#include <ydb/library/actors/async/event.h>
+#include <ydb/library/actors/async/continuation.h>
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
 
@@ -255,7 +259,6 @@ namespace NKikimr::NDDisk {
         struct TEvPrivate {
             enum {
                 EvHandleSingleQuery = EventSpaceBegin(TEvents::ES_PRIVATE),
-                EvHandleEventForChunk,
                 EvHandlePersistentBufferEventForChunk,
                 EvRetryIO,
                 EvWritePersistentBufferPart,
@@ -267,7 +270,6 @@ namespace NKikimr::NDDisk {
                 EvRetryListPersistentBuffer,
                 EvDDiskIoResult,
                 EvIntegrityIoResult,
-                EvHandleSerializedWriteForChunk,
                 EvChunkFormatIoResult,
                 EvFinishStopping,
                 EvStopIoTimeout,
@@ -327,27 +329,6 @@ namespace NKikimr::NDDisk {
                 {}
             };
 
-            struct TEvHandleEventForChunk : TEventLocal<TEvHandleEventForChunk, EvHandleEventForChunk> {
-                ui64 TabletId;
-                ui64 VChunkIndex;
-
-                TEvHandleEventForChunk(ui64 tabletId, ui64 vChunkIndex)
-                    : TabletId(tabletId)
-                    , VChunkIndex(vChunkIndex)
-                {}
-            };
-
-            struct TEvHandleSerializedWriteForChunk
-                : TEventLocal<TEvHandleSerializedWriteForChunk, EvHandleSerializedWriteForChunk>
-            {
-                ui64 TabletId;
-                ui64 VChunkIndex;
-
-                TEvHandleSerializedWriteForChunk(ui64 tabletId, ui64 vChunkIndex)
-                    : TabletId(tabletId)
-                    , VChunkIndex(vChunkIndex)
-                {}
-            };
 
             struct TEvHandlePersistentBufferEventForChunk : TEventLocal<TEvHandlePersistentBufferEventForChunk, EvHandlePersistentBufferEventForChunk> {
                 ui32 ChunkIndex;
@@ -567,7 +548,6 @@ namespace NKikimr::NDDisk {
         }
         TString GetBrokenReason() const;
         void EnterBroken(TString reason);
-        void FailPendingDDiskQuery(std::unique_ptr<IEventHandle> ev);
         void FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op, TString reason = {});
 
     public:
@@ -624,17 +604,18 @@ namespace NKikimr::NDDisk {
         struct TChunkRef {
             TChunkIdx ChunkIdx = 0;
             ui32 InFlightDataIo = 0;
-            std::queue<TPendingEvent> PendingEventsForChunk;
+            bool AllocationPending = false;
+            ui32 AllocationWaiters = 0;
+            NActors::TAsyncEvent AllocationReady;
             bool IntegrityExtentWriteInFlight = false;
-            bool SerializedWriteResumeScheduled = false;
-            std::queue<TPendingEvent> PendingSerializedWrites;
+            std::list<ui64> ExtentWaiters;
+            NActors::TAsyncEvent ExtentAvailable;
         };
 
         THashMap<ui64, THashMap<ui64, TChunkRef>> ChunkRefs; // TabletId -> (VChunkIndex -> ChunkIdx)
         TIntrusivePtr<TPDiskParams> PDiskParams;
         std::vector<TChunkIdx> OwnedChunksOnBoot;
         std::queue<TChunkIdx> StartupOrphanChunks;
-        static constexpr ui64 StartupForgetCookie = Max<ui64>() - 1;
         ui64 ChunkMapSnapshotLsn = Max<ui64>();
         std::queue<TPendingEvent> PendingQueries;
         bool HandlingQueries = false;
@@ -649,7 +630,6 @@ namespace NKikimr::NDDisk {
         void ValidateChecksumsModeAfterLogReplay();
         void ReconcileStartupReservations();
         void ForgetNextStartupOrphan();
-        void Handle(NPDisk::TEvChunkForgetResult::TPtr ev);
         void FinishRecovery();
         void StartHandlingQueries();
         void HandleSingleQuery();
@@ -670,31 +650,24 @@ namespace NKikimr::NDDisk {
         static constexpr ui32 MinChunksReservedDDisk = 4;
         static constexpr ui32 MinChunksReservedPersistentBuffer = 2;
         const ui32 MinChunksReserved;
-        std::queue<TChunkIdx> ChunkReserve;
+        TChunkManager ChunkManager;
         // Newly reserved chunks are zeroed in slices before they become allocatable in
         // checksums-disabled mode. Value is the next byte offset to format.
         absl::flat_hash_map<TChunkIdx, ui32> FormattingChunks;
         // Abandoned allocations may still have writes in flight. Never reuse them for PB.
         absl::flat_hash_set<TChunkIdx> PendingChunkRelease;
         absl::flat_hash_set<TChunkIdx> ShutdownChunkReleasesIssued;
-        bool ReserveInFlight = false;
-
-        struct TChunkForData {
-            ui64 TabletId;
-            ui64 VChunkIndex;
-        };
-
-        struct TChunkForPersistentBuffer {};
-
-        struct TChunkForIntegrity {};
-
-        std::queue<std::variant<TChunkForData, TChunkForPersistentBuffer,
-            TChunkForIntegrity>> ChunkAllocateQueue;
-        struct TLogCallback {
-            std::function<void()> Callback;
+        using TChunkForData = TChunkManager::TChunkForData;
+        using TChunkForPersistentBuffer = TChunkManager::TChunkForPersistentBuffer;
+        using TChunkForIntegrity = TChunkManager::TChunkForIntegrity;
+        struct TLogWaiter {
+            NActors::TAsyncContinuation<bool> Continuation;
+            ui64 DeliveryCookie = 0;
             bool IsDDisk = false;
         };
-        absl::flat_hash_map<ui64, TLogCallback> LogCallbacks;
+        absl::flat_hash_map<ui64, TLogWaiter> LogWaiters;
+        NActors::async<bool> WaitForLog(ui64 lsn);
+        void FailLogWaiters(bool ddiskOnly);
         ui64 NextCookie = 1;
 
         struct TPendingIoOp {
@@ -718,15 +691,12 @@ namespace NKikimr::NDDisk {
         ui64 NextRetryId = 0;
 
         void IssueChunkAllocation(ui64 tabletId, ui64 vChunkIndex);
-        void Handle(NPDisk::TEvChunkReserveResult::TPtr ev);
-        void HandleStopping(NPDisk::TEvChunkReserveResult::TPtr ev);
+        NActors::async<void> WaitForChunk(ui64 tabletId, ui64 vChunkIndex, bool allocate);
+        void ReserveChunks(size_t count);
         void ReleaseUncommittedChunks();
         void HandleChunkReserved();
-        size_t CountPendingPersistentBufferChunkAllocations() const;
-        void IssueNextChunkFormatWrite(TChunkIdx chunkIdx);
-        void Handle(TEvPrivate::TEvChunkFormatIoResult::TPtr ev);
+        void FormatChunk(TChunkIdx chunkIdx);
         void Handle(NPDisk::TEvLogResult::TPtr ev);
-        void Handle(TEvPrivate::TEvHandleEventForChunk::TPtr ev);
         void Handle(TEvPrivate::TEvHandlePersistentBufferEventForChunk::TPtr ev);
 
         void Handle(NPDisk::TEvCutLog::TPtr ev);
@@ -748,11 +718,11 @@ namespace NKikimr::NDDisk {
 
         ui64 GetFirstLsnToKeep() const;
 
-        void IssuePDiskLogRecord(TLogSignature signature, TChunkIdx chunkIdxToCommit, const NProtoBuf::Message& data,
-            ui64 *startingPointLsnPtr, std::function<void()> callback,
+        ui64 IssuePDiskLogRecord(TLogSignature signature, TChunkIdx chunkIdxToCommit, const NProtoBuf::Message& data,
+            ui64 *startingPointLsnPtr,
             TVector<TChunkIdx> chunksToDelete = {});
-        void IssuePDiskLogRecord(TLogSignature signature, TVector<TChunkIdx> chunksToCommit,
-            const NProtoBuf::Message& data, ui64 *startingPointLsnPtr, std::function<void()> callback,
+        ui64 IssuePDiskLogRecord(TLogSignature signature, TVector<TChunkIdx> chunksToCommit,
+            const NProtoBuf::Message& data, ui64 *startingPointLsnPtr,
             TVector<TChunkIdx> chunksToDelete = {});
 
         NKikimrBlobStorage::NDDisk::NInternal::TPersistentBufferChunkMapLogRecord CreatePersistentBufferChunkMapSnapshot();
@@ -841,14 +811,16 @@ namespace NKikimr::NDDisk {
         void OpenDataChunkWritePath(std::vector<TIntegrityManager::TDataChunkKey> placedKeys);
         void DrainIntegrityManager(bool kickReserve = true);
         void ReleaseIntegrityExtentWrite(ui64 tabletId, ui64 vChunkIndex);
-        void ScheduleSerializedWrite(ui64 tabletId, ui64 vChunkIndex);
-        void Handle(TEvPrivate::TEvHandleSerializedWriteForChunk::TPtr ev);
+        NActors::async<bool> AcquireIntegrityExtent(ui64 tabletId, ui64 vChunkIndex);
         // Assigns newly free slots to pending extents, submits the resulting actions, and
         // releases integrity chunks that remain completely unused. Never-logged chunks return to
-        // the reserve; committed ones are dropped via a snapshot. completion runs after the
-        // optional release snapshot commits.
-        void ReclaimUnusedIntegrityChunks(std::function<void()> completion = {});
-        void IssueDataChunkIncrement(ui64 tabletId, ui64 vChunkIndex);
+        // the reserve; committed ones are dropped via a snapshot. Returns only after the
+        // optional release snapshot commits, or false on terminal failure.
+        NActors::async<bool> ReclaimUnusedIntegrityChunks();
+        void RunIntegrityReclamation();
+        NActors::async<bool> CommitDataChunk(ui64 tabletId, ui64 vChunkIndex);
+        void AllocateChunk(TChunkManager::TAllocation allocation, TChunkIdx chunkIdx);
+        NActors::async<void> AllocateDataChunk(ui64 tabletId, ui64 vChunkIndex, TChunkIdx chunkIdx);
         void CompleteDataChunkAllocation(ui64 tabletId, ui64 vChunkIndex);
         void FlushParkedAllocationReplies(TDataChunkAllocationInFlight& allocation);
         bool IsIntegrityChunkCommitted(TChunkIdx chunkIdx) const;

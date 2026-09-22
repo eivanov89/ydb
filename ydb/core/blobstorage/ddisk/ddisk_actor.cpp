@@ -366,10 +366,6 @@ namespace {
         return BrokenReason ? BrokenReason : TString("DDisk is broken");
     }
 
-    void TDDiskActor::FailPendingDDiskQuery(std::unique_ptr<IEventHandle> ev) {
-        RejectQuery(*ev, NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR, GetBrokenReason());
-    }
-
     void TDDiskActor::FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op, TString reason) {
         switch (op->GetOperationType()) {
             case NPDisk::TUringOperationBase::EREAD:
@@ -465,6 +461,7 @@ namespace {
             FlushParkedAllocationReplies(allocation);
         }
 
+        FailLogWaiters(true);
         DataChunkAllocationsInFlight.clear();
         ChunkMapIncrementsInFlight.clear();
 
@@ -492,16 +489,7 @@ namespace {
         // and keep serving those PB allocations if DDisk is the one that
         // broke. The PersistentBuffer instance never uses this queue.
         if (!IsPersistentBufferActor) {
-            decltype(ChunkAllocateQueue) persistentBufferAllocations;
-            while (!ChunkAllocateQueue.empty()) {
-                auto allocation = std::move(ChunkAllocateQueue.front());
-                ChunkAllocateQueue.pop();
-                if (std::holds_alternative<TChunkForPersistentBuffer>(
-                        allocation)) {
-                    persistentBufferAllocations.push(std::move(allocation));
-                }
-            }
-            ChunkAllocateQueue.swap(persistentBufferAllocations);
+            ChunkManager.RetainPersistentBufferAllocations();
             HandleChunkReserved();
         }
     }
@@ -514,14 +502,14 @@ namespace {
             TryCompleteStop();
             return;
         }
-        if (sourceType == NPDisk::TEvChunkReserve::EventType && ReserveInFlight) {
-            ReserveInFlight = false;
-            BeginStopping("PDisk reserve request was not delivered");
-            TryCompleteStop();
-            return;
-        }
-        if (sourceType == NPDisk::TEvChunkForget::EventType && ev->Cookie == StartupForgetCookie) {
-            BeginStopping("PDisk startup forget request was not delivered");
+        if (sourceType == NPDisk::TEvLog::EventType) {
+            for (const auto& [lsn, waiter] : LogWaiters) {
+                Y_UNUSED(lsn);
+                if (waiter.DeliveryCookie == ev->Cookie) {
+                    BeginStopping("PDisk log request was not delivered");
+                    return;
+                }
+            }
             return;
         }
         if (sourceType == TEv::EvRead || sourceType == TEv::EvReadPersistentBuffer) {
@@ -590,15 +578,13 @@ namespace {
 
             hFunc(NPDisk::TEvYardInitResult, Handle)
             hFunc(NPDisk::TEvReadLogResult, Handle)
-            hFunc(NPDisk::TEvChunkForgetResult, Handle)
+            IgnoreFunc(NPDisk::TEvChunkForgetResult)
+            IgnoreFunc(NPDisk::TEvChunkReserveResult)
+            IgnoreFunc(TEvPrivate::TEvChunkFormatIoResult)
             cFunc(TEvPrivate::EvHandleSingleQuery, HandleSingleQuery)
-            hFunc(NPDisk::TEvChunkReserveResult, Handle)
             hFunc(NPDisk::TEvLogResult, Handle)
-            hFunc(TEvPrivate::TEvHandleEventForChunk, Handle)
-            hFunc(TEvPrivate::TEvHandleSerializedWriteForChunk, Handle)
             hFunc(TEvPrivate::TEvDDiskIoResult, Handle)
             hFunc(TEvPrivate::TEvIntegrityIoResult, Handle)
-            hFunc(TEvPrivate::TEvChunkFormatIoResult, Handle)
             hFunc(NPDisk::TEvCutLog, Handle)
             hFunc(TEvReadPersistentBufferResult, Handle)
             hFunc(NPDisk::TEvChunkWriteRawResult, Handle)
@@ -767,16 +753,11 @@ namespace {
             Y_UNUSED(tabletId);
             for (auto& [vChunkIndex, chunk] : chunks) {
                 Y_UNUSED(vChunkIndex);
-                auto drain = [&](auto& queue) {
-                    while (!queue.empty()) {
-                        auto ev = queue.front().Release();
-                        queue.pop();
-                        RejectQuery(*ev, status, reason);
-                    }
-                };
-                drain(chunk.PendingEventsForChunk);
-                drain(chunk.PendingSerializedWrites);
-                chunk.SerializedWriteResumeScheduled = false;
+                // Resume frame-owned requests so their normal handlers publish terminal
+                // replies before the stopping mailbox barrier and Gone notification.
+                chunk.AllocationPending = false;
+                chunk.AllocationReady.NotifyAll();
+                chunk.ExtentAvailable.NotifyAll();
             }
         }
 
@@ -881,7 +862,6 @@ namespace {
             cFunc(TEvPrivate::EvFinishStopping, FinishStopping)
             cFunc(TEvPrivate::EvCompleteStop, CompleteStop)
             cFunc(TEvPrivate::EvStopIoTimeout, HandleStopIoTimeout)
-            hFunc(NPDisk::TEvChunkReserveResult, HandleStopping)
             hFunc(NMon::TEvHttpInfo, Handle)
             hFunc(TEvGetPersistentBufferInfo, Handle)
             default:
@@ -916,6 +896,7 @@ namespace {
             Send(PersistentBufferActorId, new TEvents::TEvPoison(),
                 IEventHandle::FlagTrackDelivery, PBShutdownCookie);
         }
+        FailLogWaiters(false);
         RejectQueuedQueries();
         CancelRetries();
         for (auto* callbacks : {&ReadCallbacks, &WriteCallbacks}) {
@@ -932,7 +913,7 @@ namespace {
             // Includes fallback: cancellation results must precede destruction.
             Send(SelfId(), new TEvPrivate::TEvFinishStopping);
         }
-        if (previous || !PersistentBufferGone || ReserveInFlight) {
+        if (previous || !PersistentBufferGone || ChunkManager.IsReservationInFlight()) {
             Schedule(StopIoTimeout, new TEvPrivate::TEvStopIoTimeout);
         }
     }
@@ -945,7 +926,7 @@ namespace {
     }
 
     void TDDiskActor::TryCompleteStop() {
-        if (!PoisonReceived || !OwnDrainComplete || !PersistentBufferGone || ReserveInFlight) {
+        if (!PoisonReceived || !OwnDrainComplete || !PersistentBufferGone || ChunkManager.IsReservationInFlight()) {
             return;
         }
 #if defined(__linux__)
@@ -989,7 +970,7 @@ namespace {
             YDB_LOG_ERROR("TDDiskActor I/O stalled during shutdown",
                 {"DDiskId", DDiskId}, {"persistentBuffer", IsPersistentBufferActor});
         }
-        if (ReserveInFlight) {
+        if (ChunkManager.IsReservationInFlight()) {
             YDB_LOG_ERROR("DDisk waiting for outstanding reservation", {"DDiskId", DDiskId});
         }
         if (!PersistentBufferGone) {

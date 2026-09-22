@@ -522,7 +522,7 @@ void TDDiskActor::TChunkFormatIoOp::Reply(NActors::TActorSystem* actorSystem, TR
         }
     }
     actorSystem->Send(DDiskId, new TEvPrivate::TEvChunkFormatIoResult(
-        ChunkIdx, OffsetInBytes, Size, status, std::move(reason)));
+        ChunkIdx, OffsetInBytes, Size, status, std::move(reason)), 0, ChunkIdx);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
