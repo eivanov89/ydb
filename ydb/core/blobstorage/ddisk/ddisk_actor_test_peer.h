@@ -4,6 +4,10 @@
 namespace NKikimr::NDDisk {
 class TDDiskActorTestPeer {
 public:
+    static void EnterBroken(TDDiskActor& actor, TString reason) {
+        NActors::TActorRunnableQueue queue(&actor);
+        actor.EnterBroken(std::move(reason));
+    }
     static bool IsShutdownDrained(const TDDiskActor& actor) {
         return actor.OwnDrainComplete && actor.PersistentBufferGone;
     }

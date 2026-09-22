@@ -32,6 +32,8 @@ The `interface/UnalignedWritePayloads` counter counts incoming writes with fragm
 
 The first write to a virtual chunk can suspend its coroutine while data and integrity resources are allocated. Concurrent requests for that virtual chunk share one allocation. With checksums enabled, a write acknowledgment waits for the data write, integrity update, and durable allocation mapping. Serialized writes and sync segments use FIFO coroutine admission for each integrity extent; independent extents can proceed concurrently.
 
+Each read or write coroutine owns its complete request and joins submitted data and metadata work before replying. Metadata work starts before data submission, so cold metadata loads can overlap data I/O. Reads capture checksums and the used-block mask together, then apply that snapshot when checking the data. A speculative data read still consumes its completion if metadata later identifies the whole range as zeroes.
+
 An unallocated virtual chunk reads as zeroes. Chunk allocation and restored integrity state affect how the implementation recognizes never-written blocks within an allocated chunk; do not treat a successful read as evidence that the range has previously been written.
 
 ## Integrity
@@ -40,6 +42,10 @@ Wire checksums are unsalted XXH3-64 values, one per 4 KiB payload block. When `T
 
 DDisk stores integrity metadata separately from data. Stored checksums are sealed with logical and physical identity information, while the wire protocol and checksum cache use the pure payload checksum. Each integrity metadata block uses a pair of slots, self-checksums, identity/generation checks, and a sequence number to select a valid durable version after recovery. The implementation supports layouts for different device atomic-write properties; their exact format belongs to [ddisk_checksums.h](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_checksums.h).
 
+Integrity operations start eagerly and return owning handles that retain their results, including when completion precedes the wait. An operation pins its entire pair range before loading; concurrent callers share one loader per pair. Writes apply the complete mutation without suspension. One flush coroutine per pair writes immutable snapshots in sequence, coalesces newer mutations, and completes each waiter only when its required version is durable.
+
+New extent placement and readiness are separate milestones. Placement permits data writes while formatting continues. Readiness requires both extent formatting and all three integrity-chunk headers, and gates submission of the mapping log. Deleted extents retain their slots until deletion is durable and outstanding formatting has retired.
+
 Changing checksum modes is a format and recovery concern, not only a performance setting. DDisk validates checksum-mode compatibility against restored state. PB has a separate on-disk checksum setting, described in [{#T}](persistent-buffer.md#integrity).
 
 ## Synchronization
@@ -47,6 +53,8 @@ Changing checksum modes is a format and recovery concern, not only a performance
 `TEvSync` is the unified pull-and-write operation used for both PB-to-DDisk flush and DDisk-to-DDisk repair. It contains source identities and segments; each segment selects either a PB record or a DDisk source range. The destination issues reads to those services, validates the returned data, and writes the destination range.
 
 All destination segments in one request must belong to one virtual chunk. The sync handler checks nonempty aligned ranges and chunk bounds. `TSegmentManager` tracks overlapping synchronization ranges so that a delayed source read cannot blindly overwrite a newer synchronization request. Changes to this path need coverage for both request ordering and late replies.
+
+The request coroutine validates all segments before launching concurrent source reads, joins every submitted destination segment, and waits for allocation durability before replying in the original segment order. Failed or outdated results also pass this allocation barrier. Full supersession cancels preparation waits for the source, allocation, or extent admission; submitted destination I/O still drains. One extent admission is held until all destination data and metadata work for that source range finishes.
 
 The operation reports `TEvSyncResult` after processing its destination work. It does not erase source PB records. The client decides when enough replicas have been flushed, whether repair is required, and when [PB erase](persistent-buffer.md#erase) is safe. A PB source can be remote even when it occupies the same logical DBG index as the destination DDisk.
 
@@ -75,6 +83,13 @@ and parked retries, and continues processing submitted I/O results. Cancellation
 balances counters and publishes results before the final mailbox barrier.
 Existing completions may finish writes only when their integrity and allocation
 log durability conditions are satisfied; shutdown starts no further I/O.
+
+Broken and Stopping wake logical waits that cannot progress, but do not cancel
+accepted router-I/O waits. A failed request joins already-submitted sibling I/O
+before replying; its buffers and physical chunk pins remain owned until terminal
+results are consumed. Logical operations and outstanding physical producers
+both protect chunks from deletion. Remaining logical waits and request replies
+finish before the final mailbox barrier and Gone.
 
 Chunk-map `TEvLog` requests track delivery; a nondelivery notification correlated
 with an outstanding request by its cookie enters Stopping.

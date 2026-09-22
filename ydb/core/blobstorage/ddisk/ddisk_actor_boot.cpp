@@ -107,7 +107,7 @@ namespace NKikimr::NDDisk {
         if (Config.EnableChecksums) {
             // The integrity manager needs the chunk size, so it is created here rather than in the ctor.
             // VDiskSlotId + PDiskGuid identify this DDisk in TIntegrityChunkHeader.
-            IntegrityManager.emplace(DiskFormat->ChunkSize, BaseInfo.VDiskSlotId, BaseInfo.PDiskGuid,
+            IntegrityManager.emplace(IntegrityHost, DiskFormat->ChunkSize, BaseInfo.VDiskSlotId, BaseInfo.PDiskGuid,
                 Config.IntegrityChecksumCacheBytes);
         }
 

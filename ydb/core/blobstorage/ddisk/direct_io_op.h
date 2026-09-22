@@ -53,11 +53,8 @@ public:
 
     void SetCookie(ui64 cookie) { Cookie = cookie; }
     ui64 GetCookie() const { return Cookie; }
-
-    // Read-path integrity zero mask (TIntegrityManager::TReadPlan::Mixed): bit i covers the i-th
-    // IntegrityUnitSize block of the read range; unset bits are zero-filled before replying. Must
-    // live in the op because the reply happens on the uring I/O thread.
-    void SetReadUsedBlocksMask(TDynBitMap&& usedBlocks) { ReadUsedBlocksMask.emplace(std::move(usedBlocks)); }
+    void SetCompletionCookie(ui64 cookie) { CompletionCookie = cookie; }
+    ui64 GetCompletionCookie() const { return CompletionCookie; }
 
     const TActorId& GetDDiskId() const { return DDiskId; }
     const TActorId& GetOriginalRequester() const { return OriginalRequester; }
@@ -83,8 +80,6 @@ protected:
 
     virtual void SelfRecycle() noexcept { delete this; }
 
-    // Zero-fills the blocks of freshly read data whose ReadUsedBlocksMask bits are unset.
-    void ApplyReadUsedBlocksMask(TRope& data) noexcept;
 
 private:
     class TCompletionGuard;
@@ -103,10 +98,10 @@ private:
 
     NWilson::TSpan Span;
 
+    ui64 CompletionCookie = 0;
     TRcBuf AlignedDataHolder;
     std::optional<TRope> Data;
 
-    std::optional<TDynBitMap> ReadUsedBlocksMask;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -132,20 +127,10 @@ public:
         HasChunkKey = true;
     }
 
-    void SetIntegrityOperationId(ui64 operationId) {
-        IntegrityOperationId = operationId;
-    }
-
-    void SetReadChecksums(std::vector<ui64> checksums) {
-        Checksums = std::move(checksums);
-    }
-
 private:
     ui64 TabletId = 0;
     ui64 VChunkIndex = 0;
     bool HasChunkKey = false;
-    ui64 IntegrityOperationId = 0;
-    std::vector<ui64> Checksums;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -198,36 +183,14 @@ public:
     void ClearForRecycle() noexcept override;
     void SelfRecycle() noexcept override;
 
-    void SetRequestId(ui64 requestId) {
-        RequestId = requestId;
-    }
 
-    void SetSegment(ui64 begin, ui64 end) {
-        SegmentBegin = begin;
-        SegmentEnd = end;
-    }
-
-    void SetSyncId(ui64 syncId) {
-        SyncId = syncId;
-    }
-
-    void SetIntegrityOperationId(ui64 operationId) {
-        IntegrityOperationId = operationId;
-    }
-
-private:
-    ui64 SyncId = 0;
-    ui64 RequestId = 0;
-    ui64 SegmentBegin = 0;
-    ui64 SegmentEnd = 0;
-    ui64 IntegrityOperationId = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // TDDiskActor::TIntegrityIoOp
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Executes one TIntegrityManager TWriteIo / TReadIo and posts TEvPrivate::TEvIntegrityIoResult
+// Executes one integrity host read/write and posts TEvPrivate::TEvIntegrityIoResult
 // back to the actor.
 class TDDiskActor::TIntegrityIoOp final : public TDDiskActor::TDirectIoOpBase {
 public:
@@ -243,12 +206,7 @@ public:
     void ClearForRecycle() noexcept override;
     void SelfRecycle() noexcept override;
 
-    void SetIoId(ui64 ioId) {
-        IoId = ioId;
-    }
 
-private:
-    ui64 IoId = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

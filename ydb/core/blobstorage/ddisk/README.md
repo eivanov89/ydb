@@ -29,6 +29,20 @@ by LSN to actor-local continuations. Log submission captures snapshots and
 records commit intent before suspension; direct-I/O completions retain buffer
 ownership through retirement.
 
+Read, write, and sync request coroutines join their submitted data and metadata
+work before replying. Device waits use unique completion cookies independent of
+client cookies. Integrity start methods launch work eagerly and return handles
+that retain their results. Whole-range pins protect shared cold pair loads;
+one flush coroutine per pair serializes immutable images and tracks each
+mutation's required durable version. Extent placement permits data writes;
+readiness also requires extent formatting and all three chunk headers before
+the mapping log can be submitted.
+
+Broken and Stopping resolve logical waits without canceling accepted router
+I/O waits. Failed branches still drain submitted siblings, retaining their
+buffers and physical ownership. Sync cancels superseded preparation only;
+submitted destination segments finish before extent admission is released.
+
 Shutdown tests must distinguish the indefinite normal actor drain from the
 60-second `io_stalled` diagnostic and the 10-second forced-destructor deadline.
 Use explicit callback and mailbox barriers to check intermediate ordering;

@@ -265,22 +265,7 @@ TRope TDDiskActor::TDirectIoOpBase::ExtractData() {
     return TRope(std::move(AlignedDataHolder));
 }
 
-void TDDiskActor::TDirectIoOpBase::ApplyReadUsedBlocksMask(TRope& data) noexcept {
-    if (!ReadUsedBlocksMask) {
-        return;
-    }
 
-    // The buffer was just read from disk and is exclusively ours, so mutating without COW is safe.
-    // On the uring path it is a single contiguous TRcBuf (AlignedDataHolder); on the PDisk fallback
-    // path a non-contiguous rope would be compacted here (rare and small).
-    auto span = data.UnsafeGetContiguousSpanMut();
-    const size_t numBlocks = span.size() / IntegrityUnitSize;
-    for (size_t i = 0; i < numBlocks; ++i) {
-        if (!ReadUsedBlocksMask->Get(i)) {
-            memset(span.data() + i * IntegrityUnitSize, 0, IntegrityUnitSize);
-        }
-    }
-}
 
 double TDDiskActor::TDirectIoOpBase::TimePassed() const {
     return HPMilliSecondsFloat(HPNow() - StartTs);
@@ -304,7 +289,6 @@ void TDDiskActor::TDDiskIoOp::Reply(NActors::TActorSystem* actorSystem, TReplySt
     case TUringOperationBase::EREAD: {
         if (status == TReplyStatus::OK) {
             data = ExtractData();
-            ApplyReadUsedBlocksMask(data);
         }
         break;
     }
@@ -318,7 +302,7 @@ void TDDiskActor::TDDiskIoOp::Reply(NActors::TActorSystem* actorSystem, TReplySt
         GetOperationType(), status, std::move(reason), std::move(data),
         GetOriginalRequester(), GetInterconnectSession(), GetCookie(), ExtractSpan(),
         GetTotalSize(), requestTimeMs, TabletId, VChunkIndex, HasChunkKey,
-        IntegrityOperationId, std::move(Checksums)));
+        {}), 0, GetCompletionCookie());
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -373,6 +357,7 @@ void TDDiskActor::TPersistentBufferPartIoOp::Reply(NActors::TActorSystem* actorS
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void TDDiskActor::TDirectIoOpBase::Reinit(const IEventHandle* ev) {
+    CompletionCookie = 0;
     ResetSubmissionState();
     StartTs = HPNow();
     if (ev) {
@@ -386,7 +371,6 @@ void TDDiskActor::TDirectIoOpBase::Reinit(const IEventHandle* ev) {
     }
     ChunkIdx = 0;
     ChunkOffsetInBytes = 0;
-    ReadUsedBlocksMask.reset();
     RetryCount = 0;
 }
 
@@ -394,7 +378,6 @@ void TDDiskActor::TDirectIoOpBase::ClearForRecycle() noexcept {
     AlignedDataHolder = {};
     Data.reset();
     Span = {};
-    ReadUsedBlocksMask.reset();
     RetryCount = 0;
 }
 
@@ -406,8 +389,6 @@ void TDDiskActor::TDDiskIoOp::ClearForRecycle() noexcept {
     TabletId = 0;
     VChunkIndex = 0;
     HasChunkKey = false;
-    IntegrityOperationId = 0;
-    Checksums.clear();
     TDirectIoOpBase::ClearForRecycle();
 }
 
@@ -423,11 +404,6 @@ void TDDiskActor::TPersistentBufferPartIoOp::SelfRecycle() noexcept {
 }
 
 void TDDiskActor::TInternalSyncWriteOp::ClearForRecycle() noexcept {
-    SyncId = 0;
-    RequestId = 0;
-    SegmentBegin = 0;
-    SegmentEnd = 0;
-    IntegrityOperationId = 0;
     TDirectIoOpBase::ClearForRecycle();
 }
 
@@ -436,7 +412,6 @@ void TDDiskActor::TInternalSyncWriteOp::SelfRecycle() noexcept {
 }
 
 void TDDiskActor::TIntegrityIoOp::ClearForRecycle() noexcept {
-    IoId = 0;
     TDirectIoOpBase::ClearForRecycle();
 }
 
@@ -471,13 +446,8 @@ void TDDiskActor::TInternalSyncWriteOp::Reply(NActors::TActorSystem* actorSystem
     actorSystem->Send(
         DDiskId,
         new TEvPrivate::TEvInternalSyncWriteResult(
-            SyncId,
-            RequestId,
-            SegmentBegin,
-            SegmentEnd,
-            IntegrityOperationId,
             status,
-            std::move(reason)));
+            std::move(reason)), 0, GetCompletionCookie());
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -502,8 +472,7 @@ void TDDiskActor::TIntegrityIoOp::Reply(NActors::TActorSystem* actorSystem, TRep
     }
 
     actorSystem->Send(DDiskId, new TEvPrivate::TEvIntegrityIoResult(
-        IoId, status, std::move(reason), std::move(data),
-        GetOperationType() == TUringOperationBase::EREAD));
+        status, std::move(reason), std::move(data)), 0, GetCompletionCookie());
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
