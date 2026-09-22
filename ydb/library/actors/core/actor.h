@@ -542,9 +542,12 @@ namespace NActors {
 
     namespace NDetail {
         class TActorAsyncHandlerPromise;
+        class TAsyncFrameAllocator;
         template<class TEvent>
         class TActorSpecificEventAwaiter;
     }
+
+    class TAsyncFrameCache;
 
     class IActor
         : protected IActorOps
@@ -581,6 +584,7 @@ namespace NActors {
 
     private:
         friend class NDetail::TActorAsyncHandlerPromise;
+        friend class NDetail::TAsyncFrameAllocator;
         template<class TEvent>
         friend class NDetail::TActorSpecificEventAwaiter;
 
@@ -608,6 +612,12 @@ namespace NActors {
         TActorActivityType ActivityType;
 
     protected:
+        // Opt-in caches must outlive all their frames, and all cache access must
+        // be serialized with actor execution (including forced teardown).
+        virtual TAsyncFrameCache* GetAsyncFrameCache() noexcept {
+            return nullptr;
+        }
+
         ui64 HandledEvents;
 
         IActor(TReceiveFunc stateFunc, TActorActivityType activityType = {})

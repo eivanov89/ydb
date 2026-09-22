@@ -159,6 +159,51 @@ An exception stored by a nested child is rethrown in the parent at co_await.
 `async<T>` is deliberately not a general future or detachable task. Do not use
 UnsafeMove in ordinary application code; it exists for library combinators.
 
+### Optional frame cache
+
+An actor can reuse coroutine allocations by owning a `TAsyncFrameCache` from
+`ydb/library/actors/async/frame_cache.h` and overriding the protected
+`IActor::GetAsyncFrameCache()` accessor, which returns null by default:
+
+```cpp
+private:
+    TAsyncFrameCache FrameCache; // declare before members that can own frames
+
+protected:
+    TAsyncFrameCache* GetAsyncFrameCache() noexcept override {
+        return &FrameCache;
+    }
+```
+
+Both top-level and `async<T>` promises select this cache when the first
+coroutine argument converts to a mutable `IActor&`. For an actor member this is
+the implicit object argument; a free function with a leading mutable actor
+reference also qualifies. Const actor members, coroutine lambdas, functions
+without such an argument, and actors returning null use the heap. A child does
+not inherit its parent's cache merely because the parent awaits it.
+
+The cache keeps up to 32 exact-size classes, selected in first-seen order, and
+up to 64 idle blocks per class. Reuse is LIFO within a class. New sizes after
+the class table fills and returns beyond a class's retention limit use the
+heap; this is a block-count limit, not a byte budget. Each allocation has an
+aligned header recording its owner, so freeing it does not depend on the
+promise still being alive or on actor TLS. Allocations guarantee
+`__STDCPP_DEFAULT_NEW_ALIGNMENT__`; extended coroutine-frame alignment is
+unsupported. The compiler may elide coroutine allocations entirely.
+
+Opting in requires serialized allocation and destruction. The cache must
+outlive every frame whose allocation header references it, including lazy
+`async<T>` frames that have not been awaited and are not registered actor
+tasks. Uncached blocks allocated after the size-class table fills do not
+reference the cache and may outlive it. `LiveFrames` counts only cache-owned
+frames. Worker-thread migration is allowed; concurrent cache access from
+foreign threads is unsupported. Declare the cache before members that may
+own frames so those members are destroyed first. Normal cancellation and
+forced mailbox cleanup destroy registered tasks before deleting the actor;
+forced cleanup may run without actor TLS. The cache destructor checks that
+no cache-owned frames remain and releases its idle blocks. Caching does not
+extend actor lifetime or change cancellation semantics.
+
 ## Parameters, captures, and frame-owned data
 
 The top-level specialization is selected only for:

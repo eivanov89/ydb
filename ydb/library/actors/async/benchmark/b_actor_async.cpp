@@ -306,6 +306,67 @@ void BM_CallAsync(benchmark::State& state) {
 
 BENCHMARK(BM_CallAsync)->MeasureProcessCPUTime();
 
+// Keep the entry points out of line so these benchmarks measure allocated
+// frames, including the short-lived child, rather than allocation elision.
+template<bool Cached>
+class TFrameCacheBenchmarkActor : public TActorBootstrapped<TFrameCacheBenchmarkActor<Cached>> {
+    TAsyncFrameCache Cache;
+    benchmark::State& State;
+    TPromise<void> Promise;
+    size_t Allocations = 0;
+    ui64 Value = 0;
+
+    TAsyncFrameCache* GetAsyncFrameCache() noexcept override {
+        ++Allocations;
+        return Cached ? &Cache : nullptr;
+    }
+
+public:
+    TFrameCacheBenchmarkActor(benchmark::State& state, TPromise<void> promise)
+        : State(state)
+        , Promise(std::move(promise))
+    {}
+
+    ~TFrameCacheBenchmarkActor() {
+        const auto stats = Cache.GetStats();
+        State.counters["heap_allocations"] = Cached ? stats.HeapAllocations : Allocations;
+        State.counters["frame_allocations"] = Allocations;
+        State.counters["retained_bytes"] = stats.CachedBytes;
+        Promise.SetValue();
+    }
+
+    void Bootstrap() {
+        this->Become(&TFrameCacheBenchmarkActor::StateWork);
+        for (auto _ : State) {
+            Root();
+        }
+        this->PassAway();
+    }
+
+    Y_NO_INLINE void Root() {
+        benchmark::DoNotOptimize(co_await Child());
+    }
+
+    Y_NO_INLINE async<ui64> Child() {
+        co_return ++Value;
+    }
+
+    STFUNC(StateWork) {
+        Y_UNUSED(ev);
+    }
+};
+
+void BM_FrameCacheDisabled(benchmark::State& state) {
+    BM_YieldActor<TFrameCacheBenchmarkActor<false>>(state);
+}
+
+void BM_FrameCacheEnabled(benchmark::State& state) {
+    BM_YieldActor<TFrameCacheBenchmarkActor<true>>(state);
+}
+
+BENCHMARK(BM_FrameCacheDisabled)->MeasureProcessCPUTime();
+BENCHMARK(BM_FrameCacheEnabled)->MeasureProcessCPUTime();
+
 class TAsyncRescheduleRunnableActor : public TActorBootstrapped<TAsyncRescheduleRunnableActor> {
 public:
     TAsyncRescheduleRunnableActor(benchmark::State& state, TPromise<void> promise)

@@ -20,6 +20,7 @@
 
 #include <ydb/library/actors/core/mon.h>
 #include <ydb/library/actors/async/event.h>
+#include <ydb/library/actors/async/frame_cache.h>
 #include <ydb/library/actors/async/continuation.h>
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
@@ -88,6 +89,13 @@ namespace NKikimr::NDDisk {
     }
 
     class TDDiskActor : public TActorBootstrapped<TDDiskActor> {
+        // Declared first so frame-owning members, if added, are destroyed first.
+        NActors::TAsyncFrameCache AsyncFrameCache;
+
+        NActors::TAsyncFrameCache* GetAsyncFrameCache() noexcept override {
+            return &AsyncFrameCache;
+        }
+
         TString DDiskId;
         TVDiskConfig::TBaseInfo BaseInfo;
         TDDiskConfig Config;
