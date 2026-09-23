@@ -589,16 +589,21 @@ namespace NKikimr::NDDisk {
         struct TChunkRef {
             TChunkIdx ChunkIdx = 0;
             ui32 InFlightDataIo = 0;
+
             bool AllocationPending = false;
             ui32 AllocationWaiters = 0;
             NActors::TAsyncEvent AllocationReady;
+
             NActors::TAsyncEvent CommitReady;
+
             bool IntegrityExtentWriteInFlight = false;
             std::list<ui64> ExtentWaiters;
             NActors::TAsyncEvent ExtentAvailable;
         };
 
+        // Node-stable: waiters hold TChunkRef& (and its TAsyncEvent members) across co_await.
         THashMap<ui64, THashMap<ui64, TChunkRef>> ChunkRefs; // TabletId -> (VChunkIndex -> ChunkIdx)
+
         TIntrusivePtr<TPDiskParams> PDiskParams;
         std::vector<TChunkIdx> OwnedChunksOnBoot;
         std::queue<TChunkIdx> StartupOrphanChunks;
