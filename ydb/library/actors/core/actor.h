@@ -441,8 +441,14 @@ namespace NActors {
         template<class TDerived>
         class TImpl;
 
-        inline bool Handle(TAutoPtr<IEventHandle>& ev) {
-            return (*HandleFn)(this, ev);
+        // Matching must not mutate registrations or resume actor code.
+        inline bool Matches(const IEventHandle& ev) const noexcept {
+            return (*MatchesFn)(this, ev);
+        }
+
+        // The actor unlinks this awaiter before invoking the continuation.
+        inline void HandleMatched(TAutoPtr<IEventHandle>& ev) {
+            (*HandleMatchedFn)(this, ev);
         }
 
     private:
@@ -451,8 +457,8 @@ namespace NActors {
         ~TActorEventAwaiter() = default;
 
     protected:
-        // A single function pointer is cheaper than a vtable, may be changed at runtime and allows multiple instances in a class
-        bool (*HandleFn)(TActorEventAwaiter*, TAutoPtr<IEventHandle>&);
+        bool (*MatchesFn)(const TActorEventAwaiter*, const IEventHandle&) noexcept;
+        void (*HandleMatchedFn)(TActorEventAwaiter*, TAutoPtr<IEventHandle>&);
     };
 
     /**
@@ -462,13 +468,18 @@ namespace NActors {
     class TActorEventAwaiter::TImpl : public TActorEventAwaiter {
     public:
         TImpl() noexcept {
-            this->HandleFn = +[](TActorEventAwaiter* self, TAutoPtr<IEventHandle>& ev) -> bool {
-                return static_cast<TDerived&>(static_cast<TImpl&>(*self)).DoHandle(ev);
+            this->MatchesFn = +[](const TActorEventAwaiter* self, const IEventHandle& ev) noexcept -> bool {
+                return static_cast<const TDerived&>(static_cast<const TImpl&>(*self)).DoMatches(ev);
+            };
+            this->HandleMatchedFn = +[](TActorEventAwaiter* self, TAutoPtr<IEventHandle>& ev) {
+                static_cast<TDerived&>(static_cast<TImpl&>(*self)).DoHandleMatched(ev);
             };
         }
 
-        explicit TImpl(bool (*handleFn)(TActorEventAwaiter*, TAutoPtr<IEventHandle>&)) noexcept {
-            this->HandleFn = handleFn;
+        explicit TImpl(bool (*matchesFn)(const TActorEventAwaiter*, const IEventHandle&) noexcept,
+                void (*handleMatchedFn)(TActorEventAwaiter*, TAutoPtr<IEventHandle>&)) noexcept {
+            this->MatchesFn = matchesFn;
+            this->HandleMatchedFn = handleMatchedFn;
         }
     };
 

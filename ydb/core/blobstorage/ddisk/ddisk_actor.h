@@ -779,8 +779,11 @@ namespace NKikimr::NDDisk {
         NActors::async<TEvPrivate::TEvInternalSyncWriteResult::TPtr> AwaitSyncIo(
             std::unique_ptr<TDirectIoOpBase> op, ui64 tabletId, ui64 vChunkIndex);
         NActors::async<bool> WaitForChunkCommit(ui64 tabletId, ui64 vChunkIndex);
-        NActors::async<void> ReadDDiskData(IEventHandle& request, TChunkIdx chunkIdx,
-            ui32 offset, ui32 size, TEvPrivate::TEvDDiskIoResult& result);
+        static std::unique_ptr<TEvPrivate::TEvDDiskIoResult> MakeDDiskReadResult(
+            const IEventHandle& request, ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan&& span);
+        ui64 SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
+            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span,
+            std::unique_ptr<TEvPrivate::TEvDDiskIoResult>& result);
         void FinishDDiskIoResult(TEvPrivate::TEvDDiskIoResult& msg);
         void ReleaseIntegrityExtentWrite(ui64 tabletId, ui64 vChunkIndex);
         NActors::async<bool> AcquireIntegrityExtent(ui64 tabletId, ui64 vChunkIndex);

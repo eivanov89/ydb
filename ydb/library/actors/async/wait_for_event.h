@@ -68,24 +68,21 @@ namespace NActors {
                 return false;
             }
 
-            bool Matches(TAutoPtr<IEventHandle>& ev) {
+            bool DoMatches(const IEventHandle& ev) const noexcept {
                 if constexpr (std::is_same_v<TEvent, IEventHandle>) {
                     return true;
                 } else {
-                    return ev->GetTypeRewrite() == TEvent::EventType;
+                    return ev.GetTypeRewrite() == TEvent::EventType;
                 }
             }
 
-            bool DoHandle(TAutoPtr<IEventHandle>& ev) {
-                Y_ABORT_UNLESS(Actor, "Unexpected Handle call after Detach()");
-                if (Matches(ev)) {
-                    Result = std::move(reinterpret_cast<typename TEvent::TPtr&>(ev));
-                    Detach();
-                    // Resume recursively since it's an event handler
-                    Continuation.resume();
-                    return true;
-                }
-                return false;
+            void DoHandleMatched(TAutoPtr<IEventHandle>& ev) {
+                Y_ABORT_UNLESS(Actor, "Unexpected HandleMatched call after Detach()");
+                // IActor has already removed our registration using its dispatch iterator.
+                Actor = nullptr;
+                Result = std::move(reinterpret_cast<typename TEvent::TPtr&>(ev));
+                // Resume recursively since it's an event handler. This may destroy us.
+                Continuation.resume();
             }
 
         private:

@@ -156,6 +156,48 @@ Y_UNIT_TEST_SUITE(AsyncFrameCache) {
         TAsyncFrameCache::Free(other, 101);
     }
 
+    Y_UNIT_TEST(InterleavedClassesKeepLiveFramesReusable) {
+        TAsyncFrameCache cache;
+        std::array<std::array<void*, 2>, TAsyncFrameCache::MaxClasses> frames;
+        // Keep frames alive while the class table grows to its limit.
+        for (size_t i = 0; i < frames.size(); ++i) {
+            frames[i][0] = cache.Allocate(i + 1);
+        }
+        for (size_t i = frames.size(); i-- > 0;) {
+            frames[i][1] = cache.Allocate(i + 1);
+            UNIT_ASSERT(frames[i][0] != frames[i][1]);
+        }
+
+        const size_t heapAllocations = frames.size() * 2;
+        for (size_t cycle = 0; cycle < 3; ++cycle) {
+            const size_t first = cycle % 2;
+            const size_t second = 1 - first;
+            // Free the older frame first and mix classes instead of following
+            // the allocation order. Both headers must retain their own class.
+            for (size_t step = 0; step < frames.size(); ++step) {
+                const size_t i = step % 2 ? frames.size() - 1 - step / 2 : step / 2;
+                TAsyncFrameCache::Free(frames[i][first], i + 1);
+                TAsyncFrameCache::Free(frames[i][second], i + 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().SizeClasses, frames.size());
+            UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().LiveFrames, 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().CachedFrames, heapAllocations);
+
+            for (size_t i = frames.size(); i-- > 0;) {
+                UNIT_ASSERT_VALUES_EQUAL(cache.Allocate(i + 1), frames[i][second]);
+                UNIT_ASSERT_VALUES_EQUAL(cache.Allocate(i + 1), frames[i][first]);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().LiveFrames, heapAllocations);
+            UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().CachedFrames, 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().HeapAllocations, heapAllocations);
+        }
+
+        for (size_t i = 0; i < frames.size(); ++i) {
+            TAsyncFrameCache::Free(frames[i][0], i + 1);
+            TAsyncFrameCache::Free(frames[i][1], i + 1);
+        }
+    }
+
     Y_UNIT_TEST(PerClassRetentionLimit) {
         TAsyncFrameCache cache;
         std::array<void*, TAsyncFrameCache::MaxCachedPerClass + 1> frames;

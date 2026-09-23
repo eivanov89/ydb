@@ -43,6 +43,152 @@ namespace NAsyncTest {
             ASYNC_ASSERT_SEQUENCE(sequence, "returning", "finished");
         }
 
+        Y_UNIT_TEST(SameCookiePreservesTypeMatchingAndRegistrationOrder) {
+            TVector<TString> sequence;
+            TAsyncTestActor::TState state;
+            TAsyncTestActorRuntime runtime;
+
+            auto actor = runtime.StartAsyncActor(state, [&](auto*) -> async<void> {
+                co_await ActorWaitForEvent<TEvents::TEvWakeup>(123);
+                sequence.push_back("first wakeup");
+            }, [&](IEventHandle::TPtr&) {
+                sequence.push_back("unhandled");
+                return true;
+            });
+
+            actor.RunAsync([&]() -> async<void> {
+                co_await ActorWaitForEvent<TEvents::TEvGone>(123);
+                sequence.push_back("gone");
+            });
+            actor.RunAsync([&]() -> async<void> {
+                co_await ActorWaitForEvent<TEvents::TEvWakeup>(123);
+                sequence.push_back("second wakeup");
+            });
+            actor.RunAsync([&]() -> async<void> {
+                auto ev = co_await ActorWaitForEvent<IEventHandle>(123);
+                UNIT_ASSERT_VALUES_EQUAL(ev->GetTypeRewrite(), ui32(TEvents::TEvWakeup::EventType));
+                sequence.push_back("any event");
+            });
+            actor.RunAsync([&]() -> async<void> {
+                co_await ActorWaitForEvent<TEvents::TEvWakeup>(123);
+                sequence.push_back("last wakeup");
+            });
+
+            actor.Receive(new TEvents::TEvGone, 123);
+            ASYNC_ASSERT_SEQUENCE(sequence, "gone");
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            ASYNC_ASSERT_SEQUENCE(sequence, "first wakeup");
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            ASYNC_ASSERT_SEQUENCE(sequence, "second wakeup");
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            ASYNC_ASSERT_SEQUENCE(sequence, "any event");
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            ASYNC_ASSERT_SEQUENCE(sequence, "last wakeup");
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            ASYNC_ASSERT_SEQUENCE(sequence, "unhandled");
+        }
+
+        class TRehashWaitActor : public TAsyncTestActor {
+        public:
+            TRehashWaitActor(TState& state, TVector<ui64>& completed)
+                : TAsyncTestActor(state)
+                , Completed(completed)
+            {}
+
+            void Wait(ui64 cookie) {
+                auto ev = co_await ActorWaitForEvent<TEvents::TEvWakeup>(cookie);
+                Completed.push_back(ev->Cookie);
+            }
+
+            void Rearm(ui64 cookie, size_t otherWaiters) {
+                auto ev = co_await ActorWaitForEvent<TEvents::TEvWakeup>(cookie);
+                Completed.push_back(ev->Cookie);
+                // These root handlers register their waits immediately, before the
+                // current matched-event callback returns to IActor::Receive.
+                for (size_t i = 1; i <= otherWaiters; ++i) {
+                    Wait(cookie + i);
+                }
+                ev = co_await ActorWaitForEvent<TEvents::TEvWakeup>(cookie);
+                Completed.push_back(ev->Cookie);
+            }
+
+        private:
+            TVector<ui64>& Completed;
+        };
+
+        Y_UNIT_TEST(MatchedContinuationCanRehashAndRearmSameCookie) {
+            TVector<ui64> completed;
+            TAsyncTestActor::TState state;
+            TAsyncTestActorRuntime runtime;
+            auto* self = new TRehashWaitActor(state, completed);
+            TAsyncTestActorRuntime::TAsyncActorOperations actor(runtime, runtime.Register(self));
+            actor.Step();
+
+            constexpr ui64 cookie = 123;
+            constexpr size_t otherWaiters = 256;
+            actor.RunSync([&] { self->Rearm(cookie, otherWaiters); });
+            actor.Receive(new TEvents::TEvWakeup, cookie);
+            UNIT_ASSERT_VALUES_EQUAL(completed.size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(completed.back(), cookie);
+            actor.Receive(new TEvents::TEvWakeup, cookie);
+            UNIT_ASSERT_VALUES_EQUAL(completed.size(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(completed.back(), cookie);
+            for (size_t i = 1; i <= otherWaiters; ++i) {
+                actor.Receive(new TEvents::TEvWakeup, cookie + i);
+                UNIT_ASSERT_VALUES_EQUAL(completed.size(), i + 2);
+                UNIT_ASSERT_VALUES_EQUAL(completed.back(), cookie + i);
+            }
+            actor.Poison();
+            UNIT_ASSERT(state.Destroyed);
+        }
+
+        Y_UNIT_TEST(MatchedContinuationCanCancelAnotherWaiterWithSameCookie) {
+            TAsyncCancellationScope scope;
+            bool matched = false;
+            bool cancelled = false;
+            size_t unhandled = 0;
+            TAsyncTestActor::TState state;
+            TAsyncTestActorRuntime runtime;
+
+            auto actor = runtime.StartAsyncActor(state, [&](auto*) -> async<void> {
+                co_await ActorWaitForEvent<TEvents::TEvWakeup>(123);
+                scope.Cancel();
+                matched = true;
+            }, [&](IEventHandle::TPtr&) {
+                ++unhandled;
+                return true;
+            });
+            actor.RunAsync([&]() -> async<void> {
+                const bool success = co_await scope.Wrap([]() -> async<void> {
+                    ASYNC_ASSERT_NO_RETURN(co_await ActorWaitForEvent<TEvents::TEvGone>(123));
+                });
+                UNIT_ASSERT(!success);
+                cancelled = true;
+            });
+
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            UNIT_ASSERT(matched);
+            UNIT_ASSERT(cancelled);
+            UNIT_ASSERT_VALUES_EQUAL(unhandled, 0);
+            actor.Receive(new TEvents::TEvGone, 123);
+            UNIT_ASSERT_VALUES_EQUAL(unhandled, 1);
+        }
+
+        Y_UNIT_TEST(MatchedContinuationCanPassAway) {
+            bool resumed = false;
+            TAsyncTestActor::TState state;
+            TAsyncTestActorRuntime runtime;
+            auto actor = runtime.StartAsyncActor(state, [&](auto* self) -> async<void> {
+                co_await ActorWaitForEvent<TEvents::TEvWakeup>(123);
+                self->PassAway();
+                resumed = true;
+            });
+
+            actor.Receive(new TEvents::TEvWakeup, 123);
+            UNIT_ASSERT(resumed);
+            UNIT_ASSERT(state.Destroyed);
+        }
+
         Y_UNIT_TEST(Cancel) {
             TVector<TString> sequence;
 

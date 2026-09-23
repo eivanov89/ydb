@@ -50,6 +50,7 @@ namespace NActors {
             if (sizeClass && sizeClass->Head) {
                 auto* header = sizeClass->Head;
                 sizeClass->Head = header->Next;
+                header->SizeClass = sizeClass;
                 --sizeClass->Cached;
                 ++LiveFrames;
                 return header + 1;
@@ -66,6 +67,7 @@ namespace NActors {
                 sizeClass = &Classes[ClassCount++];
                 sizeClass->Size = size;
             }
+            header->SizeClass = sizeClass;
             ++HeapAllocations;
             ++LiveFrames;
             return header + 1;
@@ -79,8 +81,8 @@ namespace NActors {
         static void Free(void* frame, size_t size) noexcept {
             auto* header = static_cast<THeader*>(frame) - 1;
             if (auto* cache = header->Cache) {
-                auto* sizeClass = cache->FindClass(size);
-                Y_ABORT_UNLESS(sizeClass && cache->LiveFrames);
+                auto* sizeClass = header->SizeClass;
+                Y_ABORT_UNLESS(sizeClass && sizeClass->Size == size && cache->LiveFrames);
                 --cache->LiveFrames;
                 if (sizeClass->Cached < MaxCachedPerClass) {
                     header->Next = sizeClass->Head;
@@ -103,10 +105,17 @@ namespace NActors {
         }
 
     private:
+        struct TSizeClass;
+
         struct alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) THeader {
             TAsyncFrameCache* Cache;
-            THeader* Next = nullptr;
+            union {
+                TSizeClass* SizeClass = nullptr; // Live block; Classes never move.
+                THeader* Next; // Cached block.
+            };
         };
+        static_assert(sizeof(THeader) == (2 * sizeof(void*) + __STDCPP_DEFAULT_NEW_ALIGNMENT__ - 1)
+            / __STDCPP_DEFAULT_NEW_ALIGNMENT__ * __STDCPP_DEFAULT_NEW_ALIGNMENT__);
 
         struct TSizeClass {
             size_t Size = 0;
@@ -118,7 +127,7 @@ namespace NActors {
             if (size > std::numeric_limits<size_t>::max() - sizeof(THeader)) {
                 throw std::bad_alloc();
             }
-            return ::new (::operator new(sizeof(THeader) + size)) THeader{cache};
+            return ::new (::operator new(sizeof(THeader) + size)) THeader{cache, {nullptr}};
         }
 
         TSizeClass* FindClass(size_t size) noexcept {

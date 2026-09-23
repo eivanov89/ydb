@@ -286,9 +286,8 @@ namespace NKikimr::NDDisk {
             co_return;
         }
 
-        const auto& record = ev->Get()->Record;
-        const TQueryCredentials creds(record.GetCredentials());
-        const TBlockSelector selector(record.GetSelector());
+        const TQueryCredentials creds(ev->Get()->Record.GetCredentials());
+        const TBlockSelector selector(ev->Get()->Record.GetSelector());
 
         if (selector.OffsetInBytes % IntegrityUnitSize != 0
                 || selector.Size % IntegrityUnitSize != 0) {
@@ -309,7 +308,8 @@ namespace NKikimr::NDDisk {
             co_return;
         }
 
-        if (ChunkRefs[creds.TabletId][selector.VChunkIndex].AllocationPending) {
+        TChunkRef* readyChunk = &ChunkRefs[creds.TabletId][selector.VChunkIndex];
+        if (readyChunk->AllocationPending) {
             auto span = NWilson::TSpan(TWilson::DDiskTopLevel, NWilson::TTraceId(ev->TraceId),
                 "WaitChunkAllocation", NWilson::EFlags::AUTO_END, TActivationContext::ActorSystem());
             NPrivate::AddMessageWaitAttributes(span);
@@ -324,8 +324,9 @@ namespace NKikimr::NDDisk {
             if (!CheckQuery(*ev, &Counters.Interface.Read)) {
                 co_return;
             }
+            readyChunk = &ChunkRefs.at(creds.TabletId).at(selector.VChunkIndex);
         }
-        TChunkRef& chunkRef = ChunkRefs.at(creds.TabletId).at(selector.VChunkIndex);
+        TChunkRef& chunkRef = *readyChunk;
 
         Counters.Interface.Read.Request(selector.Size);
 
@@ -354,10 +355,7 @@ namespace NKikimr::NDDisk {
         span.Attribute("tablet_id", static_cast<i64>(creds.TabletId))
             .Attribute("vchunk_index", static_cast<i64>(selector.VChunkIndex))
             .Attribute("offset_in_bytes", selector.OffsetInBytes).Attribute("size", selector.Size);
-        TEvPrivate::TEvDDiskIoResult result(NPDisk::TUringOperationBase::EREAD,
-            NKikimrBlobStorage::NDDisk::TReplyStatus::OK, {}, {}, ev->Sender,
-            ev->InterconnectSession, ev->Cookie, std::move(span), selector.Size, 0,
-            creds.TabletId, selector.VChunkIndex, true);
+        std::unique_ptr<TEvPrivate::TEvDDiskIoResult> result;
         TIntegrityManager::TOperation metadata;
         bool needsData = true;
         if (Config.EnableChecksums) {
@@ -369,32 +367,48 @@ namespace NKikimr::NDDisk {
                     selector.OffsetInBytes, selector.Size).Kind != TIntegrityManager::TReadPlan::AllZero;
         }
         if (needsData) {
-            co_await ReadDDiskData(*ev, chunkRef.ChunkIdx, selector.OffsetInBytes, selector.Size, result);
+            ++chunkRef.InFlightDataIo;
+            Y_DEFER { --chunkRef.InFlightDataIo; };
+            if (const ui64 cookie = SubmitDDiskDataRead(ev, chunkRef.ChunkIdx,
+                    creds.TabletId, selector, span, result)) {
+                auto event = co_await NActors::ActorWaitForEvent<TEvPrivate::TEvDDiskIoResult>(cookie);
+                result.reset(event->Release().Release());
+            }
         }
         if (Config.EnableChecksums) {
             auto integrity = co_await metadata.Wait(*this);
             CountIntegrityResult(integrity);
+            // A writer sharing a cold pair load can turn a previously known hole into
+            // used data before this read captures its metadata snapshot.
+            if (integrity.Status == TIntegrityManager::EOperationStatus::Ok
+                    && !needsData && integrity.ReadPlan.Kind != TIntegrityManager::TReadPlan::AllZero) {
+                ++chunkRef.InFlightDataIo;
+                Y_DEFER { --chunkRef.InFlightDataIo; };
+                if (const ui64 cookie = SubmitDDiskDataRead(ev, chunkRef.ChunkIdx,
+                        creds.TabletId, selector, span, result)) {
+                    auto event = co_await NActors::ActorWaitForEvent<TEvPrivate::TEvDDiskIoResult>(cookie);
+                    result.reset(event->Release().Release());
+                }
+            }
+            if (!result) {
+                result = MakeDDiskReadResult(*ev, creds.TabletId, selector, std::move(span));
+            }
             if (integrity.Status != TIntegrityManager::EOperationStatus::Ok) {
-                result.Status = integrity.Status == TIntegrityManager::EOperationStatus::Corrupted
+                result->Status = integrity.Status == TIntegrityManager::EOperationStatus::Corrupted
                     ? NKikimrBlobStorage::NDDisk::TReplyStatus::CORRUPTED
                     : NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH;
-                result.ErrorMessage = std::move(integrity.ErrorReason);
+                result->ErrorMessage = std::move(integrity.ErrorReason);
             } else {
-                // A writer sharing a cold pair load can turn a previously known hole into
-                // used data before this read captures its metadata snapshot.
-                if (!needsData && integrity.ReadPlan.Kind != TIntegrityManager::TReadPlan::AllZero) {
-                    co_await ReadDDiskData(*ev, chunkRef.ChunkIdx, selector.OffsetInBytes, selector.Size, result);
-                }
-                result.Checksums = std::move(integrity.Checksums);
+                result->Checksums = std::move(integrity.Checksums);
                 if (integrity.ReadPlan.Kind == TIntegrityManager::TReadPlan::AllZero) {
                     auto zero = TRcBuf::Uninitialized(selector.Size);
                     memset(zero.GetDataMut(), 0, zero.size());
-                    result.Data = TRope(std::move(zero));
-                    result.Status = NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
-                    result.ErrorMessage.clear();
-                } else if (result.Status == NKikimrBlobStorage::NDDisk::TReplyStatus::OK
+                    result->Data = TRope(std::move(zero));
+                    result->Status = NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
+                    result->ErrorMessage.clear();
+                } else if (result->Status == NKikimrBlobStorage::NDDisk::TReplyStatus::OK
                         && integrity.ReadPlan.Kind == TIntegrityManager::TReadPlan::Mixed) {
-                    auto data = result.Data.UnsafeGetContiguousSpanMut();
+                    auto data = result->Data.UnsafeGetContiguousSpanMut();
                     for (size_t i = 0; i < data.size() / IntegrityUnitSize; ++i) {
                         if (!integrity.ReadPlan.UsedBlocks.Get(i)) {
                             memset(data.data() + i * IntegrityUnitSize, 0, IntegrityUnitSize);
@@ -403,25 +417,41 @@ namespace NKikimr::NDDisk {
                 }
             }
         }
-        result.RequestTimeMs = HPMilliSecondsFloat(HPNow() - start);
-        FinishDDiskIoResult(result);
+        result->RequestTimeMs = HPMilliSecondsFloat(HPNow() - start);
+        FinishDDiskIoResult(*result);
     }
 
-    NActors::async<void> TDDiskActor::ReadDDiskData(IEventHandle& request, TChunkIdx chunkIdx,
-            ui32 offset, ui32 size, TEvPrivate::TEvDDiskIoResult& result) {
+    std::unique_ptr<TDDiskActor::TEvPrivate::TEvDDiskIoResult> TDDiskActor::MakeDDiskReadResult(
+            const IEventHandle& request, ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan&& span) {
+        return std::make_unique<TEvPrivate::TEvDDiskIoResult>(NPDisk::TUringOperationBase::EREAD,
+            NKikimrBlobStorage::NDDisk::TReplyStatus::OK, TString{}, TRope{}, request.Sender,
+            request.InterconnectSession, request.Cookie, std::move(span), selector.Size, 0,
+            tabletId, selector.VChunkIndex, true);
+    }
+
+    ui64 TDDiskActor::SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
+            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span,
+            std::unique_ptr<TEvPrivate::TEvDDiskIoResult>& result) {
         if (Stopping || IsBroken()) {
-            result.Status = IsBroken() ? NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR
+            result = MakeDDiskReadResult(*request, tabletId, selector, std::move(span));
+            result->Status = IsBroken() ? NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR
                 : NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH;
-            result.ErrorMessage = IsBroken() ? GetBrokenReason() : TString(StoppingReason);
-            co_return;
+            result->ErrorMessage = IsBroken() ? GetBrokenReason() : TString(StoppingReason);
+            request.Reset();
+            return 0;
         }
-        std::unique_ptr<TDirectIoOpBase> op = AllocateOp<TDDiskIoOp>(&request);
-        static_cast<TDDiskIoOp*>(op.get())->SetChunkKey(result.TabletId, result.VChunkIndex);
-        op->PrepareRead(size, DiskFormat->Offset(chunkIdx, 0, offset), chunkIdx, offset);
-        auto event = co_await AwaitDataIo(std::move(op), result.TabletId, result.VChunkIndex);
-        result.Status = event->Get()->Status;
-        result.ErrorMessage = std::move(event->Get()->ErrorMessage);
-        result.Data = std::move(event->Get()->Data);
+        std::unique_ptr<TDirectIoOpBase> op = AllocateOp<TDDiskIoOp>(request.Get());
+        static_cast<TDDiskIoOp*>(op.get())->SetChunkKey(tabletId, selector.VChunkIndex);
+        op->SetSpan(std::move(span));
+        op->PrepareRead(selector.Size, DiskFormat->Offset(chunkIdx, 0, selector.OffsetInBytes),
+            chunkIdx, selector.OffsetInBytes);
+        const ui64 cookie = NActors::AllocateWaitCookie();
+        op->SetCompletionCookie(cookie);
+        // The operation now owns everything needed to route and trace its result.
+        // Drop the request while it is hot instead of retaining its protobuf across I/O.
+        request.Reset();
+        DirectUringOp(op);
+        return cookie;
     }
 
     void TDDiskActor::FinishDDiskIoResult(TEvPrivate::TEvDDiskIoResult& msg) {

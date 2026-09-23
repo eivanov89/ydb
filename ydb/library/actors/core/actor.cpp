@@ -369,7 +369,14 @@ namespace NActors {
             auto it = EventAwaiters.find(ev->Cookie);
             if (it != EventAwaiters.end()) {
                 for (auto& awaiter : it->second) {
-                    if (awaiter.Handle(ev)) {
+                    if (awaiter.Matches(*ev)) {
+                        it->second.Remove(&awaiter);
+                        if (it->second.Empty()) {
+                            EventAwaiters.erase(it);
+                        }
+                        // Resumption may destroy the awaiter or change/rehash EventAwaiters.
+                        // Do not access either after handing off the event.
+                        awaiter.HandleMatched(ev);
                         return true;
                     }
                 }

@@ -6185,6 +6185,55 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
     }
 
 #if defined(__linux__)
+    Y_UNIT_TEST(ControlledReadReleasesRequestWhileDataIoPending) {
+        struct TTrackedRead : NDDisk::TEvRead {
+            std::shared_ptr<ui32> Destructions;
+
+            TTrackedRead(const NDDisk::TQueryCredentials& creds, std::shared_ptr<ui32> destructions)
+                : TEvRead(creds, {0, 0, BlockSize}, {true})
+                , Destructions(std::move(destructions))
+            {}
+
+            ~TTrackedRead() override {
+                ++*Destructions;
+            }
+        };
+
+        for (bool router : {false, true}) for (bool checksums : {false, true}) {
+            TControlledDDisk f(router, checksums);
+            f.Initialize();
+            auto destructions = std::make_shared<ui32>(0);
+            SendToDDisk(f.Ctx, f.Disk.ServiceId, new TTrackedRead(f.Creds, destructions), 501);
+            f.Until([&] { return f.Io.size() == 1; });
+            UNIT_ASSERT_VALUES_EQUAL(*destructions, 1);
+            UNIT_ASSERT(!f.Io.front().Write);
+            UNIT_ASSERT_VALUES_EQUAL(f.Io.front().Size, BlockSize);
+            UNIT_ASSERT(f.Replies.empty());
+
+            // Releasing the request must not release the physical chunk while its
+            // completion is held. Routing and reply state also outlive the request.
+            SendToDDisk(f.Ctx, f.Disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(f.Creds), 502);
+            f.Reply<NDDisk::TEvDeleteTabletChunksResult>(502, TReplyStatus::BUSY);
+            UNIT_ASSERT_VALUES_EQUAL(f.Replies.size(), 1);
+
+            f.Complete();
+            const auto& record = f.Reply<NDDisk::TEvReadResult>(501, TReplyStatus::OK);
+            UNIT_ASSERT_VALUES_EQUAL(record.ChecksumsSize(), checksums ? 1 : 0);
+            const auto reply = std::find_if(f.Replies.begin(), f.Replies.end(), [](const auto& ev) {
+                return ev->Cookie == 501;
+            });
+            UNIT_ASSERT(reply != f.Replies.end());
+            UNIT_ASSERT_VALUES_EQUAL((*reply)->Get<NDDisk::TEvReadResult>()->GetPayload(0).ConvertToString(),
+                MakeData('A', BlockSize));
+            UNIT_ASSERT_VALUES_EQUAL(*destructions, 1);
+            UNIT_ASSERT_VALUES_EQUAL(f.Replies.size(), 2);
+
+            SendToDDisk(f.Ctx, f.Disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(f.Creds), 503);
+            f.Reply<NDDisk::TEvDeleteTabletChunksResult>(503, TReplyStatus::OK);
+            f.Shutdown();
+        }
+    }
+
     Y_UNIT_TEST(ControlledInterruptedFormattingDoesNotSubmitAnotherSlice) {
         for (bool router : {false, true}) for (bool broken : {false, true}) {
             TControlledDDisk f(router, false, true);
