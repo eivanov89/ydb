@@ -20,10 +20,18 @@ public:
     static NActors::TAsyncFrameCache::TStats FrameCacheStats(const TDDiskActor& actor) {
         return actor.AsyncFrameCache.GetStats();
     }
+    static size_t PendingReads(const TDDiskActor& actor) {
+        return actor.PendingDDiskReads.size();
+    }
 #if defined(__linux__)
     static std::pair<ui32, ui32> IoAddress(const NPDisk::TUringOperationBase& op) {
         const auto& direct = static_cast<const TDDiskActor::TDirectIoOpBase&>(op);
         return {direct.GetChunkIdx(), direct.GetChunkOffset()};
+    }
+    static std::pair<ui32, ui32> IoPartAddress(const NPDisk::TUringOperationBase& op, size_t index) {
+        const auto& direct = static_cast<const TDDiskActor::TReadPartsIoOp&>(op);
+        const auto& part = direct.GetFallbackPart(index);
+        return {part.ChunkIdx, part.OffsetInBytes};
     }
     static bool UsesRouter(const TDDiskActor& actor) { return bool(actor.UringRouter); }
 #endif

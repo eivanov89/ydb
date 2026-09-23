@@ -13,6 +13,7 @@
 
 #include <util/generic/bitmap.h>
 #include <util/generic/intrlist.h>
+#include <util/generic/array_ref.h>
 
 #include <deque>
 #include <memory>
@@ -25,8 +26,8 @@ namespace NKikimr::NDDisk {
 // TIntegrityManager
 //
 // Owns integrity allocation, shared pair loads and serialized pair flush coroutines.
-// The host launches owned factories eagerly and supplies awaitable device I/O. Handles store
-// results as well as notifications, so completion before Wait() is safe.
+// Pair preparation and completion are ordinary actor-local operations; the host submits
+// their descriptors without launching read coroutines. Handles retain completed results.
 //
 // PDisk never restarts separately from DDisk, so a reserved chunk may be formatted immediately
 // (as if committed). Formatting writes (chunk headers, extent image) run in parallel; the actor
@@ -83,6 +84,18 @@ public:
         TRope Data;
     };
 
+    struct TPairRead {
+        ui64 Id = 0;
+        TChunkIdx ChunkIdx = 0;
+        ui32 OffsetInBytes = 0;
+        ui32 Size = 0;
+    };
+
+    struct TPairReadResult {
+        ui64 Id = 0;
+        TIoResult Result;
+    };
+
     struct IHost {
         virtual ~IHost() = default;
         virtual NActors::IActor& Actor() = 0;
@@ -90,7 +103,8 @@ public:
         virtual void Launch(std::function<NActors::async<void>()> factory) = 0;
         virtual NActors::async<TChunkIdx> Allocate() = 0;
         virtual void ReturnChunk(TChunkIdx chunk) = 0;
-        virtual NActors::async<TIoResult> Read(TChunkIdx chunk, ui32 offset, ui32 size) = 0;
+        // Each descriptor must eventually reach CompletePairReads, including submission failure.
+        virtual void SubmitPairReads(std::vector<TPairRead> reads) = 0;
         virtual NActors::async<bool> Write(TChunkIdx chunk, ui32 offset, TRcBuf data,
             EWriteIoKind kind) = 0;
     };
@@ -120,21 +134,75 @@ public:
 
     struct TOperationState {
         std::optional<TOperationResult> Result;
+        // Stop can publish logical failure before a read's shared loads retire.
+        bool Settled = true;
+        // Notified only after Result is set; completion is retained for every waiter.
         NActors::TAsyncEvent Changed;
+        std::function<void()> CompletionCallback;
     };
 
     class TOperation {
     public:
+        class [[nodiscard]] TWaitAwaiter {
+        public:
+            static constexpr bool IsActorAwareAwaiter = true;
+
+            explicit TWaitAwaiter(std::shared_ptr<TOperationState> state)
+                : State(std::move(state))
+                , EventWaiter(State->Changed.Wait())
+            {}
+
+            TWaitAwaiter(const TWaitAwaiter&) = delete;
+            TWaitAwaiter(TWaitAwaiter&&) = delete;
+            TWaitAwaiter& operator=(const TWaitAwaiter&) = delete;
+            TWaitAwaiter& operator=(TWaitAwaiter&&) = delete;
+
+            TWaitAwaiter& CoAwaitByValue() && noexcept { return *this; }
+            bool await_ready() const noexcept { return State->Result.has_value(); }
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
+                EventWaiter.await_suspend(continuation);
+            }
+            bool await_cancel(std::coroutine_handle<> continuation) noexcept {
+                return EventWaiter.await_cancel(continuation);
+            }
+            TOperationResult await_resume() const {
+                Y_ABORT_UNLESS(State->Result);
+                return *State->Result;
+            }
+
+        private:
+            // Destroy the event waiter before releasing the state that owns its queue.
+            std::shared_ptr<TOperationState> State;
+            decltype(State->Changed.Wait()) EventWaiter;
+        };
+
         TOperation() = default;
         explicit TOperation(std::shared_ptr<TOperationState> state) : State(std::move(state)) {}
         const TOperationResult* GetResult() const { return State && State->Result ? &*State->Result : nullptr; }
-        NActors::async<TOperationResult> Wait(NActors::IActor& actor) const {
-            return WaitImpl(actor, State);
+        bool IsSettled() const { return State && State->Settled; }
+        // Actor-local callback, used by the read's ordinary aggregate awaiter. Passing an empty
+        // callback detaches its observer without canceling shared metadata work.
+        void SetCompletionCallback(std::function<void()> callback) const {
+            Y_ABORT_UNLESS(State);
+            if (State->Result && State->Settled) {
+                if (callback) { callback(); }
+            } else {
+                State->CompletionCallback = std::move(callback);
+            }
+        }
+        TWaitAwaiter Wait(NActors::IActor&) const {
+            Y_ABORT_UNLESS(State);
+            return TWaitAwaiter(State);
         }
     private:
-        static NActors::async<TOperationResult> WaitImpl(NActors::IActor& actor,
-            std::shared_ptr<TOperationState> state);
         std::shared_ptr<TOperationState> State;
+    };
+
+    struct TReadPreparation {
+        std::optional<TOperationResult> Result;
+        TOperation Pending;
+        // Only newly claimed loads. Existing loads are joined through Pending.
+        std::vector<TPairRead> Reads;
     };
 
     struct TExtentState {
@@ -146,6 +214,14 @@ public:
     class TExtent {
     public:
         explicit TExtent(std::shared_ptr<TExtentState> state) : State(std::move(state)) {}
+        std::optional<bool> GetPlacedResult() const {
+            if (State->Placed || State->Failed) { return State->Placed; }
+            return std::nullopt;
+        }
+        std::optional<bool> GetReadyResult() const {
+            if (State->Ready || State->Failed) { return State->Ready; }
+            return std::nullopt;
+        }
         NActors::async<bool> WaitPlaced(NActors::IActor& actor) const { return WaitImpl(actor, State, false); }
         NActors::async<bool> WaitReady(NActors::IActor& actor) const { return WaitImpl(actor, State, true); }
     private:
@@ -192,10 +268,14 @@ public:
         ui64 checksumCacheBytes = DefaultChecksumCacheBytes);
 
     TExtent StartExtent(TDataChunkKey key, TChunkIdx dataChunkIdx);
+    // Preparation claims and pins metadata but does not submit I/O. The caller can combine Reads
+    // and its data range into one vector operation. Every claimed descriptor requires completion.
+    TReadPreparation PrepareRead(TDataChunkKey key, ui32 offsetInBytes, ui32 size);
+    void CompletePairReads(TConstArrayRef<TPairReadResult> results);
     TOperation StartRead(TDataChunkKey key, ui32 offsetInBytes, ui32 size);
     TOperation StartWrite(TDataChunkKey key, ui32 offsetInBytes, ui32 size,
         const std::vector<ui64>& checksums);
-    // Close admission and wake logical waits. Accepted host I/O remains owned by its coroutine.
+    // Close admission and wake logical waits. Shared loads retain their pins until completion.
     void Stop();
 
     // Starts a durable tablet deletion. Matching extents stop participating in snapshots and
@@ -315,6 +395,8 @@ private:
 
     // Sparse state only for pairs with queued/in-flight work (or a remembered corruption). It is
     // removed when a pair becomes idle, keeping the per-disk pinned footprint at TPairMeta size.
+    struct TPendingRead;
+
     struct TPairRuntime {
         ui64 MutationVersion = 0;
         ui64 DurableVersion = 0;
@@ -325,6 +407,22 @@ private:
         bool LostWriteCorruption = false;
         TString CorruptionReason;
         NActors::TAsyncEvent Changed;
+        std::vector<std::weak_ptr<TPendingRead>> Readers;
+    };
+
+    struct TPendingRead {
+        ui64 Id = 0;
+        TDataChunkKey Key;
+        ui32 Offset = 0;
+        ui32 Size = 0;
+        ui32 Remaining = 0;
+        std::shared_ptr<TOperationState> Completion;
+    };
+
+    struct TPairLoad {
+        TDataChunkKey Key;
+        ui32 PairIdx = 0;
+        std::shared_ptr<TPairRuntime> Runtime;
     };
 
     struct TExtentInfo {
@@ -362,15 +460,19 @@ private:
         TChunkIdx chunkIdx, ui32 replica);
     static NActors::async<void> FormatExtent(NActors::IActor& actor, TIntegrityManager& self,
         TDataChunkKey key, TExtentRef ref, std::shared_ptr<TExtentState> completion);
-    static NActors::async<void> LoadPair(NActors::IActor& actor, TIntegrityManager& self,
-        TDataChunkKey key, ui32 pairIdx, std::shared_ptr<TPairRuntime> runtime);
+    TPairRead ClaimPairRead(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx,
+        const std::shared_ptr<TPairRuntime>& runtime);
+    void FinishPendingRead(const std::shared_ptr<TPendingRead>& read);
+    static void CompleteOperation(const std::shared_ptr<TOperationState>& completion, TOperationResult result);
     static NActors::async<void> FlushPair(NActors::IActor& actor, TIntegrityManager& self,
         TDataChunkKey key, ui32 pairIdx, std::shared_ptr<TPairRuntime> runtime);
     static NActors::async<void> RunOperation(NActors::IActor& actor, TIntegrityManager& self,
-        TDataChunkKey key, ui32 offset, ui32 size, std::optional<std::vector<ui64>> checksums,
+        TDataChunkKey key, ui32 offset, ui32 size, std::vector<ui64> checksums,
         std::shared_ptr<TOperationState> completion);
     TOperation StartOperation(TDataChunkKey key, ui32 offset, ui32 size,
-        std::optional<std::vector<ui64>> checksums);
+        std::vector<ui64> checksums);
+    void ValidateOperationRange(ui32 offset, ui32 size) const;
+    TOperationResult MakeReadResult(TDataChunkKey key, ui32 offset, ui32 size) const;
     TRcBuf MakePairImage(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx);
     bool LoadPairImage(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx, const TRope& data,
         TString* errorReason, bool* lostWriteDetected);
@@ -404,6 +506,10 @@ private:
 
     absl::flat_hash_map<TChunkIdx, TIntegrityChunkInfo> IntegrityChunks;
     absl::flat_hash_map<TDataChunkKey, TExtentInfo> Extents;
+    absl::flat_hash_map<ui64, TPairLoad> PairLoads;
+    absl::flat_hash_map<ui64, std::shared_ptr<TPendingRead>> PendingReads;
+    ui64 NextPairReadId = 1;
+    ui64 NextPendingReadId = 1;
 
     // Monotonic source of every VChunkGeneration / IntegrityChunkGeneration; persisted as a
     // snapshot watermark, so reuse after free keeps bumping generations even across restarts

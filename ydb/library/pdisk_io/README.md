@@ -17,7 +17,7 @@ for those layers.
 | [uring_router.h](uring_router.h), [uring_router.cpp](uring_router.cpp) | One io_uring and its dedicated I/O thread |
 | [uring_router_client.h](uring_router_client.h) | Submit-only interface and shared router configuration |
 | [uring_router_backend.h](uring_router_backend.h) | Backend seam used to isolate liburing calls in tests |
-| [uring_operation.h](uring_operation.h), [uring_operation.cpp](uring_operation.cpp) | Operation lifetime, scalar/scatter-gather buffers, result and retry cursor |
+| [uring_operation.h](uring_operation.h), [uring_operation.cpp](uring_operation.cpp) | Operation lifetime, scalar/scatter-gather buffers, independent read ranges and completion cursors |
 | [buffers.h](buffers.h), [buffer_pool.h](buffer_pool.h) | Aligned buffers and pooling |
 | [file_params.h](file_params.h), [drivedata.h](drivedata.h), [device_type.h](device_type.h) | File/device geometry and drive information |
 | [device_io_sample.h](device_io_sample.h) | Timing sample exchanged with device estimation |
@@ -99,6 +99,23 @@ operation must call `ResetSubmissionState()` before preparing new I/O; do not
 carry its previous offset, result, fixed-buffer index or retry cursor forward.
 Alignment requirements come from the opened device and caller contract.
 
+`PrepareReadParts` accepts independent `{DiskOffset, Size, Buffer}` ranges on
+all platforms. It copies the descriptors; callers own the referenced memory
+through completion. One part uses the scalar path. Multiple parts use stable
+internal cursors, each with its own offset, destination, progress, and result.
+The router issues their SQEs as queue capacity becomes available and continues
+short reads independently. The number of parts may exceed both SQ depth and the
+64-segment scatter/gather limit.
+
+The complete set of read parts is one admitted parent operation with one
+terminal callback after every part retires. `GetReadPartResult(index)` retains
+each part's byte count or negative errno. `GetResult()` reports total bytes on
+success, or the first error in descriptor order, regardless of completion order.
+`GetInflight()` and shutdown count the parent once; device samples and short-I/O
+accounting describe physical submissions. Rejection leaves ownership of the
+entire parent and every buffer with the caller. On shutdown, unissued parts are
+canceled and issued parts drain before the parent callback can recycle it.
+
 ## Shutdown
 
 `StopAsync()` atomically closes admission and returns without waiting. A
@@ -156,6 +173,15 @@ actor. Selection of PDisk fallback and translation into PDisk requests belong
 to the DDisk caller, not to `TUringRouter`. A plain ring is still io_uring; an
 ordinary CQE error is not an automatic switch to PDisk. Changes at this boundary
 must preserve sender/cookie, payload ownership and final completion on both paths.
+
+DDisk reads combine data and newly claimed integrity-pair loads into one
+`PrepareReadParts` operation. Existing shared loads remain separate dependencies
+of the read's ordinary awaiter. The DirectIo object owns all part buffers and
+keeps successful results while retrying only failed, retryable metadata parts;
+each retry is a new admission. Data errors remain separate from critical
+metadata errors. Fallback sends a PDisk raw-read request per part and produces
+one logical completion after all requests retire. The actor applies metadata
+images and resolves dependencies on its own thread.
 
 ## Tests
 

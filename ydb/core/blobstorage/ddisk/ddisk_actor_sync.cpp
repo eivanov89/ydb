@@ -96,13 +96,18 @@ namespace NKikimr::NDDisk {
                 }
             }
         }
-        co_await NActors::WithTaskGroup([&](NActors::TTaskGroup<void>& group) -> NActors::async<void> {
-            for (auto& request : sync.Requests) {
-                group.Add([this, &sync, &request] { return RunSyncSource(sync, request); });
-            }
-            while (group.Running() || group.Ready()) { co_await group.Next(); }
-        });
-        const bool committed = co_await WaitForChunkCommit(sync.Creds.TabletId, sync.VChunkIndex);
+        if (sync.Requests.size() == 1) {
+            co_await RunSyncSource(sync, sync.Requests.front());
+        } else {
+            co_await NActors::WithTaskGroup([&](NActors::TTaskGroup<void>& group) -> NActors::async<void> {
+                for (auto& request : sync.Requests) {
+                    group.Add([this, &sync, &request] { return RunSyncSource(sync, request); });
+                }
+                while (group.Running() || group.Ready()) { co_await group.Next(); }
+            });
+        }
+        const bool committed = IsChunkCommitted(sync.Creds.TabletId, sync.VChunkIndex)
+            || co_await WaitForChunkCommit(sync.Creds.TabletId, sync.VChunkIndex);
         TStringBuilder errors;
         for (auto& request : sync.Requests) {
             if (IsBroken() || !committed) {
@@ -192,10 +197,14 @@ namespace NKikimr::NDDisk {
             return true;
         };
         if (!valid()) { co_return TSyncData{}; }
-        co_await WaitForChunk(sync.Creds.TabletId, sync.VChunkIndex, true);
+        if (!ChunkRefs[sync.Creds.TabletId][sync.VChunkIndex].ChunkIdx) {
+            co_await WaitForChunk(sync.Creds.TabletId, sync.VChunkIndex, true);
+        }
         if (!valid()) { co_return TSyncData{}; }
         if (Config.EnableChecksums) {
-            request.Admitted = co_await AcquireIntegrityExtent(sync.Creds.TabletId, sync.VChunkIndex);
+            auto& chunk = ChunkRefs.at(sync.Creds.TabletId).at(sync.VChunkIndex);
+            request.Admitted = TryAcquireIntegrityExtent(chunk)
+                || co_await AcquireIntegrityExtent(sync.Creds.TabletId, sync.VChunkIndex);
             if (!valid() || !request.Admitted) { co_return TSyncData{}; }
         }
         SegmentManager.PopRequest(request.RequestId, &data.Segments);
@@ -215,30 +224,47 @@ namespace NKikimr::NDDisk {
         Y_DEFER { if (admitted) { chunk.IntegrityExtentWriteInFlight = false; } };
         if (prepared && !prepared->Segments.empty()) {
             auto& data = *prepared;
-            co_await NActors::WithTaskGroup<TSyncSegmentResult>([&](auto& group) -> NActors::async<void> {
-                ui32 consumed = request.Selector.OffsetInBytes;
-                for (const auto& [begin, end] : data.Segments) {
-                    data.Data.EraseFront(begin - consumed);
-                    TRope segment;
-                    data.Data.ExtractFront(end - begin, &segment);
-                    consumed = end;
-                    std::vector<ui64> checksums;
-                    if (Config.EnableChecksums) {
-                        const auto first = (begin - request.Selector.OffsetInBytes) / IntegrityUnitSize;
-                        checksums.assign(data.Checksums.begin() + first, data.Checksums.begin() + first + (end - begin) / IntegrityUnitSize);
-                    }
-                    group.Add([this, &sync, begin, segment = std::move(segment), checksums = std::move(checksums)]() mutable {
-                        return WriteSyncSegment(sync, begin, std::move(segment), std::move(checksums));
-                    });
+            struct TSegmentData {
+                TRope Data;
+                std::vector<ui64> Checksums;
+            };
+            ui32 consumed = request.Selector.OffsetInBytes;
+            auto takeSegment = [&](ui32 begin, ui32 end) {
+                TSegmentData segment;
+                data.Data.EraseFront(begin - consumed);
+                data.Data.ExtractFront(end - begin, &segment.Data);
+                consumed = end;
+                if (Config.EnableChecksums) {
+                    const auto first = (begin - request.Selector.OffsetInBytes) / IntegrityUnitSize;
+                    segment.Checksums.assign(data.Checksums.begin() + first,
+                        data.Checksums.begin() + first + (end - begin) / IntegrityUnitSize);
                 }
-                while (group.Running() || group.Ready()) {
-                    auto result = co_await group.Next();
-                    if (result.Status != TStatus::OK && request.Status == TStatus::UNKNOWN) {
-                        request.Status = result.Status;
-                        request.ErrorReason = std::move(result.ErrorReason);
-                    }
+                return segment;
+            };
+            auto acceptResult = [&](TSyncSegmentResult result) {
+                if (result.Status != TStatus::OK && request.Status == TStatus::UNKNOWN) {
+                    request.Status = result.Status;
+                    request.ErrorReason = std::move(result.ErrorReason);
                 }
-            });
+            };
+            if (data.Segments.size() == 1) {
+                const auto [begin, end] = data.Segments.front();
+                auto segment = takeSegment(begin, end);
+                acceptResult(co_await WriteSyncSegment(sync, begin,
+                    std::move(segment.Data), std::move(segment.Checksums)));
+            } else {
+                co_await NActors::WithTaskGroup<TSyncSegmentResult>([&](auto& group) -> NActors::async<void> {
+                    for (const auto& [begin, end] : data.Segments) {
+                        auto segment = takeSegment(begin, end);
+                        group.Add([this, &sync, begin, segment = std::move(segment)]() mutable {
+                            return WriteSyncSegment(sync, begin, std::move(segment.Data), std::move(segment.Checksums));
+                        });
+                    }
+                    while (group.Running() || group.Ready()) {
+                        acceptResult(co_await group.Next());
+                    }
+                });
+            }
             if (request.Status == TStatus::UNKNOWN) { request.Status = TStatus::OK; }
         } else if (!prepared && request.Status != TStatus::OUTDATED) {
             request.Status = IsBroken() ? TStatus::ERROR : TStatus::SESSION_MISMATCH;
@@ -263,10 +289,12 @@ namespace NKikimr::NDDisk {
         TSyncSegmentResult result;
         const auto* immediate = metadata.GetResult();
         if (!immediate || immediate->Status == TIntegrityManager::EOperationStatus::Ok) {
-            const auto chunk = ChunkRefs.at(sync.Creds.TabletId).at(sync.VChunkIndex).ChunkIdx;
+            auto& chunkRef = ChunkRefs.at(sync.Creds.TabletId).at(sync.VChunkIndex);
+            const auto chunk = chunkRef.ChunkIdx;
             std::unique_ptr<TDirectIoOpBase> op = AllocateOp<TInternalSyncWriteOp>();
             op->PrepareWrite(std::move(data), DiskFormat->Offset(chunk, 0, begin), chunk, begin);
-            auto event = co_await AwaitSyncIo(std::move(op), sync.Creds.TabletId, sync.VChunkIndex);
+            TDataIoPin pin(chunkRef);
+            auto event = co_await SubmitSyncIo(std::move(op));
             result.Status = event->Get()->Status;
             result.ErrorReason = std::move(event->Get()->ErrorMessage);
         }

@@ -2665,17 +2665,19 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             }
             UNIT_ASSERT_VALUES_EQUAL(metadataReads, 1);
 
+            ui32 physicalCompletions = 0;
+            std::multiset<size_t> completedParentSizes;
+            ctx.Runtime.FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
+                using TPrivate = NDDisk::TDDiskActor::TEvPrivate;
+                if (ev->GetTypeRewrite() == NPDisk::TEvChunkReadRawResult::EventType) {
+                    ++physicalCompletions;
+                } else if (ev->GetTypeRewrite() == TPrivate::TEvReadPartsResult::EventType) {
+                    completedParentSizes.insert(ev->Get<TPrivate::TEvReadPartsResult>()->Parts.size());
+                }
+                return true;
+            };
             auto complete = [&](bool metadata) {
-                ui32 completions = 0;
-                ctx.Runtime.FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
-                    using TPrivate = NDDisk::TDDiskActor::TEvPrivate;
-                    if (ev->GetTypeRewrite() == (metadata
-                            ? TPrivate::TEvIntegrityIoResult::EventType
-                            : TPrivate::TEvDDiskIoResult::EventType)) {
-                        ++completions;
-                    }
-                    return true;
-                };
+                const ui32 expected = physicalCompletions + (metadata ? 1 : 2);
                 for (const auto& read : reads) {
                     const auto& request = *read->Get<NPDisk::TEvChunkReadRaw>();
                     if ((request.ChunkIdx == integrityChunk) == metadata) {
@@ -2684,9 +2686,8 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
                     }
                 }
                 events = 0;
-                ctx.Runtime.Sim([&] { return completions < (metadata ? 1u : 2u) && ++events < 200; });
-                ctx.Runtime.FilterFunction = {};
-                UNIT_ASSERT_VALUES_EQUAL(completions, metadata ? 1 : 2);
+                ctx.Runtime.Sim([&] { return physicalCompletions < expected && ++events < 200; });
+                UNIT_ASSERT_VALUES_EQUAL(physicalCompletions, expected);
             };
 
             complete(metadataFirst);
@@ -2694,6 +2695,12 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             // outstanding metadata or data still prevents deleting the physical chunks.
             AssertStatus(SendToDDiskAndWait<NDDisk::TEvDeleteTabletChunksResult>(
                 ctx, disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(creds)), TReplyStatus::BUSY);
+            // The initiating read owns data + metadata in one parent. The joined
+            // read owns only data, so it can retire that parent while metadata waits.
+            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.size(), metadataFirst ? 0 : 1);
+            if (!metadataFirst) {
+                UNIT_ASSERT_VALUES_EQUAL(*completedParentSizes.begin(), 1u);
+            }
             complete(!metadataFirst);
             std::set<ui64> cookies;
             for (ui32 i = 0; i < 2; ++i) {
@@ -2703,6 +2710,10 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
                 const TString expected = result->Cookie == 1 ? payload : payload + TString(BlockSize, '\0');
                 AssertDirectRead(result, expected, CalculateChecksums(expected));
             }
+            ctx.Runtime.FilterFunction = {};
+            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.size(), 2u);
+            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.count(1), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.count(2), 1u);
             UNIT_ASSERT_VALUES_EQUAL(GetChecksumCounter(ctx, disk, "IntegrityPairReads")->Val(), 1);
         }
     }
@@ -2727,21 +2738,25 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
                 std::swap(first, second);
             }
 
-            // Retire one side before shutdown, then keep the other side's callback
-            // queued until after the request has been canceled.
-            bool completed = false;
+            // One raw reply cannot retire the vector parent. Shutdown cancels the
+            // parent once; the other raw reply arrives after its terminal result.
+            bool physicalCompleted = false;
+            ui32 parentCompletions = 0;
             ctx.Runtime.FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
                 using TPrivate = NDDisk::TDDiskActor::TEvPrivate;
-                if (ev->GetTypeRewrite() == (metadataFirst
-                        ? TPrivate::TEvIntegrityIoResult::EventType
-                        : TPrivate::TEvDDiskIoResult::EventType)) {
-                    completed = true;
+                if (ev->GetTypeRewrite() == NPDisk::TEvChunkReadRawResult::EventType) {
+                    physicalCompleted = true;
+                } else if (ev->GetTypeRewrite() == TPrivate::TEvReadPartsResult::EventType) {
+                    ++parentCompletions;
+                    UNIT_ASSERT_VALUES_EQUAL(ev->Get<TPrivate::TEvReadPartsResult>()->Parts.size(), 2u);
                 }
                 return true;
             };
             ctx.SendPDiskResponse(disk, *first, new NPDisk::TEvChunkReadRawResult(storage.Read(*first->Get())));
-            ctx.Runtime.Sim([&] { return !completed; });
-            ctx.Runtime.FilterFunction = {};
+            ctx.Runtime.Sim([&] { return !physicalCompleted; });
+            AssertStatus(SendToDDiskAndWait<NDDisk::TEvDeleteTabletChunksResult>(
+                ctx, disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(creds)), TReplyStatus::BUSY);
+            UNIT_ASSERT_VALUES_EQUAL(parentCompletions, 0u);
             NDDisk::NTesting::IgnoreShutdownChunkForget(ctx.Runtime);
             SendToDDisk(ctx, disk.ServiceId, new TEvents::TEvPoison());
             auto result = WaitFromDDisk<NDDisk::TEvReadResult>(ctx);
@@ -2751,6 +2766,8 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             // Gone is delivered only after canceled fallback completions have retired.
             // A duplicate read reply would be observed instead and fail this wait.
             WaitFromDDisk<TEvents::TEvGone>(ctx);
+            ctx.Runtime.FilterFunction = {};
+            UNIT_ASSERT_VALUES_EQUAL(parentCompletions, 1u);
         }
     }
 

@@ -481,6 +481,10 @@ struct io_uring_sqe* TUringRouter::GetSqe() {
 }
 
 void TUringRouter::PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op) {
+    if (IsReadPart(op)) {
+        PrepareReadPartSqe(sqe, GetReadCursor(op));
+        return;
+    }
     // Use vectored SQEs for genuine scatter-gather and oversized singleton
     // requests; scalar SQEs take an unsigned byte count and would narrow the latter.
     const int fd = FixedFdIndex >= 0 ? FixedFdIndex : static_cast<FHANDLE>(Fd);
@@ -540,6 +544,39 @@ void TUringRouter::PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op)
     op->SubmitCycles = HPNow();
     io_uring_sqe_set_data(sqe, op);
     NSan::Release(op);
+}
+
+bool TUringRouter::IsReadPart(const TUringOperationBase* op) {
+    return reinterpret_cast<uintptr_t>(op) & 1;
+}
+
+TUringOperationBase::TReadCursor* TUringRouter::GetReadCursor(TUringOperationBase* op) {
+    return reinterpret_cast<TUringOperationBase::TReadCursor*>(reinterpret_cast<uintptr_t>(op) & ~uintptr_t{1});
+}
+
+TUringOperationBase* TUringRouter::EncodeReadCursor(TUringOperationBase::TReadCursor* cursor) {
+    static_assert(alignof(TUringOperationBase::TReadCursor) > 1);
+    return reinterpret_cast<TUringOperationBase*>(reinterpret_cast<uintptr_t>(cursor) | 1);
+}
+
+void TUringRouter::PrepareReadPartSqe(struct io_uring_sqe* sqe, TUringOperationBase::TReadCursor* cursor) {
+    const int fd = FixedFdIndex >= 0 ? FixedFdIndex : static_cast<FHANDLE>(Fd);
+    Y_ABORT_UNLESS(cursor->Size > 0);
+    if (cursor->Size <= Max<unsigned>()) {
+        io_uring_prep_read(sqe, fd, cursor->Buffer, static_cast<unsigned>(cursor->Size), cursor->DiskOffset);
+    } else {
+        cursor->Iov = {cursor->Buffer, cursor->Size};
+        io_uring_prep_readv(sqe, fd, &cursor->Iov, 1, cursor->DiskOffset);
+    }
+    if (FixedFdIndex >= 0) {
+        sqe->flags |= IOSQE_FIXED_FILE;
+    }
+    cursor->SubmitCycles = HPNow();
+    if (!cursor->Parent->SubmitCycles) {
+        cursor->Parent->SubmitCycles = cursor->SubmitCycles;
+    }
+    io_uring_sqe_set_data(sqe, EncodeReadCursor(cursor));
+    NSan::Release(cursor);
 }
 
 ui64 TUringRouter::GetInflight() const {
@@ -639,6 +676,15 @@ bool TUringRouter::DrainSubmitQueue() {
             PendingSubmit = op;
             break;
         }
+        if (!IsReadPart(op) && op->ReadParts.size() > 1) {
+            Y_ABORT_UNLESS(op->OperationType == TUringOperationBase::EREAD);
+            Y_ABORT_UNLESS(op->NextReadPart < op->ReadCursors.size());
+            auto* cursor = &op->ReadCursors[op->NextReadPart++];
+            if (op->NextReadPart < op->ReadCursors.size()) {
+                PendingSubmit = op;
+            }
+            op = EncodeReadCursor(cursor);
+        }
         PrepareSqe(sqe, op);
         didWork = true;
     }
@@ -646,14 +692,102 @@ bool TUringRouter::DrainSubmitQueue() {
 }
 
 void TUringRouter::DropOperation(TUringOperationBase* op) {
+    if (IsReadPart(op)) {
+        CompleteReadPart(GetReadCursor(op), -ECANCELED);
+        return;
+    }
+    if (op->ReadParts.size() > 1) {
+        // Retire only ranges never staged. Issued/staged siblings still retain
+        // their parent and every buffer until their own completions or drops.
+        for (; op->NextReadPart < op->ReadCursors.size(); ++op->NextReadPart) {
+            op->ReadCursors[op->NextReadPart].Result = -ECANCELED;
+            --op->RemainingReadParts;
+        }
+        MaybeCompleteReadParts(op);
+        return;
+    }
     if (op->IsContinuation) {
         CompleteOperation(op, -ECANCELED);
         return;
+    }
+    if (!op->ReadParts.empty()) {
+        op->Result = -ECANCELED;
     }
     if (TestHooks && TestHooks->BeforeTerminalCallback) { TestHooks->BeforeTerminalCallback(); }
     op->OnDrop(ActorSystem);
     const ui64 previous = InFlightCount.fetch_sub(1, std::memory_order_release);
     Y_DEBUG_ABORT_UNLESS(previous > 0);
+}
+
+void TUringRouter::CompleteReadPart(TUringOperationBase::TReadCursor* cursor, i64 result) {
+    auto* op = cursor->Parent;
+    cursor->Result = result;
+    Y_ABORT_UNLESS(op->RemainingReadParts > 0);
+    --op->RemainingReadParts;
+    MaybeCompleteReadParts(op);
+}
+
+void TUringRouter::MaybeCompleteReadParts(TUringOperationBase* op) {
+    if (op->RemainingReadParts) {
+        return;
+    }
+    i64 result = static_cast<i64>(op->TotalSize);
+    for (const auto& cursor : op->ReadCursors) {
+        if (cursor.Result < 0) {
+            result = cursor.Result;
+            break;
+        }
+    }
+    if (op->ReadPartReachedKernel) {
+        CompleteOperation(op, result);
+    } else {
+        op->Result = result;
+        if (TestHooks && TestHooks->BeforeTerminalCallback) { TestHooks->BeforeTerminalCallback(); }
+        op->OnDrop(ActorSystem);
+        const ui64 previous = InFlightCount.fetch_sub(1, std::memory_order_release);
+        Y_DEBUG_ABORT_UNLESS(previous > 0);
+    }
+}
+
+void TUringRouter::ReapReadPart(TUringOperationBase::TReadCursor* cursor, i32 result) {
+    NSan::Acquire(cursor);
+    auto* op = cursor->Parent;
+    op->ReadPartReachedKernel = true;
+    const size_t requested = cursor->Size;
+    Y_ABORT_UNLESS(result <= 0 || static_cast<size_t>(result) <= requested,
+        "io_uring CQE exceeds the submitted read-part window");
+    if constexpr (NSan::MSanIsOn()) {
+        if (result > 0) {
+            NSan::Unpoison(cursor->Buffer, result);
+        }
+    }
+    if (SampleSink && cursor->SubmitCycles && result >= 0) {
+        TDeviceIoSample sample;
+        sample.SubmitCycles = cursor->SubmitCycles;
+        sample.CompleteCycles = HPNow();
+        sample.Offset = cursor->DiskOffset;
+        sample.Size = requested;
+        sample.IsWrite = false;
+        SampleSink(sample);
+    }
+    if (result > 0) {
+        cursor->Size -= result;
+        cursor->DiskOffset += result;
+        cursor->Buffer = static_cast<char*>(cursor->Buffer) + result;
+        if (cursor->Size) {
+            ++op->ShortIoCount;
+            if (State.load(std::memory_order_acquire) == EUringRouterState::Running) {
+                Continuations.push_back(EncodeReadCursor(cursor));
+            } else {
+                CompleteReadPart(cursor, -ECANCELED);
+            }
+            return;
+        }
+        const size_t index = cursor - op->ReadCursors.data();
+        CompleteReadPart(cursor, op->ReadParts[index].Size);
+    } else {
+        CompleteReadPart(cursor, result == 0 ? -EIO : result);
+    }
 }
 
 void TUringRouter::CompleteOperation(TUringOperationBase* op, i64 result) {
@@ -689,7 +823,11 @@ void TUringRouter::DropPendingSqes() {
             continue;
         }
         Y_ABORT_UNLESS(op && op != QueueStopSentinel());
-        NSan::Acquire(op);
+        if (IsReadPart(op)) {
+            NSan::Acquire(GetReadCursor(op));
+        } else {
+            NSan::Acquire(op);
+        }
         DropOperation(op);
     }
 }
@@ -776,6 +914,10 @@ ui32 TUringRouter::ReapCompletions() {
         } else {
             auto* op = reinterpret_cast<TUringOperationBase*>(data);
             Y_ABORT_UNLESS(op);
+            if (IsReadPart(op)) {
+                ReapReadPart(GetReadCursor(op), result);
+                continue;
+            }
             NSan::Acquire(op);
             const size_t requested = op->GetOperationBytes();
             Y_ABORT_UNLESS(result <= 0 || static_cast<size_t>(result) <= requested,

@@ -1400,6 +1400,44 @@ Y_UNIT_TEST_SUITE(TUringOperationBaseTest) {
 
 Y_UNIT_TEST_SUITE(TUringRouterTest) {
 
+    Y_UNIT_TEST(ReadPartsNativeIndependentRangesBeyondQueueDepth) {
+        const auto config = DefaultConfig(4);
+        SKIP_IF_NO_URING(config);
+        TTempFile tmp(MakeTempName(nullptr, "uring_read_parts"));
+        TFile file(tmp.Name(), CreateAlways | RdWr);
+        constexpr size_t count = 80;
+        constexpr size_t size = 4096;
+        TAlignedBuf source(count * size);
+        for (size_t i = 0; i < count; ++i) {
+            memset(static_cast<char*>(source.Data()) + i * size, i + 1, size);
+        }
+        file.Write(source.Data(), count * size);
+        std::vector<std::unique_ptr<TAlignedBuf>> buffers;
+        std::vector<TUringOperationBase::TReadPart> parts;
+        for (size_t i = 0; i < count; ++i) {
+            buffers.push_back(std::make_unique<TAlignedBuf>(size));
+            // Multiplication by 13 permutes these 80 disk ranges.
+            parts.push_back({((13 * i) % count) * size, size, buffers.back()->Data()});
+        }
+        TUringRouter router(DupOwned(file), nullptr, config);
+        router.RegisterFile();
+        router.Start();
+        TManualEvent completed;
+        TTestOp op;
+        op.Event = &completed;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(router.Read(&op));
+        completed.WaitI();
+        router.StopSync();
+        UNIT_ASSERT_VALUES_EQUAL(op.GetResult(), count * size);
+        for (size_t i = 0; i < count; ++i) {
+            UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(i), size);
+            UNIT_ASSERT(memcmp(parts[i].Buffer,
+                static_cast<char*>(source.Data()) + parts[i].DiskOffset, size) == 0);
+        }
+    }
+
     Y_UNIT_TEST(DefaultIdleSpinIs10Microseconds) {
         UNIT_ASSERT_VALUES_EQUAL(10u, TUringRouterConfig{}.IdleSpinUs);
     }
@@ -1732,7 +1770,10 @@ struct TScriptedUringBackend : NUringPrivate::IUringRouterBackend {
     }
 
     void Complete(TUringOperationBase& op, int result) {
-        const ui64 userData = reinterpret_cast<uintptr_t>(&op);
+        CompleteUserData(reinterpret_cast<uintptr_t>(&op), result);
+    }
+
+    void CompleteUserData(ui64 userData, int result) {
         auto found = std::find(Outstanding.begin(), Outstanding.end(), userData);
         Y_ABORT_UNLESS(found != Outstanding.end(), "fake completed an unconsumed operation");
         Outstanding.erase(found);
@@ -1763,6 +1804,10 @@ struct TScriptedRouter {
         Backend->Complete(op, result);
         UNIT_ASSERT_VALUES_EQUAL(TUringRouterTestPeer::Reap(*Router), 1u);
     }
+    void CompletePart(size_t submission, int result) {
+        Backend->CompleteUserData(Backend->Stats->Consumed.at(submission).Sqe.user_data, result);
+        UNIT_ASSERT_VALUES_EQUAL(TUringRouterTestPeer::Reap(*Router), 1u);
+    }
 };
 
 struct TScriptedOp : TUringOperationBase {
@@ -1790,6 +1835,288 @@ void AssertSqe(const TScriptedUringBackend::TSubmission& submission, int opcode,
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(TUringRouterScriptedTest) {
+    Y_UNIT_TEST(ReadPartsKeepIndependentBuffersAndOffsetsAndCompleteOnce) {
+        TScriptedRouter fixture;
+        fixture.Initialize();
+        char first[8] = {}, second[12] = {}, third[4] = {};
+        const TUringOperationBase::TReadPart parts[] = {
+            {512, sizeof(first), first}, {32, sizeof(second), second}, {4096, sizeof(third), third},
+        };
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 1u);
+        const auto& submitted = fixture.Backend->Stats->Consumed;
+        UNIT_ASSERT_VALUES_EQUAL(submitted.size(), 3u);
+        for (size_t i = 0; i < 3; ++i) {
+            AssertSqe(submitted[i], IORING_OP_READ, parts[i].Buffer, parts[i].Size, parts[i].DiskOffset);
+        }
+        fixture.CompletePart(2, 4);
+        fixture.CompletePart(0, 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 1u);
+        fixture.CompletePart(1, 12);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(op.Drops, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetResult(), 24);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetOperationBytes(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 0u);
+        for (size_t i = 0; i < 3; ++i) {
+            UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(i), parts[i].Size);
+            UNIT_ASSERT_VALUES_EQUAL(op.GetReadParts()[i].DiskOffset, parts[i].DiskOffset);
+            UNIT_ASSERT_VALUES_EQUAL(op.GetReadParts()[i].Buffer, parts[i].Buffer);
+        }
+    }
+
+    Y_UNIT_TEST(ReadPartsExceedSqDepthAndIovecLimitUnderOneAdmission) {
+        TScriptedRouter fixture(4);
+        fixture.Initialize();
+        char buffer[130] = {};
+        std::vector<TUringOperationBase::TReadPart> parts;
+        for (size_t i = 0; i < sizeof(buffer); ++i) {
+            parts.push_back({4096 * i, 1, &buffer[i]});
+        }
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        size_t retired = 0;
+        while (retired < parts.size()) {
+            fixture.Issue();
+            const size_t submitted = fixture.Backend->Stats->Consumed.size();
+            UNIT_ASSERT_VALUES_EQUAL(submitted, Min(retired + 4, parts.size()));
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 1u);
+            for (size_t i = submitted; i-- > retired;) {
+                AssertSqe(fixture.Backend->Stats->Consumed[i], IORING_OP_READ,
+                    parts[i].Buffer, 1, parts[i].DiskOffset);
+                fixture.CompletePart(i, 1);
+            }
+            retired = submitted;
+        }
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetResult(), parts.size());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 0u);
+    }
+
+    Y_UNIT_TEST(ReadPartsShortsAndSiblingFailuresKeepResultsInPartOrder) {
+        TScriptedRouter fixture;
+        std::vector<TDeviceIoSample> samples;
+        fixture.Router->SetSampleSink([&](const TDeviceIoSample& sample) { samples.push_back(sample); });
+        fixture.Initialize();
+        char first[8] = {}, second[8] = {}, third[8] = {};
+        const TUringOperationBase::TReadPart parts[] = {
+            {64, 8, first}, {128, 8, second}, {256, 8, third},
+        };
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        fixture.CompletePart(2, -EIO);
+        fixture.CompletePart(1, 3);
+        fixture.CompletePart(0, -EINVAL);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 0u);
+        fixture.Issue();
+        AssertSqe(fixture.Backend->Stats->Consumed.back(), IORING_OP_READ, second + 3, 5, 131);
+        fixture.CompletePart(3, 5);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetResult(), -EINVAL);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), -EINVAL);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(1), 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(2), -EIO);
+        UNIT_ASSERT_VALUES_EQUAL(op.TakeShortIoCount(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(samples.size(), 2u);
+        UNIT_ASSERT_VALUES_EQUAL(samples[0].Offset, 128u);
+        UNIT_ASSERT_VALUES_EQUAL(samples[0].Size, 8u);
+        UNIT_ASSERT_VALUES_EQUAL(samples[1].Offset, 131u);
+        UNIT_ASSERT_VALUES_EQUAL(samples[1].Size, 5u);
+    }
+
+    Y_UNIT_TEST(ReadPartsPermitSelectiveRetryAndSingletonScalarCompletion) {
+        TScriptedRouter fixture;
+        fixture.Initialize();
+        char data[8] = {}, metadata[8] = {};
+        const TUringOperationBase::TReadPart parts[] = {{16, 8, data}, {8192, 8, metadata}};
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        fixture.CompletePart(0, 8);
+        fixture.CompletePart(1, -EAGAIN);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(1), -EAGAIN);
+        op.PrepareReadParts(op.GetReadParts().Slice(1, 1));
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadParts().size(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), 0);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        AssertSqe(fixture.Backend->Stats->Consumed.back(), IORING_OP_READ, metadata, 8, 8192);
+        fixture.Complete(op, -ENOMEM);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), -ENOMEM);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 2u);
+        op.SetReadPartResult(0, 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), 8);
+    }
+
+    Y_UNIT_TEST(ReadPartsRejectionKeepsDescriptorsAndCallerOwnership) {
+        TScriptedRouter fixture;
+        char data[8] = {}, metadata[8] = {};
+        const TUringOperationBase::TReadPart parts[] = {{16, 8, data}, {8192, 8, metadata}};
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(!fixture.Router->Read(&op));
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions + op.Drops, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadParts()[1].Buffer, metadata);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(1), 0);
+        fixture.Initialize();
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        fixture.CompletePart(0, 8);
+        fixture.CompletePart(1, 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetResult(), 16);
+    }
+
+    Y_UNIT_TEST(ReadPartsShutdownDropsOnlyAfterAllStagedRangesRetire) {
+        for (bool stage : {false, true}) {
+            TScriptedRouter fixture(2);
+            fixture.Initialize();
+            char buffer[3] = {};
+            const TUringOperationBase::TReadPart parts[] = {{0, 1, buffer}, {8, 1, buffer + 1}, {16, 1, buffer + 2}};
+            TScriptedOp op;
+            op.SetOperationType(TUringOperationBase::EREAD);
+            op.PrepareReadParts(parts);
+            UNIT_ASSERT(fixture.Router->Read(&op));
+            if (stage) {
+                TUringRouterTestPeer::Drain(*fixture.Router);
+            }
+            fixture.Router->StopAsync();
+            TUringRouterTestPeer::Drain(*fixture.Router);
+            TUringRouterTestPeer::Submit(*fixture.Router);
+            UNIT_ASSERT_VALUES_EQUAL(op.Completions, 0u);
+            UNIT_ASSERT_VALUES_EQUAL(op.Drops, 1u);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 0u);
+            for (size_t i = 0; i < 3; ++i) {
+                UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(i), -ECANCELED);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(ReadPartsShutdownDrainsIssuedSiblingsBeforeTerminalCallback) {
+        TScriptedRouter fixture(2);
+        fixture.Initialize();
+        char buffer[5] = {};
+        const TUringOperationBase::TReadPart parts[] = {
+            {0, 1, buffer}, {8, 1, buffer + 1}, {16, 1, buffer + 2},
+            {24, 1, buffer + 3}, {32, 1, buffer + 4},
+        };
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        TUringRouterTestPeer::Drain(*fixture.Router);
+        fixture.Router->StopAsync();
+        TUringRouterTestPeer::Drain(*fixture.Router);
+        TUringRouterTestPeer::Submit(*fixture.Router);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions + op.Drops, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 1u);
+        fixture.CompletePart(1, 1);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions + op.Drops, 0u);
+        fixture.CompletePart(0, 1);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(op.Drops, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetResult(), -ECANCELED);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), 1);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(1), 1);
+        for (size_t i = 2; i < 5; ++i) {
+            UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(i), -ECANCELED);
+        }
+    }
+
+    Y_UNIT_TEST(ReadPartsCancelShortContinuationWithoutResubmittingSibling) {
+        TScriptedRouter fixture(1);
+        fixture.Initialize();
+        char first[8] = {}, second[8] = {};
+        const TUringOperationBase::TReadPart parts[] = {{16, 8, first}, {64, 8, second}};
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        fixture.CompletePart(0, 3);
+        fixture.Issue();
+        AssertSqe(fixture.Backend->Stats->Consumed.back(), IORING_OP_READ, second, 8, 64);
+        fixture.Router->StopAsync();
+        TUringRouterTestPeer::Drain(*fixture.Router);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 0u);
+        fixture.CompletePart(1, 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(0), -ECANCELED);
+        UNIT_ASSERT_VALUES_EQUAL(op.GetReadPartResult(1), 8);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Backend->Stats->Consumed.size(), 2u);
+    }
+
+    Y_UNIT_TEST(ReadPartsTerminalCallbackCanRecycleParentAndDescriptors) {
+        TScriptedRouter fixture;
+        fixture.Initialize();
+        char first[8] = {}, second[8] = {};
+        const TUringOperationBase::TReadPart parts[] = {{16, 8, first}, {64, 8, second}};
+        TScriptedOp op;
+        op.SetOperationType(TUringOperationBase::EREAD);
+        op.PrepareReadParts(parts);
+        op.Callback = [&] {
+            if (op.Completions == 1) {
+                op.ResetSubmissionState();
+                op.SetOperationType(TUringOperationBase::EREAD);
+                op.PrepareReadParts(parts);
+                Y_ABORT_UNLESS(fixture.Router->Read(&op));
+            }
+        };
+        UNIT_ASSERT(fixture.Router->Read(&op));
+        fixture.Issue();
+        fixture.CompletePart(0, 8);
+        fixture.CompletePart(1, 8);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 1u);
+        fixture.Issue();
+        fixture.CompletePart(3, 8);
+        fixture.CompletePart(2, 8);
+        UNIT_ASSERT_VALUES_EQUAL(op.Completions, 2u);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 0u);
+    }
+
+    Y_UNIT_TEST(ReadPartsTerminalCallbackCanDeleteParentAfterSiblingFailure) {
+        struct TDeletingOp : TUringOperationBase {
+            unsigned& Completions;
+            explicit TDeletingOp(unsigned& completions) : Completions(completions) {}
+            void OnComplete(TActorSystem*) noexcept override {
+                Y_ABORT_UNLESS(GetReadPartResult(0) == 8 && GetReadPartResult(1) == -EIO);
+                ++Completions;
+                delete this;
+            }
+            void OnDrop(TActorSystem*) noexcept override { delete this; }
+        };
+        TScriptedRouter fixture;
+        fixture.Initialize();
+        unsigned completions = 0;
+        char first[8] = {}, second[8] = {};
+        const TUringOperationBase::TReadPart parts[] = {{16, 8, first}, {64, 8, second}};
+        auto owner = std::make_unique<TDeletingOp>(completions);
+        owner->SetOperationType(TUringOperationBase::EREAD);
+        owner->PrepareReadParts(parts);
+        auto* op = owner.release();
+        UNIT_ASSERT(fixture.Router->Read(op));
+        fixture.Issue();
+        fixture.CompletePart(1, 0);
+        UNIT_ASSERT_VALUES_EQUAL(completions, 0u);
+        fixture.CompletePart(0, 8);
+        UNIT_ASSERT_VALUES_EQUAL(completions, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Router->GetInflight(), 0u);
+    }
+
     Y_UNIT_TEST(StopSyncWaitsForEveryPublisherPhase) {
         for (ui32 phase = 0; phase != 3; ++phase) {
             auto backend = std::make_unique<TScriptedUringBackend>();

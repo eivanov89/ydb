@@ -7,8 +7,8 @@
 namespace NKikimr::NDDisk {
 namespace NIntegrityTest {
 
-// Only the fixture records submissions and assigns test completion IDs. Production
-// coroutines wait directly on the host and contain no action/completion pump.
+// The fixture records ordinary pair submissions and awaitable writes/allocations, then
+// delivers all completions on the actor thread.
 class THost : public TIntegrityManager::IHost {
 public:
     struct TAllocateIntegrityChunk {};
@@ -31,11 +31,12 @@ public:
     NActors::IActor* ActorPtr = nullptr;
     NAsyncTest::TAsyncTestActorRuntime::TAsyncActorOperations Mailbox;
     std::vector<TAction> Submissions;
+    size_t LaunchCount = 0;
     ui64 NextIo = 1;
     TChunkIdx ImmediateChunk = 0;
     bool ImmediateWrites = false;
     std::map<ui64, NActors::TAsyncContinuation<bool>> Writes;
-    std::map<ui64, NActors::TAsyncContinuation<TIntegrityManager::TIoResult>> Reads;
+    std::map<ui64, ui64> Reads;
     std::deque<NActors::TAsyncContinuation<TChunkIdx>> Allocations;
     std::vector<TChunkIdx> Returned;
 
@@ -48,7 +49,10 @@ public:
         Y_UNUSED(actor);
         co_await factory();
     }
-    void Launch(std::function<NActors::async<void>()> factory) override { Run(Actor(), std::move(factory)); }
+    void Launch(std::function<NActors::async<void>()> factory) override {
+        ++LaunchCount;
+        Run(Actor(), std::move(factory));
+    }
     NActors::async<TChunkIdx> Allocate() override {
         if (ImmediateChunk) { co_return ImmediateChunk++; }
         co_return co_await NActors::WithAsyncContinuation<TChunkIdx>([this](auto continuation) {
@@ -66,12 +70,12 @@ public:
             Submissions.emplace_back(TWriteIo{id, chunk, offset, std::move(data), kind});
         });
     }
-    NActors::async<TIntegrityManager::TIoResult> Read(TChunkIdx chunk, ui32 offset, ui32 size) override {
-        co_return co_await NActors::WithAsyncContinuation<TIntegrityManager::TIoResult>([&](auto continuation) {
+    void SubmitPairReads(std::vector<TIntegrityManager::TPairRead> reads) override {
+        for (const auto& read : reads) {
             const ui64 id = NextIo++;
-            Reads.emplace(id, std::move(continuation));
-            Submissions.emplace_back(TReadIo{id, chunk, offset, size});
-        });
+            Reads.emplace(id, read.Id);
+            Submissions.emplace_back(TReadIo{id, read.ChunkIdx, read.OffsetInBytes, read.Size});
+        }
     }
 };
 
@@ -96,6 +100,7 @@ public:
 
     std::vector<TAction> TakeActions() { return std::exchange(Submissions, {}); }
     bool HasActions() const { return !Submissions.empty(); }
+    size_t GetHostLaunchCount() const { return LaunchCount; }
     std::vector<TDataChunkKey> TakePlacedKeys() { return std::exchange(Placed, {}); }
     std::vector<TOperationResult> TakeCompletedOperations() { return std::exchange(Completed, {}); }
     void UseSynchronousHost(TChunkIdx firstChunk) { ImmediateChunk = firstChunk; ImmediateWrites = true; }
@@ -136,9 +141,9 @@ public:
     }
     void OnReadIoCompleted(ui64 id, TRope data, bool ok = true) {
         Mailbox.RunSync([&] {
-            auto continuation = std::move(Reads.at(id));
+            TPairReadResult result{Reads.at(id), TIoResult{ok, std::move(data)}};
             Reads.erase(id);
-            continuation.Resume(TIoResult{ok, std::move(data)});
+            CompletePairReads(TConstArrayRef<TPairReadResult>(&result, 1));
         });
     }
     ui64 BeginBlocksWrite(TDataChunkKey key, ui32 offset, ui32 size, const std::vector<ui64>& checksums) {

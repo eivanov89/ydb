@@ -38,7 +38,11 @@ public:
     virtual bool IsRestoreIo() const noexcept { return false; }
     virtual bool IsIntegrityIo() const noexcept { return false; }
     virtual bool IsChunkFormatIo() const noexcept { return false; }
+    virtual bool IsReadPartsIo() const noexcept { return false; }
     bool IsCriticalDDiskIo() const noexcept { return IsIntegrityIo() || IsChunkFormatIo(); }
+
+    // Selective retries may submit fewer bytes than the original logical request.
+    virtual ui64 GetAccountingSize() const noexcept { return GetTotalSize(); }
 
     virtual void ClearForRecycle() noexcept;
 
@@ -79,6 +83,7 @@ protected:
     const TActorId DDiskId;
 
     virtual void SelfRecycle() noexcept { delete this; }
+    virtual bool PrepareRetry() noexcept;
 
 
 private:
@@ -131,6 +136,58 @@ private:
     ui64 TabletId = 0;
     ui64 VChunkIndex = 0;
     bool HasChunkKey = false;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TDDiskActor::TReadPartsIoOp
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// One logical cold read owns the data buffer and any newly claimed metadata
+// buffers. Shared metadata loads remain independent of the initiating reader.
+// Completion only publishes an event; metadata and reader state are actor-local.
+class TDDiskActor::TReadPartsIoOp final : public TDDiskActor::TDirectIoOpBase {
+public:
+    struct TPart {
+        ui64 Id = 0; // zero denotes client data; nonzero denotes a metadata load
+        TChunkIdx ChunkIdx = 0;
+        ui32 OffsetInBytes = 0;
+        ui32 Size = 0;
+        ui64 DiskOffset = 0;
+    };
+
+    explicit TReadPartsIoOp(TDDiskActor& actor)
+        : TDirectIoOpBase(actor)
+    {}
+
+    void PrepareParts(TConstArrayRef<TPart> parts);
+
+    bool IsReadPartsIo() const noexcept override { return true; }
+    ui64 GetAccountingSize() const noexcept override { return AccountingSize; }
+
+    const TPart& GetFallbackPart(size_t activeIndex) const;
+    void SetFallbackPartResult(size_t activeIndex, i64 result, TRope&& data);
+    void FinishFallbackReadParts();
+
+    void Reply(NActors::TActorSystem* actorSystem,
+        NKikimrBlobStorage::NDDisk::TReplyStatus::E status, TString reason = {}) noexcept override;
+
+protected:
+    bool PrepareRetry() noexcept override;
+
+private:
+    struct TOwnedPart {
+        TPart Part;
+        TRcBuf Buffer;
+        std::optional<TRope> FallbackData;
+        i64 Result = 0;
+        bool Completed = false;
+    };
+
+    void PrepareActiveParts();
+
+    std::vector<TOwnedPart> Parts;
+    std::vector<size_t> ActiveParts;
+    ui64 AccountingSize = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

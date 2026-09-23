@@ -22,6 +22,7 @@
 #include <ydb/library/actors/async/event.h>
 #include <ydb/library/actors/async/frame_cache.h>
 #include <ydb/library/actors/async/continuation.h>
+#include <ydb/library/actors/async/wait_for_event.h>
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
 
@@ -110,6 +111,7 @@ namespace NKikimr::NDDisk {
         class TPersistentBufferPartIoOp;
         class TInternalSyncWriteOp;
         class TIntegrityIoOp;
+        class TReadPartsIoOp;
         class TChunkFormatIoOp;
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -286,6 +288,7 @@ namespace NKikimr::NDDisk {
                 EvRetryIODelayed,
                 EvProcessPersistentBufferRemoval,
                 EvExpirePersistentBufferRegistrationToken,
+                EvReadPartsResult,
             };
 
             struct TEvExpirePersistentBufferRegistrationToken
@@ -438,6 +441,19 @@ namespace NKikimr::NDDisk {
                 TEvIntegrityIoResult(NKikimrBlobStorage::NDDisk::TReplyStatus::E status,
                         TString errorMessage = {}, TRope data = {})
                     : Status(status), ErrorMessage(std::move(errorMessage)), Data(std::move(data))
+                {}
+            };
+
+            struct TEvReadPartsResult : TEventLocal<TEvReadPartsResult, EvReadPartsResult> {
+                struct TPartResult {
+                    ui64 Id;
+                    NKikimrBlobStorage::NDDisk::TReplyStatus::E Status;
+                    TString ErrorMessage;
+                    TRope Data;
+                };
+                std::vector<TPartResult> Parts;
+                explicit TEvReadPartsResult(std::vector<TPartResult> parts)
+                    : Parts(std::move(parts))
                 {}
             };
 
@@ -601,6 +617,25 @@ namespace NKikimr::NDDisk {
             NActors::TAsyncEvent ExtentAvailable;
         };
 
+        class TDataIoPin {
+        public:
+            explicit TDataIoPin(TChunkRef& chunk)
+                : Chunk(chunk)
+            {
+                ++Chunk.InFlightDataIo;
+            }
+
+            ~TDataIoPin() {
+                --Chunk.InFlightDataIo;
+            }
+
+            TDataIoPin(const TDataIoPin&) = delete;
+            TDataIoPin& operator=(const TDataIoPin&) = delete;
+
+        private:
+            TChunkRef& Chunk;
+        };
+
         // Node-stable: waiters hold TChunkRef& (and its TAsyncEvent members) across co_await.
         THashMap<ui64, THashMap<ui64, TChunkRef>> ChunkRefs; // TabletId -> (VChunkIndex -> ChunkIdx)
 
@@ -678,6 +713,12 @@ namespace NKikimr::NDDisk {
 
         THashMap<ui64, TPendingIoOp> WriteCallbacks;
         THashMap<ui64, TPendingIoOp> ReadCallbacks;
+        struct TReadPartCallback {
+            ui64 ParentCookie;
+            size_t Index;
+        };
+        THashMap<ui64, TReadPartCallback> ReadPartCallbacks;
+        THashMap<ui64, size_t> ReadPartsRemaining;
         THashMap<ui64, TPendingIoOp> DelayedRetries;
         ui64 NextRetryId = 0;
 
@@ -759,8 +800,8 @@ namespace NKikimr::NDDisk {
             void Launch(std::function<NActors::async<void>()> factory) override { Self.LaunchIntegrity(std::move(factory)); }
             NActors::async<TChunkIdx> Allocate() override { return Self.AllocateIntegrityChunk(); }
             void ReturnChunk(TChunkIdx chunk) override { Self.ChunkManager.ReturnChunk(chunk); }
-            NActors::async<TIntegrityManager::TIoResult> Read(TChunkIdx chunk, ui32 offset, ui32 size) override {
-                return Self.ReadIntegrity(chunk, offset, size);
+            void SubmitPairReads(std::vector<TIntegrityManager::TPairRead> reads) override {
+                Self.SubmitIntegrityPairReads(std::move(reads));
             }
             NActors::async<bool> Write(TChunkIdx chunk, ui32 offset, TRcBuf data,
                     TIntegrityManager::EWriteIoKind kind) override {
@@ -770,29 +811,99 @@ namespace NKikimr::NDDisk {
         std::deque<NActors::TAsyncContinuation<TChunkIdx>> IntegrityAllocations;
         void LaunchIntegrity(std::function<NActors::async<void>()> factory);
         NActors::async<TChunkIdx> AllocateIntegrityChunk();
-        NActors::async<TIntegrityManager::TIoResult> ReadIntegrity(TChunkIdx chunk, ui32 offset, ui32 size);
+        void SubmitIntegrityPairReads(std::vector<TIntegrityManager::TPairRead> reads);
         NActors::async<bool> WriteIntegrity(TChunkIdx chunk, ui32 offset, TRcBuf data,
             TIntegrityManager::EWriteIoKind kind);
         void CountIntegrityResult(const TIntegrityManager::TOperationResult& result);
-        NActors::async<TEvPrivate::TEvDDiskIoResult::TPtr> AwaitDataIo(
-            std::unique_ptr<TDirectIoOpBase> op, ui64 tabletId, ui64 vChunkIndex);
-        NActors::async<TEvPrivate::TEvInternalSyncWriteResult::TPtr> AwaitSyncIo(
-            std::unique_ptr<TDirectIoOpBase> op, ui64 tabletId, ui64 vChunkIndex);
+        // Callers retain a TDataIoPin until the returned completion is consumed.
+        using TDataIoCompletion = decltype(NActors::ActorWaitForEvent<TEvPrivate::TEvDDiskIoResult>(0));
+        using TSyncIoCompletion = decltype(NActors::ActorWaitForEvent<TEvPrivate::TEvInternalSyncWriteResult>(0));
+        TDataIoCompletion SubmitDataIo(std::unique_ptr<TDirectIoOpBase> op);
+        TSyncIoCompletion SubmitSyncIo(std::unique_ptr<TDirectIoOpBase> op);
+        bool IsChunkCommitted(ui64 tabletId, ui64 vChunkIndex) const;
         NActors::async<bool> WaitForChunkCommit(ui64 tabletId, ui64 vChunkIndex);
         static std::unique_ptr<TEvPrivate::TEvDDiskIoResult> MakeDDiskReadResult(
             const IEventHandle& request, ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan&& span);
         ui64 SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
             ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span,
             std::unique_ptr<TEvPrivate::TEvDDiskIoResult>& result);
+        struct TPendingDDiskRead {
+            TDataIoPin Pin;
+            TIntegrityManager::TOperation Metadata;
+            std::unique_ptr<TEvPrivate::TEvDDiskIoResult> Result;
+            NActors::TAsyncEvent Changed;
+            bool IoPending = false;
+            bool Done = false;
+            bool Detached = false;
+
+            explicit TPendingDDiskRead(TChunkRef& chunk) : Pin(chunk) {}
+        };
+        THashMap<ui64, std::shared_ptr<TPendingDDiskRead>> PendingDDiskReads;
+
+        class TDDiskReadAwaiter {
+        public:
+            static constexpr bool IsActorAwareAwaiter = true;
+            TDDiskReadAwaiter(TDDiskActor& self, TEvRead::TPtr& request, TChunkRef& chunk,
+                ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span);
+            ~TDDiskReadAwaiter();
+            TDDiskReadAwaiter(const TDDiskReadAwaiter&) = delete;
+            TDDiskReadAwaiter& CoAwaitByValue() && noexcept { return *this; }
+            bool await_ready() const noexcept;
+            template<class TPromise>
+            void await_suspend(std::coroutine_handle<TPromise> parent) {
+                if (Mode == EMode::DataEvent) {
+                    Event->await_suspend(parent);
+                } else {
+                    Cold->Waiter.await_suspend(parent);
+                }
+            }
+            std::coroutine_handle<> await_cancel(std::coroutine_handle<> continuation) noexcept {
+                if (Mode == EMode::DataEvent) {
+                    return Event->await_cancel(continuation);
+                }
+                return Cold->Waiter.await_cancel(continuation) ? continuation : std::coroutine_handle<>{};
+            }
+            std::unique_ptr<TEvPrivate::TEvDDiskIoResult> await_resume();
+
+        private:
+            enum class EMode { Ready, DataEvent, Cold } Mode = EMode::Ready;
+            struct TColdWait {
+                std::shared_ptr<TPendingDDiskRead> Context;
+                decltype(Context->Changed.Wait()) Waiter;
+                explicit TColdWait(std::shared_ptr<TPendingDDiskRead> context)
+                    : Context(std::move(context)), Waiter(Context->Changed.Wait())
+                {}
+            };
+            TDDiskActor& Self;
+            std::unique_ptr<TEvPrivate::TEvDDiskIoResult> Result;
+            std::optional<TIntegrityManager::TOperationResult> Metadata;
+            std::optional<TDataIoPin> Pin;
+            std::optional<TDataIoCompletion> Event;
+            std::optional<TColdWait> Cold;
+        };
+        TDDiskReadAwaiter ReadDDisk(TEvRead::TPtr& request, TChunkRef& chunk,
+            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span);
+        void ApplyDDiskReadMetadata(TEvPrivate::TEvDDiskIoResult& result,
+            TIntegrityManager::TOperationResult metadata);
+        void TryFinishDDiskRead(ui64 cookie);
+        void Handle(TEvPrivate::TEvReadPartsResult::TPtr ev);
         void FinishDDiskIoResult(TEvPrivate::TEvDDiskIoResult& msg);
         void ReleaseIntegrityExtentWrite(ui64 tabletId, ui64 vChunkIndex);
+        bool TryAcquireIntegrityExtent(TChunkRef& chunk);
         NActors::async<bool> AcquireIntegrityExtent(ui64 tabletId, ui64 vChunkIndex);
         // Assigns newly free slots to pending extents, starts their formatting, and
         // releases integrity chunks that remain completely unused. Never-logged chunks return to
         // the reserve; committed ones are dropped via a snapshot. Returns only after the
         // optional release snapshot commits, or false on terminal failure.
         NActors::async<bool> ReclaimUnusedIntegrityChunks();
+        struct TIntegrityReclamation {
+            bool Ok;
+            std::optional<ui64> LogLsn;
+        };
+        // Performs eager placement/reclamation and submits its optional durability log.
+        TIntegrityReclamation PrepareIntegrityReclamation();
         void RunIntegrityReclamation();
+        void WaitForIntegrityReclamation(ui64 lsn);
         NActors::async<bool> CommitDataChunk(ui64 tabletId, ui64 vChunkIndex);
         void AllocateChunk(TChunkManager::TAllocation allocation, TChunkIdx chunkIdx);
         NActors::async<void> AllocateDataChunk(ui64 tabletId, ui64 vChunkIndex, TChunkIdx chunkIdx);

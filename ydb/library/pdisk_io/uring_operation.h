@@ -1,10 +1,13 @@
 #pragma once
 
 #include <util/system/types.h>
+#include <util/generic/array_ref.h>
+#include <library/cpp/containers/stack_vector/stack_vec.h>
+
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/uio.h>
-#include <library/cpp/containers/stack_vector/stack_vec.h>
 #endif
 
 namespace NActors {
@@ -19,6 +22,12 @@ class TUringOperationBase {
     friend class TUringRouter;
 
 public:
+    struct TReadPart {
+        ui64 DiskOffset;
+        size_t Size;
+        void* Buffer;
+    };
+
     // NHPTimer cycle count captured by TUringRouter right before the operation
     // is submitted to the kernel (SQE prepared). Used together with the
     // completion timestamp (captured by the I/O thread) to build a
@@ -55,6 +64,18 @@ public:
     // buf must remain valid until OnComplete/OnDrop is called.
     void PrepareIov(void* buf, size_t size, ui64 offset);
 
+    // Independent disk ranges, completed as one accepted operation. Descriptors
+    // are copied; all buffers must survive the single terminal callback. Call
+    // again with only failed ranges to prepare a selective retry. Unlike
+    // scatter/gather, the number of ranges is not limited by MAX_IOVS or SQ depth.
+    void PrepareReadParts(TConstArrayRef<TReadPart> parts);
+    TConstArrayRef<TReadPart> GetReadParts() const { return ReadParts; }
+    i64 GetReadPartResult(size_t index) const;
+
+    // Caller-side fallback backends use the same result slots. SetResult still
+    // supplies their logical aggregate result before delivering completion.
+    void SetReadPartResult(size_t index, i64 result);
+
 #if defined(__linux__)
     // Begin a scatter-gather I/O: clears the iovec list, reserves room for
     // `count` segments and sets the disk offset.  Follow with `count` AddIov()
@@ -77,8 +98,15 @@ public:
 
     // Returns the number of bytes remaining in the current (possibly partially
     // advanced) iovec window. This is zero after a successful logical completion.
-    // Invariant: GetOperationBytes() == TotalSize - BytesProcessed.
+    // Multi-range reads sum the independently advanced ranges instead.
     size_t GetOperationBytes() const {
+        if (ReadParts.size() > 1) {
+            size_t remaining = 0;
+            for (const auto& part : ReadCursors) {
+                remaining += part.Size;
+            }
+            return remaining;
+        }
 #if defined(__linux__)
         return TotalSize - BytesProcessed;
 #else
@@ -103,6 +131,9 @@ public:
     ui64 GetDiskOffset() const { return DiskOffset; }
 
     const void* GetIovBase() const {
+        if (ReadParts.size() > 1) {
+            return ReadParts.front().Buffer;
+        }
 #if defined(__linux__)
         if (IovBegin < Iov.size()) {
             return Iov[IovBegin].iov_base;
@@ -125,6 +156,11 @@ public:
         DiskOffset = 0;
         FixedBuffer = false;
         BufIndex = 0;
+        ReadParts.clear();
+        ReadCursors.clear();
+        NextReadPart = 0;
+        RemainingReadParts = 0;
+        ReadPartReachedKernel = false;
 #if defined(__linux__)
         Iov.clear();
         IovBegin = 0;
@@ -142,6 +178,26 @@ public:
 #endif
 
 private:
+    // Stable cursors are allocated only for a genuine multi-range read. An SQE
+    // refers to its cursor, never to a child operation or an additional admission.
+    struct TReadCursor {
+        TUringOperationBase* Parent = nullptr;
+        ui64 DiskOffset = 0;
+        void* Buffer = nullptr;
+        size_t Size = 0;
+        i64 Result = 0;
+        ui64 SubmitCycles = 0;
+#if defined(__linux__)
+        struct iovec Iov{};
+#endif
+    };
+
+    TStackVec<TReadPart, 1> ReadParts;
+    std::vector<TReadCursor> ReadCursors;
+    size_t NextReadPart = 0;
+    size_t RemainingReadParts = 0;
+    bool ReadPartReachedKernel = false;
+
     // Set by TUringRouter::ReadFixed/WriteFixed before the operation is handed
     // to the I/O thread.
     void SetFixedBuffer(ui16 bufIndex) {

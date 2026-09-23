@@ -212,6 +212,13 @@ private:
 
     struct io_uring_sqe* GetSqe();
     void PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op);
+    static bool IsReadPart(const TUringOperationBase* op);
+    static TUringOperationBase::TReadCursor* GetReadCursor(TUringOperationBase* op);
+    static TUringOperationBase* EncodeReadCursor(TUringOperationBase::TReadCursor* cursor);
+    void PrepareReadPartSqe(struct io_uring_sqe* sqe, TUringOperationBase::TReadCursor* cursor);
+    void ReapReadPart(TUringOperationBase::TReadCursor* cursor, i32 result);
+    void CompleteReadPart(TUringOperationBase::TReadCursor* cursor, i64 result);
+    void MaybeCompleteReadParts(TUringOperationBase* op);
 
     // Dedicated-I/O-thread methods.
     void InitializeOnIoThread();
@@ -261,7 +268,9 @@ private:
     std::atomic<bool> Parked{false};
     bool WakePollArmed = false;
 
-    // Operation popped from Queue while the SQ was full.
+    // Operation popped from Queue while the SQ was full, or a multi-range
+    // parent with unissued ranges. Tagged pointers denote individual cursors
+    // awaiting a short-read continuation; they never enter the producer Queue.
     TUringOperationBase* PendingSubmit = nullptr;
     std::deque<TUringOperationBase*> Continuations;
 

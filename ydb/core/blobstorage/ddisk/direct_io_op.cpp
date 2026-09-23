@@ -99,12 +99,10 @@ void TDDiskActor::TDirectIoOpBase::OnComplete(NActors::TActorSystem* actorSystem
     const double requestTimeMs = TimePassed();
     AccountShortIo();
 
-    // EAGAIN/ENOMEM/ENOSPC on integrity/formatting I/O must not brick the DDisk: retry the same op
-    // (buffers still owned here) through the actor retry path. Defer Done() until the retry
-    // completes or a hard error is reported.
-    if (Y_UNLIKELY(result < 0 && IsCriticalDDiskIo()
-            && UringErrorToStatus(result, opType) == TReplyStatus::OVERLOADED
-            && RetryCount < MaxResubmissions)) {
+    // Integrity overload retries retain all buffers. A read-parts operation
+    // rearms only failed metadata parts and keeps its completed data untouched.
+    // Defer logical Done() until retries finish or fail terminally.
+    if (Y_UNLIKELY(PrepareRetry())) {
         ++RetryCount;
         auto ev = std::make_unique<TDDiskActor::TEvPrivate::TEvRetryIO>(guard.Release());
         actorSystem->Send(new IEventHandle(DDiskId, {}, ev.release()));
@@ -113,10 +111,10 @@ void TDDiskActor::TDirectIoOpBase::OnComplete(NActors::TActorSystem* actorSystem
 
     switch (opType) {
     case TUringOperationBase::EREAD:
-        Actor.Counters.DirectIO.Read.Done(GetTotalSize(), requestTimeMs);
+        Actor.Counters.DirectIO.Read.Done(GetAccountingSize(), requestTimeMs);
         break;
     case TUringOperationBase::EWRITE:
-        Actor.Counters.DirectIO.Write.Done(GetTotalSize(), requestTimeMs);
+        Actor.Counters.DirectIO.Write.Done(GetAccountingSize(), requestTimeMs);
         break;
     default:
         Y_ABORT("Unknown OperationType");
@@ -153,16 +151,22 @@ void TDDiskActor::TDirectIoOpBase::OnComplete(NActors::TActorSystem* actorSystem
     Reply(actorSystem, TReplyStatus::OK);
 }
 
+bool TDDiskActor::TDirectIoOpBase::PrepareRetry() noexcept {
+    return GetResult() < 0 && IsCriticalDDiskIo()
+        && UringErrorToStatus(GetResult(), GetOperationType()) == TReplyStatus::OVERLOADED
+        && RetryCount < MaxResubmissions;
+}
+
 void TDDiskActor::TDirectIoOpBase::OnDrop(NActors::TActorSystem* actorSystem) noexcept {
     TCompletionGuard guard(this, actorSystem);
     AccountShortIo();
 
     switch (GetOperationType()) {
     case TUringOperationBase::EREAD:
-        Actor.Counters.DirectIO.Read.Done(GetTotalSize());
+        Actor.Counters.DirectIO.Read.Done(GetAccountingSize());
         break;
     case TUringOperationBase::EWRITE:
-        Actor.Counters.DirectIO.Write.Done(GetTotalSize());
+        Actor.Counters.DirectIO.Write.Done(GetAccountingSize());
         break;
     default:
         Y_ABORT("Unknown OperationType");
@@ -303,6 +307,130 @@ void TDDiskActor::TDDiskIoOp::Reply(NActors::TActorSystem* actorSystem, TReplySt
         GetOriginalRequester(), GetInterconnectSession(), GetCookie(), ExtractSpan(),
         GetTotalSize(), requestTimeMs, TabletId, VChunkIndex, HasChunkKey,
         {}), 0, GetCompletionCookie());
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TDDiskActor::TReadPartsIoOp
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void TDDiskActor::TReadPartsIoOp::PrepareParts(TConstArrayRef<TPart> parts) {
+    Y_ABORT_UNLESS(!parts.empty());
+    Parts.clear();
+    Parts.reserve(parts.size());
+    ActiveParts.clear();
+    ActiveParts.reserve(parts.size());
+    AccountingSize = 0;
+    for (const auto& part : parts) {
+        Y_ABORT_UNLESS(part.Size && part.Size <= MaxRwCount);
+        TOwnedPart owned;
+        owned.Part = part;
+        owned.Buffer = TRcBuf::UninitializedPageAligned(part.Size);
+        ActiveParts.push_back(Parts.size());
+        Parts.push_back(std::move(owned));
+        AccountingSize += part.Size;
+    }
+    PrepareActiveParts();
+}
+
+void TDDiskActor::TReadPartsIoOp::PrepareActiveParts() {
+    std::vector<NPDisk::TUringOperationBase::TReadPart> descriptors;
+    descriptors.reserve(ActiveParts.size());
+    for (const size_t index : ActiveParts) {
+        auto& part = Parts[index];
+        part.Completed = false;
+        part.FallbackData.reset();
+        descriptors.push_back({part.Part.DiskOffset, part.Part.Size, part.Buffer.GetDataMut()});
+    }
+    PrepareReadParts(descriptors);
+    SetOperationType(EREAD);
+}
+
+const TDDiskActor::TReadPartsIoOp::TPart& TDDiskActor::TReadPartsIoOp::GetFallbackPart(
+        size_t activeIndex) const {
+    return Parts.at(ActiveParts.at(activeIndex)).Part;
+}
+
+void TDDiskActor::TReadPartsIoOp::SetFallbackPartResult(size_t activeIndex, i64 result, TRope&& data) {
+    auto& part = Parts.at(ActiveParts.at(activeIndex));
+    if (result >= 0 && (static_cast<ui64>(result) != part.Part.Size || data.size() != part.Part.Size)) {
+        result = -EIO;
+    }
+    if (result >= 0) {
+        // Keep the PDisk-owned rope instead of copying it into the direct-I/O buffer.
+        part.FallbackData.emplace(std::move(data));
+    }
+    SetReadPartResult(activeIndex, result);
+}
+
+void TDDiskActor::TReadPartsIoOp::FinishFallbackReadParts() {
+    i64 aggregate = GetTotalSize();
+    for (size_t index = 0; index < ActiveParts.size(); ++index) {
+        const i64 result = GetReadPartResult(index);
+        if (result < 0) {
+            aggregate = result;
+            break;
+        }
+        Y_ABORT_UNLESS(static_cast<ui64>(result) == GetFallbackPart(index).Size);
+    }
+    SetResult(aggregate);
+}
+
+bool TDDiskActor::TReadPartsIoOp::PrepareRetry() noexcept {
+    std::vector<size_t> retry;
+    for (size_t index = 0; index < ActiveParts.size(); ++index) {
+        auto& part = Parts[ActiveParts[index]];
+        part.Result = GetReadPartResult(index);
+        part.Completed = true;
+        Y_ABORT_UNLESS(part.Result < 0 || static_cast<ui64>(part.Result) == part.Part.Size);
+        if (part.Part.Id && part.Result < 0
+                && UringErrorToStatus(part.Result, EREAD) == TReplyStatus::OVERLOADED
+                && RetryCount < MaxResubmissions) {
+            retry.push_back(ActiveParts[index]);
+        }
+    }
+    if (retry.empty()) {
+        return false;
+    }
+    ActiveParts = std::move(retry);
+    PrepareActiveParts();
+    return true;
+}
+
+void TDDiskActor::TReadPartsIoOp::Reply(NActors::TActorSystem* actorSystem, TReplyStatus::E status,
+        TString reason) noexcept {
+    std::vector<TEvPrivate::TEvReadPartsResult::TPartResult> results;
+    results.reserve(Parts.size());
+    for (auto& part : Parts) {
+        TEvPrivate::TEvReadPartsResult::TPartResult result;
+        result.Id = part.Part.Id;
+        result.Status = status;
+        result.ErrorMessage = reason;
+        if (part.Completed) {
+            if (part.Result >= 0) {
+                result.Status = TReplyStatus::OK;
+                result.ErrorMessage.clear();
+                result.Data = part.FallbackData
+                    ? std::move(*part.FallbackData)
+                    : TRope(std::move(part.Buffer));
+            } else {
+                result.Status = UringErrorToStatus(part.Result, EREAD);
+                const bool exhausted = part.Part.Id && result.Status == TReplyStatus::OVERLOADED;
+                if (exhausted) {
+                    result.Status = TReplyStatus::ERROR;
+                }
+                result.ErrorMessage = TStringBuilder()
+                    << (part.Part.Id ? "metadata" : "data") << " read failed: errno=" << -part.Result
+                    << " (" << strerror(-part.Result) << ")"
+                    << " chunkIdx=" << part.Part.ChunkIdx << " chunkOffset=" << part.Part.OffsetInBytes;
+                if (exhausted) {
+                    result.ErrorMessage += TStringBuilder() << " retry exhausted: attempts=" << (RetryCount + 1);
+                }
+            }
+        }
+        results.push_back(std::move(result));
+    }
+    actorSystem->Send(DDiskId, new TEvPrivate::TEvReadPartsResult(std::move(results)),
+        0, GetCompletionCookie());
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

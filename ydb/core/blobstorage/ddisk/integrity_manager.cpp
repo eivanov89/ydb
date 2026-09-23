@@ -306,7 +306,10 @@ NActors::async<void> TIntegrityManager::FormatExtent(NActors::IActor& actor, TIn
     it->second.Formatting = false;
     it->second.FormatComplete = ok;
     if (ok) {
-        co_await TExtent(headers).WaitReady(actor);
+        const TExtent headerExtent(headers);
+        if (!headerExtent.GetReadyResult().has_value()) {
+            co_await headerExtent.WaitReady(actor);
+        }
     }
     // Re-look up after suspension: the logical extent may have been deleted and replaced.
     it = self.Extents.find(key);
@@ -748,15 +751,6 @@ bool TIntegrityManager::HasInFlightOperationsForTablet(ui64 tabletId) const {
     return false;
 }
 
-NActors::async<TIntegrityManager::TOperationResult> TIntegrityManager::TOperation::WaitImpl(
-        NActors::IActor& actor, std::shared_ptr<TOperationState> state) {
-    Y_UNUSED(actor);
-    while (!state->Result) {
-        co_await state->Changed.Wait();
-    }
-    co_return *state->Result;
-}
-
 NActors::async<bool> TIntegrityManager::TExtent::WaitImpl(NActors::IActor& actor,
         std::shared_ptr<TExtentState> state, bool ready) {
     Y_UNUSED(actor);
@@ -768,6 +762,10 @@ NActors::async<bool> TIntegrityManager::TExtent::WaitImpl(NActors::IActor& actor
 
 void TIntegrityManager::Stop() {
     Stopped = true;
+    // Publish failure now, but retain every read's pins until its shared metadata loads settle.
+    std::vector<std::shared_ptr<TOperationState>> reads;
+    reads.reserve(PendingReads.size());
+    for (const auto& [_, read] : PendingReads) { reads.push_back(read->Completion); }
     for (auto& [_, chunk] : IntegrityChunks) {
         chunk.Completion->Failed = true;
         chunk.Completion->Changed.NotifyAll();
@@ -778,6 +776,11 @@ void TIntegrityManager::Stop() {
         for (auto& [_, runtime] : extent.PairRuntime) {
             runtime->Changed.NotifyAll();
         }
+    }
+    for (const auto& completion : reads) {
+        TOperationResult result;
+        result.Status = EOperationStatus::Failed;
+        CompleteOperation(completion, std::move(result));
     }
 }
 
@@ -794,29 +797,110 @@ NActors::async<void> TIntegrityManager::AllocateChunk(NActors::IActor& actor, TI
     }
 }
 
-NActors::async<void> TIntegrityManager::LoadPair(NActors::IActor& actor, TIntegrityManager& self,
-        TDataChunkKey key, ui32 pairIdx, std::shared_ptr<TPairRuntime> runtime) {
-    Y_UNUSED(actor);
-    const auto ref = self.Extents.at(key).Ref;
-    auto result = co_await self.Host.Read(ref.IntegrityChunkIdx,
-        self.ExtentOffset(ref.ExtentSlot) + pairIdx * IntegrityPairSlots * IntegrityUnitSize,
-        IntegrityPairSlots * IntegrityUnitSize);
-    auto& extent = self.Extents.at(key); // loader pins forbid deletion, even after logical failure
-    runtime->Loading = false;
-    runtime->Failed = !result.Ok;
-    if (result.Ok && !self.LoadPairImage(key, extent, pairIdx, result.Data,
-            &runtime->CorruptionReason, &runtime->LostWriteCorruption)) {
-        extent.Pairs.at(pairIdx).Corrupted = true;
+TIntegrityManager::TPairRead TIntegrityManager::ClaimPairRead(TDataChunkKey key,
+        TExtentInfo& extent, ui32 pairIdx, const std::shared_ptr<TPairRuntime>& runtime) {
+    Y_ABORT_UNLESS(!runtime->Loading);
+    runtime->Loading = true;
+    const ui64 id = NextPairReadId++;
+    PairLoads.emplace(id, TPairLoad{key, pairIdx, runtime});
+    return {
+        id,
+        extent.Ref.IntegrityChunkIdx,
+        static_cast<ui32>(ExtentOffset(extent.Ref.ExtentSlot)
+            + pairIdx * IntegrityPairSlots * IntegrityUnitSize),
+        IntegrityPairSlots * IntegrityUnitSize,
+    };
+}
+
+void TIntegrityManager::CompleteOperation(const std::shared_ptr<TOperationState>& completion,
+        TOperationResult result) {
+    if (!completion->Result) {
+        completion->Result.emplace(std::move(result));
+        completion->Changed.NotifyAll();
     }
-    runtime->Changed.NotifyAll();
-    self.MaybeDropPairRuntime(extent, pairIdx);
-    self.EvictBlockStatesOverBudget();
+    if (!completion->Settled) { return; }
+    auto callback = std::move(completion->CompletionCallback);
+    if (callback) { callback(); }
+}
+
+void TIntegrityManager::CompletePairReads(TConstArrayRef<TPairReadResult> results) {
+    std::vector<TPairLoad> completed;
+    completed.reserve(results.size());
+    // Apply every image before waking either readers or writers. A callback can submit more
+    // work, so no reference into PairLoads or Extents survives notification.
+    for (const auto& result : results) {
+        const auto it = PairLoads.find(result.Id);
+        Y_ABORT_UNLESS(it != PairLoads.end());
+        auto load = std::move(it->second);
+        PairLoads.erase(it);
+        auto& extent = Extents.at(load.Key); // Loading/pins prohibit deletion until retirement.
+        auto& runtime = *load.Runtime;
+        Y_ABORT_UNLESS(runtime.Loading);
+        runtime.Loading = false;
+        runtime.Failed = !result.Result.Ok;
+        if (result.Result.Ok && !LoadPairImage(load.Key, extent, load.PairIdx, result.Result.Data,
+                &runtime.CorruptionReason, &runtime.LostWriteCorruption)) {
+            extent.Pairs.at(load.PairIdx).Corrupted = true;
+        }
+        completed.push_back(std::move(load));
+    }
+    std::vector<std::shared_ptr<TPendingRead>> ready;
+    for (const auto& load : completed) {
+        auto readers = std::exchange(load.Runtime->Readers, {});
+        for (const auto& weak : readers) {
+            if (auto read = weak.lock()) {
+                Y_ABORT_UNLESS(read->Remaining);
+                if (!--read->Remaining) { ready.push_back(std::move(read)); }
+            }
+        }
+        load.Runtime->Changed.NotifyAll();
+        MaybeDropPairRuntime(Extents.at(load.Key), load.PairIdx);
+    }
+    for (const auto& read : ready) { FinishPendingRead(read); }
+    EvictBlockStatesOverBudget();
+}
+
+void TIntegrityManager::FinishPendingRead(const std::shared_ptr<TPendingRead>& read) {
+    Y_ABORT_UNLESS(!read->Remaining);
+    auto& extent = Extents.at(read->Key);
+    const ui32 first = FirstPair(read->Offset), end = EndPair(read->Offset, read->Size);
+    TOperationResult result;
+    if (!read->Completion->Result) {
+        for (ui32 idx = first; idx < end; ++idx) {
+            const auto it = extent.PairRuntime.find(idx);
+            if (extent.Pairs.at(idx).Corrupted) {
+                Y_ABORT_UNLESS(it != extent.PairRuntime.end());
+                result.Status = EOperationStatus::Corrupted;
+                result.ErrorReason = it->second->CorruptionReason;
+                result.LostWriteDetected = it->second->LostWriteCorruption;
+                break;
+            }
+            if (it != extent.PairRuntime.end() && it->second->Failed) {
+                result.Status = EOperationStatus::Failed;
+            }
+        }
+        if (Stopped) { result.Status = EOperationStatus::Failed; }
+        if (result.Status == EOperationStatus::Ok) {
+            result = MakeReadResult(read->Key, read->Offset, read->Size);
+        }
+    }
+    for (ui32 idx = first; idx < end; ++idx) {
+        Y_ABORT_UNLESS(extent.Pairs.at(idx).OperationPins);
+        --extent.Pairs.at(idx).OperationPins;
+        MaybeDropPairRuntime(extent, idx);
+    }
+    PendingReads.erase(read->Id);
+    EvictBlockStatesOverBudget();
+    read->Completion->Settled = true;
+    CompleteOperation(read->Completion, std::move(result));
 }
 
 NActors::async<void> TIntegrityManager::FlushPair(NActors::IActor& actor, TIntegrityManager& self,
         TDataChunkKey key, ui32 pairIdx, std::shared_ptr<TPairRuntime> runtime) {
     auto completion = self.Extents.at(key).Completion;
-    const bool ready = co_await TExtent(completion).WaitReady(actor);
+    const TExtent extentCompletion(completion);
+    const auto immediate = extentCompletion.GetReadyResult();
+    const bool ready = immediate ? *immediate : co_await extentCompletion.WaitReady(actor);
     if (!ready) { runtime->Failed = true; }
     while (ready && runtime->Dirty && !self.Stopped) {
         auto& extent = self.Extents.at(key);
@@ -845,8 +929,116 @@ NActors::async<void> TIntegrityManager::FlushPair(NActors::IActor& actor, TInteg
     self.EvictBlockStatesOverBudget();
 }
 
+TIntegrityManager::TReadPreparation TIntegrityManager::PrepareRead(
+        TDataChunkKey key, ui32 offset, ui32 size) {
+    ValidateOperationRange(offset, size);
+    TReadPreparation preparation;
+    TOperationResult error;
+    const auto it = Extents.find(key);
+    if (Stopped) {
+        error.Status = EOperationStatus::Failed;
+        preparation.Result.emplace(std::move(error));
+        return preparation;
+    }
+    if (it == Extents.end() || it->second.DeletionPending) {
+        error.Status = EOperationStatus::Corrupted;
+        error.ErrorReason = "integrity extent is missing for an allocated data chunk";
+        preparation.Result.emplace(std::move(error));
+        return preparation;
+    }
+    auto& extent = it->second;
+    const ui32 first = FirstPair(offset), end = EndPair(offset, size);
+    bool pending = false;
+    for (ui32 idx = first; idx < end; ++idx) {
+        const auto& pair = extent.Pairs.at(idx);
+        const auto runtimeIt = extent.PairRuntime.find(idx);
+        if (pair.Corrupted) {
+            Y_ABORT_UNLESS(runtimeIt != extent.PairRuntime.end());
+            error.Status = EOperationStatus::Corrupted;
+            error.ErrorReason = runtimeIt->second->CorruptionReason;
+            error.LostWriteDetected = runtimeIt->second->LostWriteCorruption;
+            preparation.Result.emplace(std::move(error));
+            return preparation;
+        }
+        if (runtimeIt != extent.PairRuntime.end() && runtimeIt->second->Failed) {
+            error.Status = EOperationStatus::Failed;
+        }
+        pending |= !pair.Resident;
+    }
+    if (error.Status != EOperationStatus::Ok) {
+        preparation.Result.emplace(std::move(error));
+        return preparation;
+    }
+    if (!pending) {
+        for (ui32 idx = first; idx < end; ++idx) { FindBlockState(extent, idx); }
+        preparation.Result.emplace(MakeReadResult(key, offset, size));
+        EvictBlockStatesOverBudget();
+        return preparation;
+    }
+    // Pin the complete range before claiming any load. No submission or eager coroutine may
+    // evict a cached sibling before the read captures its complete immutable snapshot.
+    for (ui32 idx = first; idx < end; ++idx) { ++extent.Pairs.at(idx).OperationPins; }
+    auto read = std::make_shared<TPendingRead>();
+    read->Id = NextPendingReadId++;
+    read->Key = key;
+    read->Offset = offset;
+    read->Size = size;
+    read->Completion = std::make_shared<TOperationState>();
+    read->Completion->Settled = false;
+    PendingReads.emplace(read->Id, read);
+    preparation.Pending = TOperation(read->Completion);
+    for (ui32 idx = first; idx < end; ++idx) {
+        if (extent.Pairs.at(idx).Resident) {
+            FindBlockState(extent, idx);
+            continue;
+        }
+        auto runtime = GetPairRuntime(extent, idx);
+        if (!runtime->Loading) {
+            preparation.Reads.push_back(ClaimPairRead(key, extent, idx, runtime));
+        }
+        ++read->Remaining;
+        runtime->Readers.push_back(read);
+    }
+    Y_ABORT_UNLESS(read->Remaining);
+    return preparation;
+}
+
 TIntegrityManager::TOperation TIntegrityManager::StartRead(TDataChunkKey key, ui32 offset, ui32 size) {
-    return StartOperation(key, offset, size, std::nullopt);
+    auto preparation = PrepareRead(key, offset, size);
+    if (preparation.Result) {
+        auto completion = std::make_shared<TOperationState>();
+        completion->Result.emplace(std::move(*preparation.Result));
+        return TOperation(std::move(completion));
+    }
+    if (!preparation.Reads.empty()) { Host.SubmitPairReads(std::move(preparation.Reads)); }
+    return std::move(preparation.Pending);
+}
+
+void TIntegrityManager::ValidateOperationRange(ui32 offset, ui32 size) const {
+    Y_ABORT_UNLESS(size && offset % IntegrityUnitSize == 0 && size % IntegrityUnitSize == 0
+        && ui64(offset) + size <= DataChunkSize);
+}
+
+TIntegrityManager::TOperationResult TIntegrityManager::MakeReadResult(
+        TDataChunkKey key, ui32 offset, ui32 size) const {
+    TOperationResult result;
+    const auto& extent = Extents.at(key);
+    result.ReadPlan = MakeReadPlan(key, offset, size);
+    for (ui32 block = offset / IntegrityUnitSize; block < (offset + size) / IntegrityUnitSize; ++block) {
+        if (!extent.UsedBlocks.Get(block)) {
+            result.Checksums.push_back(GetZeroBlockChecksum());
+        } else {
+            ui64 checksum;
+            if (!GetBlockChecksum(key, block, &checksum)) {
+                result.Status = EOperationStatus::Corrupted;
+                result.ErrorReason = TStringBuilder() << "checksum is missing for used data block " << block;
+                result.Checksums.clear();
+                break;
+            }
+            result.Checksums.push_back(checksum);
+        }
+    }
+    return result;
 }
 
 TIntegrityManager::TOperation TIntegrityManager::StartWrite(TDataChunkKey key, ui32 offset, ui32 size,
@@ -856,9 +1048,8 @@ TIntegrityManager::TOperation TIntegrityManager::StartWrite(TDataChunkKey key, u
 }
 
 TIntegrityManager::TOperation TIntegrityManager::StartOperation(TDataChunkKey key, ui32 offset, ui32 size,
-        std::optional<std::vector<ui64>> checksums) {
-    Y_ABORT_UNLESS(size && offset % IntegrityUnitSize == 0 && size % IntegrityUnitSize == 0
-        && ui64(offset) + size <= DataChunkSize);
+        std::vector<ui64> checksums) {
+    ValidateOperationRange(offset, size);
     auto completion = std::make_shared<TOperationState>();
     Host.Launch([this, key, offset, size, checksums = std::move(checksums), completion] {
         return RunOperation(Host.Actor(), *this, key, offset, size, checksums, completion);
@@ -867,7 +1058,7 @@ TIntegrityManager::TOperation TIntegrityManager::StartOperation(TDataChunkKey ke
 }
 
 NActors::async<void> TIntegrityManager::RunOperation(NActors::IActor& actor, TIntegrityManager& self,
-        TDataChunkKey key, ui32 offset, ui32 size, std::optional<std::vector<ui64>> checksums,
+        TDataChunkKey key, ui32 offset, ui32 size, std::vector<ui64> checksums,
         std::shared_ptr<TOperationState> completion) {
     Y_UNUSED(actor);
     TOperationResult result;
@@ -905,20 +1096,19 @@ NActors::async<void> TIntegrityManager::RunOperation(NActors::IActor& actor, TIn
     };
     std::vector<std::shared_ptr<TPairRuntime>> runtimes;
     runtimes.reserve(end - first);
+    std::vector<TPairRead> reads;
     for (ui32 idx = first; idx < end; ++idx) {
         auto& extent = self.Extents.at(key);
         auto runtime = self.GetPairRuntime(extent, idx);
         runtimes.push_back(runtime);
         const auto& pair = extent.Pairs.at(idx);
         if (!self.Stopped && !pair.Resident && !pair.Corrupted && !runtime->Loading && !runtime->Failed) {
-            runtime->Loading = true;
-            self.Host.Launch([&self, key, idx, runtime] {
-                return LoadPair(self.Host.Actor(), self, key, idx, runtime);
-            });
+            reads.push_back(self.ClaimPairRead(key, extent, idx, runtime));
         } else if (pair.Resident) {
             self.FindBlockState(extent, idx);
         }
     }
+    if (!reads.empty()) { self.Host.SubmitPairReads(std::move(reads)); }
     // Join every submitted load, including siblings of a failed/corrupted load.
     for (const auto& runtime : runtimes) {
         while (runtime->Loading) { co_await runtime->Changed.Wait(); }
@@ -939,26 +1129,6 @@ NActors::async<void> TIntegrityManager::RunOperation(NActors::IActor& actor, TIn
         finish();
         co_return;
     }
-    if (!checksums) {
-        const auto& extent = self.Extents.at(key);
-        result.ReadPlan = self.MakeReadPlan(key, offset, size);
-        for (ui32 block = offset / IntegrityUnitSize; block < (offset + size) / IntegrityUnitSize; ++block) {
-            if (!extent.UsedBlocks.Get(block)) {
-                result.Checksums.push_back(GetZeroBlockChecksum());
-            } else {
-                ui64 checksum;
-                if (!self.GetBlockChecksum(key, block, &checksum)) {
-                    result.Status = EOperationStatus::Corrupted;
-                    result.ErrorReason = TStringBuilder() << "checksum is missing for used data block " << block;
-                    result.Checksums.clear();
-                    break;
-                }
-                result.Checksums.push_back(checksum);
-            }
-        }
-        finish();
-        co_return;
-    }
     // Apply the entire mutation and record all required versions without suspension.
     auto& extent = self.Extents.at(key);
     for (ui32 block = offset / IntegrityUnitSize; block < (offset + size) / IntegrityUnitSize; ++block) {
@@ -966,7 +1136,7 @@ NActors::async<void> TIntegrityManager::RunOperation(NActors::IActor& actor, TIn
         const ui32 idx = block / ChecksumsPerIntegrityBlock, slot = block % ChecksumsPerIntegrityBlock;
         auto& state = self.GetOrCreateBlockState(key, extent, idx);
         auto& pair = extent.Pairs.at(idx);
-        const ui64 checksum = (*checksums)[block - offset / IntegrityUnitSize];
+        const ui64 checksum = checksums[block - offset / IntegrityUnitSize];
         if (state.Known.Get(slot)) {
             UpdateRoot(pair.Digest, extent.Ref.VChunkGeneration, block, state.Checksums[slot], checksum);
         } else {

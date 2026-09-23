@@ -369,10 +369,10 @@ namespace {
     void TDDiskActor::FailDirectIoOp(std::unique_ptr<TDirectIoOpBase> op, TString reason) {
         switch (op->GetOperationType()) {
             case NPDisk::TUringOperationBase::EREAD:
-                Counters.DirectIO.Read.Done(op->GetTotalSize());
+                Counters.DirectIO.Read.Done(op->GetAccountingSize());
                 break;
             case NPDisk::TUringOperationBase::EWRITE:
-                Counters.DirectIO.Write.Done(op->GetTotalSize());
+                Counters.DirectIO.Write.Done(op->GetAccountingSize());
                 break;
             default:
                 Y_ABORT("Unknown OperationType");
@@ -417,6 +417,8 @@ namespace {
             WriteCallbacks.erase(it);
             FailDirectIoOp(std::move(op));
         }
+        ReadPartCallbacks.clear();
+        ReadPartsRemaining.clear();
         while (!ReadCallbacks.empty()) {
             auto it = ReadCallbacks.begin();
             auto op = std::move(it->second.Op);
@@ -496,6 +498,8 @@ namespace {
             hFunc(TEvents::TEvGone, HandleGone)
 
             hFunc(TEvReadResult, Handle)
+            hFunc(TEvPrivate::TEvReadPartsResult, Handle)
+            IgnoreFunc(TEvPrivate::TEvDDiskIoResult)
 
             hFunc(NPDisk::TEvYardInitResult, Handle)
             hFunc(NPDisk::TEvReadLogResult, Handle)
@@ -750,6 +754,7 @@ namespace {
             hFunc(TEvReadThenWritePersistentBuffers, reject)
             hFunc(TEvPrivate::TEvRetryListPersistentBuffer, rejectListRetry)
 
+            hFunc(TEvPrivate::TEvReadPartsResult, Handle)
             hFunc(TEvPrivate::TEvReadPersistentBufferPart, Handle)
             hFunc(TEvPrivate::TEvWritePersistentBufferPart, Handle)
 #if defined(__linux__)
@@ -799,6 +804,8 @@ namespace {
         FailLogWaiters(false);
         RejectQueuedQueries();
         CancelRetries();
+        ReadPartCallbacks.clear();
+        ReadPartsRemaining.clear();
         for (auto* callbacks : {&ReadCallbacks, &WriteCallbacks}) {
             while (!callbacks->empty()) {
                 auto it = callbacks->begin();

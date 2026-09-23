@@ -31,12 +31,34 @@ ownership through retirement.
 
 Read, write, and sync request coroutines join their submitted data and metadata
 work before replying. Device waits use unique completion cookies independent of
-client cookies. Integrity start methods launch work eagerly and return handles
-that retain their results. Whole-range pins protect shared cold pair loads;
-one flush coroutine per pair serializes immutable images and tracks each
-mutation's required durable version. Extent placement permits data writes;
+client cookies. Write and sync data submission helpers return native event
+awaiters; a scoped `TDataIoPin` holds the chunk through the data completion.
+Ready allocation, FIFO admission, and commit checks avoid child wait coroutines.
+For an allocated, formatted chunk, `ReadDDisk` returns one ordinary awaiter to
+the read handler. Its Ready and DataEvent modes need no aggregate allocation or
+pending-read registry; Cold joins its parent I/O and shared metadata loads.
+`PrepareRead` captures resident snapshots inline or claims missing pair loads
+without submitting them. The single DirectIo object combines data and newly
+claimed metadata parts in one initial router admission. Known zero ranges omit
+data I/O; joins never duplicate existing pair loads. PDisk fallback submits one
+raw read per part and aggregates their completions. Data buffers transfer to the
+reply directly. Metadata retries resubmit only failed metadata parts.
+
+Requested data blocks must not be written concurrently. Neighboring writes or
+syncs may share a metadata pair: a read's checksum/mask snapshot is immutable and
+does not wait for an unrelated flush. Whole-range pins protect pending reads,
+and shared load records survive reader cancellation. Ordinary actor-thread
+completion validates pair images and releases their dependencies. Writers use
+the same ordinary pair submission interface; one flush coroutine per pair
+serializes immutable images and tracks each mutation's required durable version.
+Background integrity reclamation creates a log-wait coroutine only when it
+submits a reclamation log. Extent placement permits data writes;
 readiness also requires extent formatting and all three chunk headers before
 the mapping log can be submitted.
+
+Sync directly awaits one input request or one surviving destination segment;
+multiple requests or segments use task groups. Both paths share payload and
+checksum slicing, including a singleton range trimmed by supersession.
 
 Broken and Stopping resolve logical waits without canceling accepted router
 I/O waits. Failed branches still drain submitted siblings, retaining their

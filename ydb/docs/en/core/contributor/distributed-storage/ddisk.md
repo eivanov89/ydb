@@ -32,7 +32,13 @@ The `interface/UnalignedWritePayloads` counter counts incoming writes with fragm
 
 The first write to a virtual chunk can suspend its coroutine while data and integrity resources are allocated. Concurrent requests for that virtual chunk share one allocation. With checksums enabled, a write acknowledgment waits for the data write, integrity update, and durable allocation mapping. Serialized writes and sync segments use FIFO coroutine admission for each integrity extent; independent extents can proceed concurrently.
 
-Each read or write coroutine owns the state of its logical operation and joins submitted data and metadata work before replying. Before waiting for data I/O, a read copies the routing and selector fields it needs, transfers the trace span to the I/O operation, and releases the incoming event. The read coroutine retains its metadata operation and chunk pins and owns the received I/O completion. Metadata work starts before data submission, so cold metadata loads can overlap data I/O. Reads capture checksums and the used-block mask together, then apply that snapshot when checking the data. A speculative data read still consumes its completion if metadata later identifies the whole range as zeroes.
+Ready allocation, extent admission, and commit checks run synchronously; pending states use the corresponding wait coroutines. Write and sync data submission helpers return native event awaiters. A scoped chunk pin covers the data wait and ends before metadata or commit waits.
+
+For an allocated, formatted chunk, the read handler uses one top-level coroutine and one ordinary awaiter: `auto result = co_await ReadDDisk(...); FinishDDiskIoResult(*result);`. Preparation, metadata loading, completion aggregation, and result processing create no child coroutines. `TDDiskReadAwaiter` has three modes: **Ready** for immediate errors or validated zeroes, **DataEvent** for checksums disabled or immediately available metadata, and **Cold** for pending metadata dependencies. Only Cold allocates aggregate state and enters the pending-read registry; DataEvent reuses the pooled operation and cookie-based event waiter.
+
+Before waiting, a read copies the routing and selector fields it needs, transfers its trace span, and releases the incoming event. A single DirectIo object owns the data and newly claimed metadata buffers and submits them in one initial router admission. The router reads the independent ranges, handles queue pressure and short reads, and produces one terminal callback after every part retires. PDisk fallback sends one raw-read message per part and aggregates their results. The read also joins metadata loads already owned by another operation; it can finish its own I/O while still waiting for a shared load. Successful data buffers transfer directly into the response without a payload copy.
+
+The read contract requires that the requested data blocks are not written concurrently. Writing or syncing neighboring blocks in the same metadata pair is allowed. Reads capture checksums and the used-block mask together as an immutable snapshot, which remains valid across neighboring mutations and cache eviction. Available snapshots do not wait for a neighboring metadata flush. If already submitted data turns out to cover only never-written blocks, the read still consumes its data completion before returning zeroes.
 
 An unallocated virtual chunk reads as zeroes. Chunk allocation and restored integrity state affect how the implementation recognizes never-written blocks within an allocated chunk; do not treat a successful read as evidence that the range has previously been written.
 
@@ -42,7 +48,20 @@ Wire checksums are unsalted XXH3-64 values, one per 4 KiB payload block. When `T
 
 DDisk stores integrity metadata separately from data. Stored checksums are sealed with logical and physical identity information, while the wire protocol and checksum cache use the pure payload checksum. Each integrity metadata block uses a pair of slots, self-checksums, identity/generation checks, and a sequence number to select a valid durable version after recovery. The implementation supports layouts for different device atomic-write properties; their exact format belongs to [ddisk_checksums.h](https://github.com/ydb-platform/ydb/blob/main/ydb/core/blobstorage/ddisk/ddisk_checksums.h).
 
-Integrity operations start eagerly and return owning handles that retain their results, including when completion precedes the wait. An operation pins its entire pair range before loading; concurrent callers share one loader per pair. Writes apply the complete mutation without suspension. One flush coroutine per pair writes immutable snapshots in sequence, coalesces newer mutations, and completes each waiter only when its required version is durable.
+`TIntegrityManager::PrepareRead` is an ordinary actor-local operation. It returns an inline snapshot when metadata is resident, or a pending handle plus descriptors for newly claimed pair loads. It pins the complete metadata range before claiming loads and joins existing loads without duplication. Preparation submits no I/O; the read combines its data range and the claimed pairs in its single operation:
+
+| Metadata state | Parts submitted by this read |
+| --- | --- |
+| Cached, used or mixed range | Data |
+| Cached, all-zero range | None |
+| Cold, known all-zero range | Newly claimed metadata pairs |
+| Cold, unknown, used or mixed range | Data and newly claimed metadata pairs |
+
+`CompletePairReads` validates completed pair images and resolves dependencies on the actor thread. Pair slot selection, identity and digest checks, and lost-write detection also apply after cache eviction. Shared load records have their own lifetime: detaching a canceled reader does not cancel the loads. Stopping resolves logical read handles with failure while retaining their pins until shared loads retire; the Cold awaiter still waits for that retirement before finishing. Final metadata results and snapshots are owned by their handles.
+
+Write operations still launch eagerly and return owning result handles. Writers use the same ordinary pair submission/completion interface when metadata is cold, then apply the complete mutation without suspension. One flush coroutine per pair writes immutable snapshots in sequence, coalesces newer mutations, and completes each waiter only when its required version is durable. Background integrity reclamation creates a log-wait coroutine only when it submits a reclamation log.
+
+Data errors and critical metadata errors retain separate results. Retriable metadata errors retain the existing retry limits and delays; only failed metadata parts are resubmitted, preserving successful data and metadata buffers. These error retries require additional router admissions. Completion processing continues during Stopping, and accepted work retains buffer and chunk ownership through retirement.
 
 New extent placement and readiness are separate milestones. Placement permits data writes while formatting continues. Readiness requires both extent formatting and all three integrity-chunk headers, and gates submission of the mapping log. Deleted extents retain their slots until deletion is durable and outstanding formatting has retired.
 
@@ -55,6 +74,8 @@ Changing checksum modes is a format and recovery concern, not only a performance
 All destination segments in one request must belong to one virtual chunk. The sync handler checks nonempty aligned ranges and chunk bounds. `TSegmentManager` tracks overlapping synchronization ranges so that a delayed source read cannot blindly overwrite a newer synchronization request. Changes to this path need coverage for both request ordering and late replies.
 
 The request coroutine validates all segments before launching concurrent source reads, joins every submitted destination segment, and waits for allocation durability before replying in the original segment order. Failed or outdated results also pass this allocation barrier. Full supersession cancels preparation waits for the source, allocation, or extent admission; submitted destination I/O still drains. One extent admission is held until all destination data and metadata work for that source range finishes.
+
+One input segment is awaited directly; multiple input segments use a task group. The same choice applies to surviving destination segments after overlap processing. Both paths share payload and checksum slicing, so a single surviving range may still be smaller than the source reply. Preparation retains its separate cancellation scope in both paths.
 
 The operation reports `TEvSyncResult` after processing its destination work. It does not erase source PB records. The client decides when enough replicas have been flushed, whether repair is required, and when [PB erase](persistent-buffer.md#erase) is safe. A PB source can be remote even when it occupies the same logical DBG index as the destination DDisk.
 
