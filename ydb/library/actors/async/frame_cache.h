@@ -16,7 +16,7 @@ namespace NActors {
     // coroutine-frame alignment is not supported.
     class TAsyncFrameCache {
     public:
-        static constexpr size_t MaxClasses = 32;
+        static constexpr size_t MaxClasses = 64;
         static constexpr size_t MaxCachedPerClass = 64;
 
         struct TStats {
