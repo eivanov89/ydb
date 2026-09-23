@@ -102,6 +102,11 @@ public:
     void InActor(std::function<void(NActors::IActor&)> callback) {
         Mailbox.RunSync([&] { callback(Actor()); });
     }
+    void ObserveExtent(TIntegrityManager::TExtent extent, bool ready, std::optional<bool>& result) {
+        Launch([this, extent, ready, &result]() -> NActors::async<void> {
+            result = ready ? co_await extent.WaitReady(Actor()) : co_await extent.WaitPlaced(Actor());
+        });
+    }
     const std::vector<TChunkIdx>& ReturnedChunks() const { return Returned; }
     void OnDataChunkAllocated(TDataChunkKey key, TChunkIdx chunk) {
         Mailbox.RunSync([&] {

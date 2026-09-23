@@ -22,6 +22,7 @@
 #include <cstring>
 #include <numeric>
 #include <random>
+#include <set>
 
 namespace NKikimr {
 namespace {
@@ -71,14 +72,62 @@ struct TEvReservationsSettled : TEventLocal<TEvReservationsSettled, EventSpaceBe
     explicit TEvReservationsSettled(bool settled) : Settled(settled) {}
 };
 
+struct TEvControlGate : TEventLocal<TEvControlGate, EventSpaceBegin(TEvents::ES_PRIVATE) + 102> {
+    ui32 Type = 0;
+    bool Release = false;
+    bool Broken = false;
+    TEvControlGate(ui32 type = 0, bool release = false, bool broken = false)
+        : Type(type), Release(release), Broken(broken) {}
+};
+struct TEvGateState : TEventLocal<TEvGateState, EventSpaceBegin(TEvents::ES_PRIVATE) + 103> {
+    size_t Held;
+    ui64 IoCompletions;
+    bool Router;
+    size_t Reserved;
+    TEvGateState(size_t held, ui64 io, bool router, size_t reserved)
+        : Held(held), IoCompletions(io), Router(router), Reserved(reserved) {}
+};
+
 // A mailbox probe avoids racing test-thread reads of the actor's reservation state.
 class TReservationProbeDecorator : public TDecorator {
+    ui32 GateType = 0;
+    ui64 IoCompletions = 0;
+    std::vector<TAutoPtr<IEventHandle>> Held;
+    std::set<IEventHandle*> Released;
 public:
     explicit TReservationProbeDecorator(IActor* actor)
         : TDecorator(THolder<IActor>(actor))
     {}
 
     bool DoBeforeReceiving(TAutoPtr<IEventHandle>& ev, const TActorContext& ctx) override {
+        const auto type = ev->GetTypeRewrite();
+        if (type == TEvControlGate::EventType) {
+            const auto& command = *ev->Get<TEvControlGate>();
+            if (command.Type) { GateType = command.Type; }
+            if (command.Broken) {
+                NDDisk::TDDiskActorTestPeer::EnterBroken(*static_cast<NDDisk::TDDiskActor*>(Actor.Get()),
+                    "native gated interruption");
+            }
+            if (command.Release) {
+                GateType = command.Type;
+                for (auto& event : Held) { Released.insert(event.Get()); ctx.Send(event.Release()); }
+                Held.clear();
+            }
+            bool router = false;
+#if defined(__linux__)
+            router = NDDisk::TDDiskActorTestPeer::UsesRouter(*static_cast<NDDisk::TDDiskActor*>(Actor.Get()));
+#endif
+            ctx.Send(ev->Sender, new TEvGateState(Held.size(), IoCompletions, router,
+                NDDisk::TDDiskActorTestPeer::ReservedChunks(*static_cast<NDDisk::TDDiskActor*>(Actor.Get()))));
+            return false;
+        }
+        if (Released.erase(ev.Get())) { return true; }
+        if (type == NDDisk::TDDiskActor::TEvPrivate::TEvDDiskIoResult::EventType) { ++IoCompletions; }
+        if (type == GateType && (type != NPDisk::TEvLogResult::EventType
+                || ev->Get<NPDisk::TEvLogResult>()->Status == NKikimrProto::OK)) {
+            Held.emplace_back(ev.Release());
+            return false;
+        }
         if (ev->GetTypeRewrite() != TEvProbeReservations::EventType) {
             return true;
         }
@@ -172,8 +221,7 @@ public:
         pdiskConfig->GetDriveDataSwitch = NKikimrBlobStorage::TPDiskConfig::DoNotTouch;
         pdiskConfig->WriteCacheSwitch = NKikimrBlobStorage::TPDiskConfig::DoNotTouch;
         pdiskConfig->FeatureFlags.SetEnableSmallDiskOptimization(true);
-        if (ProbeReservations) {
-            UNIT_ASSERT_VALUES_EQUAL(p, 0);
+        if (ProbeReservations && p == 0) {
             UncommittedChunkCount = GetServiceCounters(Counters, "pdisks")
                 ->GetSubgroup("pdisk", Sprintf("%09u", pdiskId))
                 ->GetSubgroup("media", to_lower(pdiskConfig->PDiskCategory.TypeStrShort()))

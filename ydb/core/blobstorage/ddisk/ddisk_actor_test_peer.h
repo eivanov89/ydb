@@ -1,9 +1,32 @@
 #pragma once
 #include "ddisk_actor.h"
+#include "direct_io_op.h"
 
 namespace NKikimr::NDDisk {
 class TDDiskActorTestPeer {
 public:
+    static ui64 ChecksumMismatches(const TDDiskActor& actor) {
+        return actor.Counters.Checksums.ChecksumMismatch->Val();
+    }
+    static size_t ReservedChunks(const TDDiskActor& actor) {
+        return actor.ChunkManager.GetReservedChunkCount();
+    }
+    static bool IoCountersBalanced(const TDDiskActor& actor) {
+        const auto& io = actor.Counters.DirectIO;
+        return !actor.GetDirectIoInflight() && !io.RunningCount->Val()
+            && !io.Read.RequestsInFlight->Val() && !io.Read.BytesInFlight->Val()
+            && !io.Write.RequestsInFlight->Val() && !io.Write.BytesInFlight->Val();
+    }
+    static NActors::TAsyncFrameCache::TStats FrameCacheStats(const TDDiskActor& actor) {
+        return actor.AsyncFrameCache.GetStats();
+    }
+#if defined(__linux__)
+    static std::pair<ui32, ui32> IoAddress(const NPDisk::TUringOperationBase& op) {
+        const auto& direct = static_cast<const TDDiskActor::TDirectIoOpBase&>(op);
+        return {direct.GetChunkIdx(), direct.GetChunkOffset()};
+    }
+    static bool UsesRouter(const TDDiskActor& actor) { return bool(actor.UringRouter); }
+#endif
     static void EnterBroken(TDDiskActor& actor, TString reason) {
         NActors::TActorRunnableQueue queue(&actor);
         actor.EnterBroken(std::move(reason));

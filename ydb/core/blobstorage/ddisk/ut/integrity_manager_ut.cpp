@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
+#include <set>
 
 namespace NKikimr::NDDisk {
 
@@ -1582,6 +1583,143 @@ Y_UNIT_TEST_SUITE(TIntegrityManagerTest) {
         UNIT_ASSERT_VALUES_EQUAL(completed[0].OperationId, secondOperation);
         UNIT_ASSERT_VALUES_EQUAL(completed[1].OperationId, thirdOperation);
         UNIT_ASSERT(Drain(manager).Writes.empty());
+    }
+
+    Y_UNIT_TEST(CoalescedFlushFailureCompletesEveryWaiterOnce) {
+        for (const bool failFirst : {false, true}) {
+            NIntegrityTest::TFixture manager(SmallChunkSize, TestDDiskId, TestPDiskGuid);
+            const TKey key{41, 0};
+            TChunkIdx next = 910;
+            MakeReady(manager, key, 1700, &next);
+            const auto first = manager.BeginBlocksWrite(key, 0, IntegrityUnitSize, {0xA});
+            auto writes = Drain(manager).Writes;
+            UNIT_ASSERT_VALUES_EQUAL(writes.size(), 1);
+            const auto second = manager.BeginBlocksWrite(key, IntegrityUnitSize, IntegrityUnitSize, {0xB});
+            const auto third = manager.BeginBlocksWrite(key, 2 * IntegrityUnitSize, IntegrityUnitSize, {0xC});
+            UNIT_ASSERT(!manager.HasActions());
+            UNIT_ASSERT(manager.TakeCompletedOperations().empty());
+            manager.OnIoCompleted(writes.front().IoId, !failFirst);
+            auto completed = manager.TakeCompletedOperations();
+            if (!failFirst) {
+                UNIT_ASSERT_VALUES_EQUAL(completed.size(), 1);
+                UNIT_ASSERT_VALUES_EQUAL(completed.front().OperationId, first);
+                UNIT_ASSERT_EQUAL(completed.front().Status, TIntegrityManager::EOperationStatus::Ok);
+                writes = Drain(manager).Writes;
+                UNIT_ASSERT_VALUES_EQUAL(writes.size(), 1);
+                manager.OnIoCompleted(writes.front().IoId, false);
+                completed = manager.TakeCompletedOperations();
+            }
+            UNIT_ASSERT_VALUES_EQUAL(completed.size(), failFirst ? 3 : 2);
+            std::set<ui64> ids;
+            for (const auto& result : completed) {
+                UNIT_ASSERT(ids.insert(result.OperationId).second);
+                UNIT_ASSERT_EQUAL(result.Status, TIntegrityManager::EOperationStatus::Failed);
+            }
+            UNIT_ASSERT(ids.contains(second) && ids.contains(third));
+            UNIT_ASSERT_VALUES_EQUAL(ids.contains(first), failFirst);
+            UNIT_ASSERT(!manager.HasInFlightOperationsForTablet(key.TabletId));
+            UNIT_ASSERT(!manager.HasActions());
+            manager.InActor([](NActors::IActor&) {});
+            UNIT_ASSERT(manager.TakeCompletedOperations().empty());
+        }
+    }
+
+    Y_UNIT_TEST(SharedColdReadAndDisjointWriteLoadOnce) {
+        for (const bool readFirst : {false, true}) {
+            for (const int failure : {0, 1, 2}) {
+                NIntegrityTest::TFixture original(SmallChunkSize, TestDDiskId, TestPDiskGuid);
+                const TKey key{42, 3};
+                TChunkIdx next = 920;
+                MakeReady(original, key, 1800, &next);
+                const auto ref = *original.FindExtentRef(key);
+                const auto generation = original.GetIntegrityChunkGeneration(ref.IntegrityChunkIdx);
+                NIntegrityTest::TFixture manager(SmallChunkSize, TestDDiskId, TestPDiskGuid);
+                manager.ApplyMappingSnapshot(original.SnapshotMapping());
+                ui64 read = 0, write = 0;
+                auto startRead = [&] { read = manager.BeginChecksumRead(key, 0, 2 * IntegrityUnitSize); };
+                auto startWrite = [&] { write = manager.BeginBlocksWrite(key, 2 * IntegrityUnitSize,
+                    IntegrityUnitSize, {0x30}); };
+                if (readFirst) { startRead(); startWrite(); } else { startWrite(); startRead(); }
+                auto actions = Drain(manager);
+                UNIT_ASSERT_VALUES_EQUAL(actions.Reads.size(), 1);
+                UNIT_ASSERT(actions.Writes.empty());
+                UNIT_ASSERT(manager.TakeCompletedOperations().empty());
+                auto a = MakeIntegrityBlock(key, ref, generation, 0, 2, {{0, 0x10}});
+                auto b = MakeIntegrityBlock(key, ref, generation, 0, 3, {{0, 0x10}});
+                if (failure == 2) { ++a.Checksums[0]; ++b.Checksums[0]; }
+                manager.OnReadIoCompleted(actions.Reads.front().IoId, MakeIntegrityPair(a, b), failure != 1);
+                auto completed = manager.TakeCompletedOperations();
+                actions = Drain(manager);
+                UNIT_ASSERT(actions.Reads.empty());
+                if (!failure) {
+                    UNIT_ASSERT_VALUES_EQUAL(completed.size(), 1);
+                    UNIT_ASSERT_VALUES_EQUAL(completed.front().OperationId, read);
+                    UNIT_ASSERT_EQUAL(completed.front().Status, TIntegrityManager::EOperationStatus::Ok);
+                    UNIT_ASSERT_VALUES_EQUAL(completed.front().Checksums,
+                        (std::vector<ui64>{0x10, GetZeroBlockChecksum()}));
+                    UNIT_ASSERT_EQUAL(completed.front().ReadPlan.Kind, TReadPlan::Mixed);
+                    UNIT_ASSERT(completed.front().ReadPlan.UsedBlocks.Get(0));
+                    UNIT_ASSERT(!completed.front().ReadPlan.UsedBlocks.Get(1));
+                    UNIT_ASSERT_VALUES_EQUAL(actions.Writes.size(), 1);
+                    TIntegrityBlock image;
+                    memcpy(&image, actions.Writes.front().Data.data(), sizeof(image));
+                    UNIT_ASSERT_VALUES_EQUAL(image.Checksums[0], b.Checksums[0]);
+                    UNIT_ASSERT_VALUES_EQUAL(image.Checksums[1], 0);
+                    UNIT_ASSERT_VALUES_EQUAL(image.Header.UsedBlocksBitmap[0], 5);
+                    CompleteWrites(manager, actions.Writes);
+                    const auto done = TakeOnlyCompletion(manager);
+                    UNIT_ASSERT_VALUES_EQUAL(done.OperationId, write);
+                    UNIT_ASSERT_EQUAL(done.Status, TIntegrityManager::EOperationStatus::Ok);
+                } else {
+                    UNIT_ASSERT(actions.Writes.empty());
+                    UNIT_ASSERT_VALUES_EQUAL(completed.size(), 2);
+                    std::set<ui64> ids;
+                    for (const auto& result : completed) {
+                        UNIT_ASSERT(ids.insert(result.OperationId).second);
+                        UNIT_ASSERT_EQUAL(result.Status, failure == 1
+                            ? TIntegrityManager::EOperationStatus::Failed : TIntegrityManager::EOperationStatus::Corrupted);
+                    }
+                    UNIT_ASSERT(ids.contains(read) && ids.contains(write));
+                }
+                UNIT_ASSERT(!manager.HasInFlightOperationsForTablet(key.TabletId));
+                UNIT_ASSERT(!manager.HasActions());
+                UNIT_ASSERT(manager.TakeCompletedOperations().empty());
+            }
+        }
+    }
+
+    Y_UNIT_TEST(StopPendingExtentCompletesBothMilestonesAndReturnsLateAllocation) {
+        // DDisk starts extents before stopping; allocation can complete afterward.
+        std::optional<bool> placed, ready;
+        NIntegrityTest::TFixture manager(SmallChunkSize, TestDDiskId, TestPDiskGuid);
+        manager.InActor([&](NActors::IActor&) {
+            auto extent = manager.StartExtent({99, 0}, 2000);
+            manager.ObserveExtent(extent, false, placed);
+            manager.ObserveExtent(extent, true, ready);
+        });
+        const auto actions = Drain(manager);
+        UNIT_ASSERT_VALUES_EQUAL(actions.AllocateRequests, 1);
+        UNIT_ASSERT(actions.Writes.empty());
+        UNIT_ASSERT(actions.Reads.empty());
+        UNIT_ASSERT(!placed.has_value() && !ready.has_value());
+        const auto before = manager.SnapshotMapping();
+        manager.InActor([&](NActors::IActor&) { manager.Stop(); });
+        manager.InActor([](NActors::IActor&) {}); // drain runnable work without awaiting a stuck milestone
+        UNIT_ASSERT_C(placed.has_value() && ready.has_value(),
+            "Stop left existing extent milestone waiters pending: placed=" << placed.has_value()
+            << " ready=" << ready.has_value());
+        UNIT_ASSERT(!*placed && !*ready);
+        UNIT_ASSERT(!manager.HasActions());
+
+        manager.OnIntegrityChunkAllocated(2001);
+        UNIT_ASSERT_VALUES_EQUAL(manager.ReturnedChunks().size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(manager.ReturnedChunks().front(), 2001);
+        UNIT_ASSERT(!manager.HasActions());
+        UNIT_ASSERT(!*placed && !*ready);
+        const auto after = manager.SnapshotMapping();
+        UNIT_ASSERT_VALUES_EQUAL(after.Extents.size(), before.Extents.size());
+        UNIT_ASSERT_VALUES_EQUAL(after.IntegrityChunks.size(), before.IntegrityChunks.size());
+        UNIT_ASSERT_VALUES_EQUAL(after.GenerationCounter, before.GenerationCounter);
     }
 
     Y_UNIT_TEST(RestoredPairSelectsWinnerAndRestoresBitmap) {

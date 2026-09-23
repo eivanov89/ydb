@@ -4,6 +4,14 @@
 
 #include <thread>
 
+#if defined(__linux__)
+#include <util/system/tempfile.h>
+#include <util/stream/file.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 namespace NAsyncTest {
 namespace {
 
@@ -189,6 +197,73 @@ Y_UNIT_TEST_SUITE(AsyncFrameCache) {
             TAsyncFrameCache::Free(frames[i], i + 1);
         }
         UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().HeapAllocations, frames.size() + 2);
+    }
+
+    Y_UNIT_TEST(ClassOverflowPreservesLiveCachedFrameAccounting) {
+        TAsyncFrameCache cache;
+        for (size_t size = 1; size <= TAsyncFrameCache::MaxClasses; ++size) {
+            auto* frame = cache.Allocate(size);
+            TAsyncFrameCache::Free(frame, size);
+        }
+        auto* retained = cache.Allocate(1);
+        const auto before = cache.GetStats();
+        UNIT_ASSERT_VALUES_EQUAL(before.LiveFrames, 1);
+        auto* overflow = cache.Allocate(TAsyncFrameCache::MaxClasses + 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().LiveFrames, 1);
+        TAsyncFrameCache::Free(overflow, TAsyncFrameCache::MaxClasses + 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().LiveFrames, 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().CachedFrames, before.CachedFrames);
+        TAsyncFrameCache::Free(retained, 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache.Allocate(1), retained);
+        UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().HeapAllocations, before.HeapAllocations + 1);
+        TAsyncFrameCache::Free(retained, 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().LiveFrames, 0);
+    }
+
+#if defined(__linux__)
+    Y_UNIT_TEST(LazyFrameOutlivingOwnerAbortsWithDiagnostic) {
+        TTempFile diagnostic(MakeTempName(nullptr, "lazy_frame_owner"));
+        const pid_t pid = fork();
+        UNIT_ASSERT(pid >= 0);
+        if (!pid) {
+            const rlimit noCore{0, 0};
+            setrlimit(RLIMIT_CORE, &noCore);
+            TFile output(diagnostic.Name(), CreateAlways | WrOnly);
+            Y_ABORT_UNLESS(dup2(output.GetHandle(), STDERR_FILENO) >= 0);
+            TFixture f;
+            // Direct initialization is required: async<T> is not movable.
+            auto lazy = f.Self->LazyValue();
+            Y_ABORT_UNLESS(lazy.GetHandle());
+            Y_ABORT_UNLESS(f.Self->Cache.GetStats().LiveFrames == 1);
+            f.Runtime.CleanupNode();
+            _exit(1);
+        }
+        int status = 0;
+        UNIT_ASSERT_VALUES_EQUAL(waitpid(pid, &status, 0), pid);
+        UNIT_ASSERT(WIFSIGNALED(status));
+        UNIT_ASSERT_VALUES_EQUAL(WTERMSIG(status), SIGABRT);
+        UNIT_ASSERT_STRING_CONTAINS(TFileInput(diagnostic.Name()).ReadAll(),
+            "Coroutine frame cache destroyed with live frames");
+    }
+#endif
+
+    Y_UNIT_TEST(ExplicitOwnerWinsOverCurrentActorActivation) {
+        TFixture a;
+        TFixture b;
+        b.Actor.RunSync([&] {
+            const auto beforeA = a.Self->Cache.GetStats();
+            const auto beforeB = b.Self->Cache.GetStats();
+            {
+                auto lazy = FreeWithActor(*a.Self);
+                UNIT_ASSERT(lazy.GetHandle());
+                UNIT_ASSERT_VALUES_EQUAL(a.Self->Cache.GetStats().LiveFrames, beforeA.LiveFrames + 1);
+                UNIT_ASSERT_VALUES_EQUAL(b.Self->Cache.GetStats().LiveFrames, beforeB.LiveFrames);
+                UNIT_ASSERT_VALUES_EQUAL(b.Self->Cache.GetStats().HeapAllocations, beforeB.HeapAllocations);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(a.Self->Cache.GetStats().LiveFrames, beforeA.LiveFrames);
+            UNIT_ASSERT_VALUES_EQUAL(a.Self->Cache.GetStats().CachedFrames, beforeA.CachedFrames + 1);
+            UNIT_ASSERT_VALUES_EQUAL(b.Self->Cache.GetStats().CachedFrames, beforeB.CachedFrames);
+        });
     }
 
     Y_UNIT_TEST(UncachedClassOverflowBlockOutlivesCache) {
