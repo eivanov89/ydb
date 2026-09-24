@@ -387,8 +387,8 @@ namespace NKikimr::NDDisk {
             tabletId, selector.VChunkIndex, true);
     }
 
-    ui64 TDDiskActor::SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
-            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span,
+    bool TDDiskActor::SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
+            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span, ui64 indexedReadToken,
             std::unique_ptr<TEvPrivate::TEvDDiskIoResult>& result) {
         if (Stopping || IsBroken()) {
             result = MakeDDiskReadResult(*request, tabletId, selector, std::move(span));
@@ -396,20 +396,84 @@ namespace NKikimr::NDDisk {
                 : NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH;
             result->ErrorMessage = IsBroken() ? GetBrokenReason() : TString(StoppingReason);
             request.Reset();
-            return 0;
+            return false;
         }
         std::unique_ptr<TDirectIoOpBase> op = AllocateOp<TDDiskIoOp>(request.Get());
         static_cast<TDDiskIoOp*>(op.get())->SetChunkKey(tabletId, selector.VChunkIndex);
         op->SetSpan(std::move(span));
         op->PrepareRead(selector.Size, DiskFormat->Offset(chunkIdx, 0, selector.OffsetInBytes),
             chunkIdx, selector.OffsetInBytes);
-        const ui64 cookie = NActors::AllocateWaitCookie();
-        op->SetCompletionCookie(cookie);
+        static_cast<TDDiskIoOp*>(op.get())->SetIndexedReadToken(indexedReadToken);
         // The operation now owns everything needed to route and trace its result.
         // Drop the request while it is hot instead of retaining its protobuf across I/O.
         request.Reset();
+        FindIndexedRead(indexedReadToken)->Submitted = true;
         DirectUringOp(op);
-        return cookie;
+        return true;
+    }
+
+    ui64 TDDiskActor::ReserveIndexedRead(TDDiskReadAwaiter& waiter, TChunkRef& chunk) {
+        ui32 index = FirstFreeIndexedRead;
+        if (index == Max<ui32>()) {
+            Y_ABORT_UNLESS(IndexedReads.size() < Max<ui32>());
+            index = IndexedReads.size();
+            IndexedReads.emplace_back();
+        } else {
+            FirstFreeIndexedRead = IndexedReads[index].NextFree;
+        }
+        auto& slot = IndexedReads[index];
+        Y_ABORT_UNLESS(!slot.Pin && !slot.Waiter);
+        slot.Pin.emplace(chunk);
+        slot.Waiter = &waiter;
+        slot.Submitted = false;
+        ++ActiveIndexedReads;
+        return (ui64(slot.Generation) << 32) | (ui64(index) + 1);
+    }
+
+    TDDiskActor::TIndexedReadSlot* TDDiskActor::FindIndexedRead(ui64 token) {
+        const ui32 encodedIndex = token;
+        if (!encodedIndex || encodedIndex > IndexedReads.size()) { return nullptr; }
+        auto& slot = IndexedReads[encodedIndex - 1];
+        return slot.Pin && slot.Generation == (token >> 32) ? &slot : nullptr;
+    }
+
+    void TDDiskActor::ReleaseIndexedRead(ui64 token) {
+        auto* slot = FindIndexedRead(token);
+        Y_ABORT_UNLESS(slot && ActiveIndexedReads);
+        slot->Waiter = nullptr;
+        slot->Pin.reset();
+        slot->Submitted = false;
+        --ActiveIndexedReads;
+        // Never wrap a generation: an ancient queued token must not match a new read.
+        if (slot->Generation != Max<ui32>()) {
+            ++slot->Generation;
+            slot->NextFree = FirstFreeIndexedRead;
+            FirstFreeIndexedRead = ui32(token) - 1;
+        }
+    }
+
+    void TDDiskActor::DetachIndexedRead(ui64 token) {
+        if (auto* slot = FindIndexedRead(token)) {
+            slot->Waiter = nullptr;
+            if (!slot->Submitted) { ReleaseIndexedRead(token); }
+        }
+    }
+
+    void TDDiskActor::Handle(TEvPrivate::TEvDDiskIoResult::TPtr ev) {
+        const ui64 token = ev->Get()->IndexedReadToken;
+        auto* slot = FindIndexedRead(token);
+        if (!slot || !slot->Submitted) { return; }
+        auto* waiter = slot->Waiter;
+        std::coroutine_handle<> continuation;
+        if (waiter) {
+            waiter->Result.reset(ev->Release().Release());
+            waiter->Token = 0;
+            continuation = std::exchange(waiter->Continuation, {});
+        }
+        ReleaseIndexedRead(token);
+        // Inline resumption may destroy the awaiter or grow/reuse the registry.
+        if (continuation) { continuation.resume(); }
+        if (Stopping && !GetDirectIoInflight() && !ActiveIndexedReads) { FinishStopping(); }
     }
 
     TDDiskActor::TDDiskReadAwaiter TDDiskActor::ReadDDisk(TEvRead::TPtr& request,
@@ -424,8 +488,7 @@ namespace NKikimr::NDDisk {
         TIntegrityManager::TReadPreparation preparation;
         if (Self.Config.EnableChecksums) {
             preparation = Self.IntegrityManager->PrepareRead({tabletId, selector.VChunkIndex},
-                selector.OffsetInBytes, selector.Size);
-            Metadata = std::move(preparation.Result);
+                selector.OffsetInBytes, selector.Size, Metadata);
         }
 
         if (Metadata && (Metadata->Status != TIntegrityManager::EOperationStatus::Ok
@@ -437,12 +500,14 @@ namespace NKikimr::NDDisk {
             return;
         }
         if (!Self.Config.EnableChecksums || Metadata) {
-            Pin.emplace(chunk);
-            if (const ui64 cookie = Self.SubmitDDiskDataRead(request, chunk.ChunkIdx,
-                    tabletId, selector, span, Result)) {
-                Mode = EMode::DataEvent;
-                Event.emplace(cookie);
-            }
+            Token = Self.ReserveIndexedRead(*this, chunk);
+            bool submitted = false;
+            Y_DEFER {
+                if (!submitted) { Self.DetachIndexedRead(std::exchange(Token, 0)); }
+            };
+            submitted = Self.SubmitDDiskDataRead(request, chunk.ChunkIdx,
+                tabletId, selector, span, Token, Result);
+            if (submitted) { Mode = EMode::DataEvent; }
             return;
         }
 
@@ -481,6 +546,7 @@ namespace NKikimr::NDDisk {
     }
 
     TDDiskActor::TDDiskReadAwaiter::~TDDiskReadAwaiter() {
+        if (Token) { Self.DetachIndexedRead(Token); }
         if (Cold) { Cold->Context->Detached = true; }
     }
 
@@ -491,8 +557,7 @@ namespace NKikimr::NDDisk {
     std::unique_ptr<TDDiskActor::TEvPrivate::TEvDDiskIoResult>
     TDDiskActor::TDDiskReadAwaiter::await_resume() {
         if (Mode == EMode::DataEvent) {
-            auto event = Event->await_resume();
-            Result.reset(event->Release().Release());
+            Y_ABORT_UNLESS(Result && !Token);
             if (Metadata) { Self.ApplyDDiskReadMetadata(*Result, std::move(*Metadata)); }
         } else if (Mode == EMode::Cold) {
             Y_ABORT_UNLESS(Cold->Context->Done);
@@ -502,16 +567,27 @@ namespace NKikimr::NDDisk {
     }
 
     void TDDiskActor::ApplyDDiskReadMetadata(TEvPrivate::TEvDDiskIoResult& result,
-            TIntegrityManager::TOperationResult metadata) {
+            TIntegrityManager::TOperationResult&& metadata) {
+        ApplyDDiskReadMetadataImpl(result, std::move(metadata));
+    }
+
+    void TDDiskActor::ApplyDDiskReadMetadata(TEvPrivate::TEvDDiskIoResult& result,
+            const TIntegrityManager::TOperationResult& metadata) {
+        ApplyDDiskReadMetadataImpl(result, metadata);
+    }
+
+    template<class TMetadata>
+    void TDDiskActor::ApplyDDiskReadMetadataImpl(TEvPrivate::TEvDDiskIoResult& result,
+            TMetadata&& metadata) {
         CountIntegrityResult(metadata);
         if (metadata.Status != TIntegrityManager::EOperationStatus::Ok) {
             result.Status = metadata.Status == TIntegrityManager::EOperationStatus::Corrupted
                 ? NKikimrBlobStorage::NDDisk::TReplyStatus::CORRUPTED
                 : NKikimrBlobStorage::NDDisk::TReplyStatus::SESSION_MISMATCH;
-            result.ErrorMessage = std::move(metadata.ErrorReason);
+            result.ErrorMessage = std::forward<TMetadata>(metadata).ErrorReason;
             return;
         }
-        result.Checksums = std::move(metadata.Checksums);
+        result.Checksums = std::forward<TMetadata>(metadata).Checksums;
         if (metadata.ReadPlan.Kind == TIntegrityManager::TReadPlan::AllZero) {
             auto zero = TRcBuf::Uninitialized(result.TotalSize);
             memset(zero.GetDataMut(), 0, zero.size());
@@ -574,6 +650,7 @@ namespace NKikimr::NDDisk {
     }
 
     void TDDiskActor::FinishDDiskIoResult(TEvPrivate::TEvDDiskIoResult& msg) {
+        static const std::vector<ui64> emptyChecksums;
         auto status = msg.Status;
         TString errorMessage = std::move(msg.ErrorMessage);
         if (Y_UNLIKELY(IsBroken())) {
@@ -619,7 +696,7 @@ namespace NKikimr::NDDisk {
             case NPDisk::TUringOperationBase::EREAD:
                 reply = std::make_unique<TEvReadResult>(
                     status, errorReason, isOk ? std::move(msg.Data) : TRope{},
-                    isOk ? msg.Checksums : std::vector<ui64>{});
+                    isOk ? msg.Checksums : emptyChecksums);
                 Counters.Interface.Read.Reply(isOk, msg.TotalSize, msg.RequestTimeMs);
                 break;
             case NPDisk::TUringOperationBase::EWRITE:

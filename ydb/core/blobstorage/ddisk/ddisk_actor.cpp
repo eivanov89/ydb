@@ -499,7 +499,7 @@ namespace {
 
             hFunc(TEvReadResult, Handle)
             hFunc(TEvPrivate::TEvReadPartsResult, Handle)
-            IgnoreFunc(TEvPrivate::TEvDDiskIoResult)
+            hFunc(TEvPrivate::TEvDDiskIoResult, Handle)
 
             hFunc(NPDisk::TEvYardInitResult, Handle)
             hFunc(NPDisk::TEvReadLogResult, Handle)
@@ -755,6 +755,7 @@ namespace {
             hFunc(TEvPrivate::TEvRetryListPersistentBuffer, rejectListRetry)
 
             hFunc(TEvPrivate::TEvReadPartsResult, Handle)
+            hFunc(TEvPrivate::TEvDDiskIoResult, Handle)
             hFunc(TEvPrivate::TEvReadPersistentBufferPart, Handle)
             hFunc(TEvPrivate::TEvWritePersistentBufferPart, Handle)
 #if defined(__linux__)
@@ -833,7 +834,8 @@ namespace {
     }
 
     void TDDiskActor::TryCompleteStop() {
-        if (!PoisonReceived || !OwnDrainComplete || !PersistentBufferGone || ChunkManager.IsReservationInFlight()) {
+        if (!PoisonReceived || !OwnDrainComplete || ActiveIndexedReads
+                || !PersistentBufferGone || ChunkManager.IsReservationInFlight()) {
             return;
         }
 #if defined(__linux__)
@@ -894,6 +896,7 @@ namespace {
 
     void TDDiskActor::FinishStopping() {
         Y_ABORT_UNLESS(Stopping && !GetDirectIoInflight());
+        if (ActiveIndexedReads) { return; }
         if (std::exchange(OwnDrainFinishing, true)) {
             return;
         }

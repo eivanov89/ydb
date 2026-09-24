@@ -126,6 +126,13 @@ public:
     void ClearForRecycle() noexcept override;
     void SelfRecycle() noexcept override;
 
+    void Reinit(const IEventHandle* ev = nullptr) {
+        TDirectIoOpBase::Reinit(ev);
+        IndexedReadToken = 0;
+    }
+    void SetIndexedReadToken(ui64 token) { IndexedReadToken = token; }
+    ui64 GetIndexedReadToken() const { return IndexedReadToken; }
+
     void SetChunkKey(ui64 tabletId, ui64 vChunkIndex) {
         TabletId = tabletId;
         VChunkIndex = vChunkIndex;
@@ -133,6 +140,7 @@ public:
     }
 
 private:
+    ui64 IndexedReadToken = 0;
     ui64 TabletId = 0;
     ui64 VChunkIndex = 0;
     bool HasChunkKey = false;

@@ -1260,6 +1260,8 @@ public:
     std::set<ui32> Forgotten;
     std::set<ui64> AcknowledgedLogLsns;
     std::unique_ptr<IEventHandle> ChildGone;
+    std::vector<std::unique_ptr<IEventHandle>> IndexedCompletions;
+    bool HoldIndexedCompletions = false;
     bool HoldLogs = false, HoldChildGone = false;
     ui32 Submissions = 0, LogSubmissions = 0, Gone = 0;
 
@@ -1286,6 +1288,11 @@ public:
         Ctx.Runtime.RegisterService(MakeBlobStoragePersistentBufferId(NodeId, 181, 1), Source);
         Ctx.Runtime.FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
             const auto type = ev->GetTypeRewrite();
+            if (HoldIndexedCompletions && NDDisk::TDDiskActorTestPeer::IsIndexedReadCompletion(*ev)) {
+                UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, 0);
+                IndexedCompletions.push_back(std::move(ev));
+                return false;
+            }
             if (ev->Recipient == Ctx.Edge) {
                 Replies.push_back(std::move(ev));
                 return false;
@@ -1476,6 +1483,20 @@ public:
                 *static_cast<NDDisk::TDDiskActor*>(actor)).LiveFrames;
         }));
         return result;
+    }
+    template<class F> auto Inspect(F callback) {
+        using TResult = decltype(callback(std::declval<NDDisk::TDDiskActor&>()));
+        std::optional<TResult> result;
+        UNIT_ASSERT(Ctx.Runtime.WrapInActorContext(Parent, [&](IActor* actor) {
+            result.emplace(callback(*static_cast<NDDisk::TDDiskActor*>(actor)));
+        }));
+        return std::move(*result);
+    }
+    size_t IndexedReads() {
+        return Inspect([](auto& actor) { return NDDisk::TDDiskActorTestPeer::ActiveIndexedReads(actor); });
+    }
+    auto ReadTokens() {
+        return Inspect([](auto& actor) { return NDDisk::TDDiskActorTestPeer::IndexedReadTokens(actor); });
     }
     size_t PendingReads() {
         size_t result = 0;
@@ -6330,6 +6351,13 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
             SendToDDisk(f.Ctx, f.Disk.ServiceId, new TTrackedRead(f.Creds, destructions), 501);
             f.Until([&] { return f.Io.size() == 1; });
             UNIT_ASSERT_VALUES_EQUAL(*destructions, 1);
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 1);
+            const void* buffer = nullptr;
+            if (router) {
+                UNIT_ASSERT(NDDisk::TDDiskActorTestPeer::IsIndexedRead(*f.Io.front().Op));
+                buffer = f.Io.front().Op->GetIovBase();
+                UNIT_ASSERT_VALUES_EQUAL(f.Router->Outstanding, 1);
+            }
             UNIT_ASSERT(!f.Io.front().Write);
             UNIT_ASSERT_VALUES_EQUAL(f.Io.front().Size, BlockSize);
             UNIT_ASSERT(f.Replies.empty());
@@ -6351,6 +6379,10 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
             UNIT_ASSERT(reply != f.Replies.end());
             UNIT_ASSERT_VALUES_EQUAL((*reply)->Get<NDDisk::TEvReadResult>()->GetPayload(0).ConvertToString(),
                 MakeData('A', BlockSize));
+            if (router) {
+                UNIT_ASSERT_VALUES_EQUAL((*reply)->Get<NDDisk::TEvReadResult>()->GetPayload(0).Begin().ContiguousData(), buffer);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 0);
             UNIT_ASSERT_VALUES_EQUAL(*destructions, 1);
             UNIT_ASSERT_VALUES_EQUAL(f.Replies.size(), 2);
 
@@ -6433,6 +6465,147 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
             }
             UNIT_ASSERT_VALUES_EQUAL(restored.Replies.size(), 2);
             restored.Shutdown();
+        }
+    }
+
+    Y_UNIT_TEST(ControlledIndexedReadGrowthReuseAndStaleTokens) {
+        for (bool router : {false, true}) {
+            TControlledDDisk f(router);
+            f.Initialize();
+            const auto frames = f.LiveFrames();
+            for (ui32 i = 0; i < 64; ++i) { f.Read(0, BlockSize, 1000 + i); }
+            f.Until([&] { return f.Io.size() == 64; });
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 64);
+            UNIT_ASSERT_VALUES_EQUAL(f.LiveFrames(), frames + 64);
+            auto tokens = f.ReadTokens();
+            // A generic write wait must coexist with the cookie-zero read dispatch.
+            f.Write(BlockSize, 'B', 2000);
+            f.Until([&] { return f.Io.size() == 66; });
+            while (!f.Io.empty()) { f.Complete(f.Io.size() - 1); }
+            f.Reply<NDDisk::TEvWriteResult>(2000, TReplyStatus::OK);
+            for (ui32 i = 0; i < 64; ++i) { f.Reply<NDDisk::TEvReadResult>(1000 + i, TReplyStatus::OK); }
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 0);
+            f.Read(0, BlockSize, 3000);
+            f.Until([&] { return f.Io.size() == 1; });
+            const auto reused = f.ReadTokens().front();
+            UNIT_ASSERT(std::find(tokens.begin(), tokens.end(), reused) == tokens.end());
+            for (ui64 token : tokens) {
+                f.Ctx.Runtime.Send(new IEventHandle(f.Parent, f.Ctx.Edge,
+                    NDDisk::TDDiskActorTestPeer::IndexedReadCompletion(token)), NodeId);
+            }
+            f.Pump();
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(f.ReadTokens().front(), reused);
+            f.Complete();
+            f.Reply<NDDisk::TEvReadResult>(3000, TReplyStatus::OK);
+            f.Ctx.Runtime.Send(new IEventHandle(f.Parent, f.Ctx.Edge,
+                NDDisk::TDDiskActorTestPeer::IndexedReadCompletion(reused)), NodeId);
+            f.Pump();
+            UNIT_ASSERT_VALUES_EQUAL(f.Replies.size(), 66);
+            UNIT_ASSERT_VALUES_EQUAL(f.LiveFrames(), frames);
+            f.Shutdown();
+        }
+    }
+
+    Y_UNIT_TEST(ControlledIndexedReadAbandonedReservationAndRejection) {
+        TControlledDDisk f(true, false);
+        f.Initialize();
+        UNIT_ASSERT(f.Inspect([&](auto& actor) {
+            return NDDisk::TDDiskActorTestPeer::AbandonReadReservation(actor, f.Creds);
+        }));
+        UNIT_ASSERT(f.Io.empty());
+        f.Router->RejectSubmissions = true;
+        f.Read(0, BlockSize, 501);
+        // Preserve the router rejection result; its separate event enters Stopping.
+        f.Reply<NDDisk::TEvReadResult>(501, TReplyStatus::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 0);
+        UNIT_ASSERT(f.Io.empty());
+        f.Shutdown();
+    }
+
+    Y_UNIT_TEST(ControlledIndexedReadQueuedCompletionBlocksStopping) {
+        for (bool router : {false, true}) for (bool completeBeforeStop : {false, true}) {
+            TControlledDDisk f(router);
+            f.Initialize();
+            f.HoldIndexedCompletions = true;
+            f.Read(0, BlockSize, 501);
+            f.Until([&] { return f.Io.size() == 1; });
+            if (completeBeforeStop) { f.Complete(); }
+            SendToDDisk(f.Ctx, f.Disk.ServiceId, new TEvents::TEvPoison);
+            if (router && !completeBeforeStop) { f.Complete(); }
+            f.Until([&] { return f.IndexedCompletions.size() == 1; });
+            f.Pump();
+            UNIT_ASSERT_VALUES_EQUAL(f.Gone, 0);
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 1);
+            UNIT_ASSERT(f.Forgotten.empty());
+            f.HoldIndexedCompletions = false;
+            f.Ctx.Runtime.Send(std::move(f.IndexedCompletions.front()), NodeId);
+            f.Until([&] { return f.Gone == 1; });
+            f.Reply<NDDisk::TEvReadResult>(501, !router && !completeBeforeStop
+                ? TReplyStatus::SESSION_MISMATCH : TReplyStatus::OK);
+            // A fallback device request may outlive its actor-owned cancellation result.
+            f.Io.clear();
+        }
+    }
+
+    Y_UNIT_TEST(ControlledIndexedReadGenerationExhaustion) {
+        TControlledDDisk f(true);
+        f.Initialize();
+        f.Read(0, BlockSize, 501);
+        f.FinishIo();
+        f.Reply<NDDisk::TEvReadResult>(501, TReplyStatus::OK);
+        f.Inspect([](auto& actor) {
+            NDDisk::TDDiskActorTestPeer::ExhaustNextIndexedReadGeneration(actor);
+            return true;
+        });
+        f.Read(0, BlockSize, 502);
+        f.Until([&] { return f.Io.size() == 1; });
+        const ui64 exhausted = f.ReadTokens().front();
+        UNIT_ASSERT_VALUES_EQUAL(exhausted >> 32, Max<ui32>());
+        f.Complete();
+        f.Reply<NDDisk::TEvReadResult>(502, TReplyStatus::OK);
+        f.Read(0, BlockSize, 503);
+        f.Until([&] { return f.Io.size() == 1; });
+        UNIT_ASSERT(ui32(f.ReadTokens().front()) != ui32(exhausted));
+        f.Complete();
+        f.Reply<NDDisk::TEvReadResult>(503, TReplyStatus::OK);
+        UNIT_ASSERT_VALUES_EQUAL(f.Inspect([](auto& actor) {
+            return NDDisk::TDDiskActorTestPeer::IndexedReadCapacity(actor);
+        }), 2);
+        f.Shutdown();
+    }
+
+    Y_UNIT_TEST(ControlledIndexedReadCancellationRetainsPin) {
+        for (bool router : {false, true}) for (ui32 timing : {0u, 1u, 2u}) {
+            TControlledDDisk f(router);
+            f.Initialize();
+            NActors::TAsyncCancellationScope scope;
+            bool finished = false, completed = false;
+            f.Inspect([&](auto& actor) {
+                NDDisk::TDDiskActorTestPeer::CancellableRead(actor, f.Creds, scope,
+                    timing == 0, finished, completed);
+                return true;
+            });
+            f.Until([&] { return f.Io.size() == 1; });
+            UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 1);
+            if (timing == 2) { f.Complete(); f.Until([&] { return finished; }); }
+            f.Inspect([&](auto& actor) {
+                NActors::TActorRunnableQueue queue(&actor);
+                scope.Cancel();
+                return true;
+            });
+            f.Until([&] { return finished; });
+            UNIT_ASSERT_VALUES_EQUAL(completed, timing == 2);
+            if (timing != 2) {
+                UNIT_ASSERT_VALUES_EQUAL(f.IndexedReads(), 1);
+                SendToDDisk(f.Ctx, f.Disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(f.Creds), 501);
+                f.Reply<NDDisk::TEvDeleteTabletChunksResult>(501, TReplyStatus::BUSY);
+                f.Complete();
+                f.Until([&] { return f.IndexedReads() == 0; });
+            }
+            SendToDDisk(f.Ctx, f.Disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(f.Creds), 502);
+            f.Reply<NDDisk::TEvDeleteTabletChunksResult>(502, TReplyStatus::OK);
+            f.Shutdown();
         }
     }
 
@@ -6831,11 +7004,14 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
     }
 
     Y_UNIT_TEST(ControlledForcedCleanupReleasesWriteSyncAndDeletionFrames) {
-        for (ui32 kind : {0u, 1u, 2u, 3u}) {
+        for (ui32 kind : {0u, 1u, 2u, 3u, 4u}) {
             NActors::TAsyncFrameCache::TStats finalStats;
             TControlledDDisk f(true, true, false, &finalStats);
             f.Initialize();
-            if (kind == 0) {
+            if (kind == 4) {
+                f.Read(0, BlockSize, 501);
+                f.Until([&] { return f.Io.size() == 1; });
+            } else if (kind == 0) {
                 f.Write(BlockSize, 'W', 501);
                 f.Until([&] { return f.Io.size() == 2; });
             } else if (kind == 1 || kind == 3) {

@@ -410,6 +410,7 @@ namespace NKikimr::NDDisk {
                 ui64 VChunkIndex = 0;
                 bool HasChunkKey = false;
                 std::vector<ui64> Checksums;
+                ui64 IndexedReadToken = 0;
 
                 TEvDDiskIoResult(NPDisk::TUringOperationBase::EOperationType operationType,
                         NKikimrBlobStorage::NDDisk::TReplyStatus::E status, TString errorMessage,
@@ -620,20 +621,24 @@ namespace NKikimr::NDDisk {
         class TDataIoPin {
         public:
             explicit TDataIoPin(TChunkRef& chunk)
-                : Chunk(chunk)
+                : Chunk(&chunk)
             {
-                ++Chunk.InFlightDataIo;
+                ++Chunk->InFlightDataIo;
             }
 
             ~TDataIoPin() {
-                --Chunk.InFlightDataIo;
+                if (Chunk) { --Chunk->InFlightDataIo; }
             }
+
+            TDataIoPin(TDataIoPin&& other) noexcept
+                : Chunk(std::exchange(other.Chunk, nullptr))
+            {}
 
             TDataIoPin(const TDataIoPin&) = delete;
             TDataIoPin& operator=(const TDataIoPin&) = delete;
 
         private:
-            TChunkRef& Chunk;
+            TChunkRef* Chunk;
         };
 
         // Node-stable: waiters hold TChunkRef& (and its TAsyncEvent members) across co_await.
@@ -824,8 +829,8 @@ namespace NKikimr::NDDisk {
         NActors::async<bool> WaitForChunkCommit(ui64 tabletId, ui64 vChunkIndex);
         static std::unique_ptr<TEvPrivate::TEvDDiskIoResult> MakeDDiskReadResult(
             const IEventHandle& request, ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan&& span);
-        ui64 SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
-            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span,
+        bool SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
+            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span, ui64 indexedReadToken,
             std::unique_ptr<TEvPrivate::TEvDDiskIoResult>& result);
         struct TPendingDDiskRead {
             TDataIoPin Pin;
@@ -840,6 +845,23 @@ namespace NKikimr::NDDisk {
         };
         THashMap<ui64, std::shared_ptr<TPendingDDiskRead>> PendingDDiskReads;
 
+        class TDDiskReadAwaiter;
+        struct TIndexedReadSlot {
+            ui32 Generation = 1;
+            ui32 NextFree = Max<ui32>();
+            TDDiskReadAwaiter* Waiter = nullptr;
+            std::optional<TDataIoPin> Pin;
+            bool Submitted = false;
+        };
+        std::vector<TIndexedReadSlot> IndexedReads;
+        ui32 FirstFreeIndexedRead = Max<ui32>();
+        size_t ActiveIndexedReads = 0;
+        ui64 ReserveIndexedRead(TDDiskReadAwaiter& waiter, TChunkRef& chunk);
+        TIndexedReadSlot* FindIndexedRead(ui64 token);
+        void ReleaseIndexedRead(ui64 token);
+        void DetachIndexedRead(ui64 token);
+        void Handle(TEvPrivate::TEvDDiskIoResult::TPtr ev);
+
         class TDDiskReadAwaiter {
         public:
             static constexpr bool IsActorAwareAwaiter = true;
@@ -852,20 +874,24 @@ namespace NKikimr::NDDisk {
             template<class TPromise>
             void await_suspend(std::coroutine_handle<TPromise> parent) {
                 if (Mode == EMode::DataEvent) {
-                    Event->await_suspend(parent);
+                    Continuation = parent;
                 } else {
                     Cold->Waiter.await_suspend(parent);
                 }
             }
             std::coroutine_handle<> await_cancel(std::coroutine_handle<> continuation) noexcept {
                 if (Mode == EMode::DataEvent) {
-                    return Event->await_cancel(continuation);
+                    if (!Token) { return {}; }
+                    Self.DetachIndexedRead(std::exchange(Token, 0));
+                    Continuation = {};
+                    return continuation;
                 }
                 return Cold->Waiter.await_cancel(continuation) ? continuation : std::coroutine_handle<>{};
             }
             std::unique_ptr<TEvPrivate::TEvDDiskIoResult> await_resume();
 
         private:
+            friend class TDDiskActor;
             enum class EMode { Ready, DataEvent, Cold } Mode = EMode::Ready;
             struct TColdWait {
                 std::shared_ptr<TPendingDDiskRead> Context;
@@ -877,14 +903,18 @@ namespace NKikimr::NDDisk {
             TDDiskActor& Self;
             std::unique_ptr<TEvPrivate::TEvDDiskIoResult> Result;
             std::optional<TIntegrityManager::TOperationResult> Metadata;
-            std::optional<TDataIoPin> Pin;
-            std::optional<TDataIoCompletion> Event;
+            ui64 Token = 0;
+            std::coroutine_handle<> Continuation;
             std::optional<TColdWait> Cold;
         };
         TDDiskReadAwaiter ReadDDisk(TEvRead::TPtr& request, TChunkRef& chunk,
             ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span);
         void ApplyDDiskReadMetadata(TEvPrivate::TEvDDiskIoResult& result,
-            TIntegrityManager::TOperationResult metadata);
+            TIntegrityManager::TOperationResult&& metadata);
+        void ApplyDDiskReadMetadata(TEvPrivate::TEvDDiskIoResult& result,
+            const TIntegrityManager::TOperationResult& metadata);
+        template<class TMetadata>
+        void ApplyDDiskReadMetadataImpl(TEvPrivate::TEvDDiskIoResult& result, TMetadata&& metadata);
         void TryFinishDDiskRead(ui64 cookie);
         void Handle(TEvPrivate::TEvReadPartsResult::TPtr ev);
         void FinishDDiskIoResult(TEvPrivate::TEvDDiskIoResult& msg);

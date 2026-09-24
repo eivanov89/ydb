@@ -199,7 +199,6 @@ public:
     };
 
     struct TReadPreparation {
-        std::optional<TOperationResult> Result;
         TOperation Pending;
         // Only newly claimed loads. Existing loads are joined through Pending.
         std::vector<TPairRead> Reads;
@@ -270,7 +269,8 @@ public:
     TExtent StartExtent(TDataChunkKey key, TChunkIdx dataChunkIdx);
     // Preparation claims and pins metadata but does not submit I/O. The caller can combine Reads
     // and its data range into one vector operation. Every claimed descriptor requires completion.
-    TReadPreparation PrepareRead(TDataChunkKey key, ui32 offsetInBytes, ui32 size);
+    TReadPreparation PrepareRead(TDataChunkKey key, ui32 offsetInBytes, ui32 size,
+        std::optional<TOperationResult>& readyResult);
     void CompletePairReads(TConstArrayRef<TPairReadResult> results);
     TOperation StartRead(TDataChunkKey key, ui32 offsetInBytes, ui32 size);
     TOperation StartWrite(TDataChunkKey key, ui32 offsetInBytes, ui32 size,
@@ -472,7 +472,8 @@ private:
     TOperation StartOperation(TDataChunkKey key, ui32 offset, ui32 size,
         std::vector<ui64> checksums);
     void ValidateOperationRange(ui32 offset, ui32 size) const;
-    TOperationResult MakeReadResult(TDataChunkKey key, ui32 offset, ui32 size) const;
+    void CollectReadResult(TExtentInfo& extent, ui32 offset, ui32 size,
+        TOperationResult& result, bool touch);
     TRcBuf MakePairImage(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx);
     bool LoadPairImage(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx, const TRope& data,
         TString* errorReason, bool* lostWriteDetected);

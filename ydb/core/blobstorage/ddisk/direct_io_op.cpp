@@ -302,11 +302,14 @@ void TDDiskActor::TDDiskIoOp::Reply(NActors::TActorSystem* actorSystem, TReplySt
         Y_ABORT("Unknown OperationType");
     }
 
-    actorSystem->Send(DDiskId, new TEvPrivate::TEvDDiskIoResult(
+    auto* result = new TEvPrivate::TEvDDiskIoResult(
         GetOperationType(), status, std::move(reason), std::move(data),
         GetOriginalRequester(), GetInterconnectSession(), GetCookie(), ExtractSpan(),
         GetTotalSize(), requestTimeMs, TabletId, VChunkIndex, HasChunkKey,
-        {}), 0, GetCompletionCookie());
+        {});
+    result->IndexedReadToken = GetIndexedReadToken();
+    Y_ABORT_UNLESS(!result->IndexedReadToken || !GetCompletionCookie());
+    actorSystem->Send(DDiskId, result, 0, GetCompletionCookie());
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -514,6 +517,7 @@ void TDDiskActor::TDDiskIoOp::SelfRecycle() noexcept {
 }
 
 void TDDiskActor::TDDiskIoOp::ClearForRecycle() noexcept {
+    IndexedReadToken = 0;
     TabletId = 0;
     VChunkIndex = 0;
     HasChunkKey = false;

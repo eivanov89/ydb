@@ -30,19 +30,28 @@ records commit intent before suspension; direct-I/O completions retain buffer
 ownership through retirement.
 
 Read, write, and sync request coroutines join their submitted data and metadata
-work before replying. Device waits use unique completion cookies independent of
-client cookies. Write and sync data submission helpers return native event
+work before replying. Generic device waits use unique completion cookies independent of
+client cookies; indexed DDisk reads use their own tokens and envelope cookie zero. Write and sync data submission helpers return native event
 awaiters; a scoped `TDataIoPin` holds the chunk through the data completion.
 Ready allocation, FIFO admission, and commit checks avoid child wait coroutines.
 For an allocated, formatted chunk, `ReadDDisk` returns one ordinary awaiter to
-the read handler. Its Ready and DataEvent modes need no aggregate allocation or
-pending-read registry; Cold joins its parent I/O and shared metadata loads.
-`PrepareRead` captures resident snapshots inline or claims missing pair loads
-without submitting them. The single DirectIo object combines data and newly
+the read handler. Ready needs no registry entry. DataEvent uses reusable actor-owned
+indexed slots without aggregate allocation or generic waiter registration; Cold
+joins its parent I/O and shared metadata loads. Slot tokens combine generation
+and index, survive vector growth, and reject stale or duplicate completions. A
+slot is never reused after generation exhaustion. Cancellation detaches the
+awaiter but retains submitted slots and chunk pins until terminal processing;
+completion releases the slot before resuming inline.
+`PrepareRead` constructs immediate metadata results in the awaiter's empty optional
+or claims missing pair loads without submitting them. Warm reads move owned
+result fields; cold reads inspect the immutable shared plan by const reference.
+Collection reuses the resolved extent and gathers checksums and usage in one
+pass by metadata pair before eviction. The single DirectIo object combines data and newly
 claimed metadata parts in one initial router admission. Known zero ranges omit
 data I/O; joins never duplicate existing pair loads. PDisk fallback submits one
 raw read per part and aggregates their completions. Data buffers transfer to the
-reply directly. Metadata retries resubmit only failed metadata parts.
+reply directly; checksum vectors reach the reply constructor by const reference
+without an intermediate copy. Metadata retries resubmit only failed metadata parts.
 
 Requested data blocks must not be written concurrently. Neighboring writes or
 syncs may share a metadata pair: a read's checksum/mask snapshot is immutable and
@@ -64,6 +73,9 @@ Broken and Stopping resolve logical waits without canceling accepted router
 I/O waits. Failed branches still drain submitted siblings, retaining their
 buffers and physical ownership. Sync cancels superseded preparation only;
 submitted destination segments finish before extent admission is released.
+Indexed completions are handled during Stopping too; reservation release and
+Gone require zero active slots as well as callback drain. Forced destruction
+drains callbacks before releasing remaining registry pins.
 
 Shutdown tests must distinguish the indefinite normal actor drain from the
 60-second `io_stalled` diagnostic and the 10-second forced-destructor deadline.

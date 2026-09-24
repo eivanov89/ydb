@@ -208,7 +208,7 @@ namespace NKikimr::NDDisk {
         if (IsPersistentBufferActor || !PDiskParams || !LogReplayComplete) {
             return;
         }
-        Y_ABORT_UNLESS(Stopping && !GetDirectIoInflight());
+        Y_ABORT_UNLESS(Stopping && !GetDirectIoInflight() && !ActiveIndexedReads);
 
         TVector<TChunkIdx> chunks = ChunkManager.ExtractReservations();
         for (const auto& [chunkIdx, _] : FormattingChunks) {

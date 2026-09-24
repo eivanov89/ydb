@@ -2086,15 +2086,16 @@ Y_UNIT_TEST_SUITE(TIntegrityManagerTest) {
         manager.ApplyMappingSnapshot(original.SnapshotMapping());
         const ui32 blocks = ChecksumsPerIntegrityBlock + 1;
         TIntegrityManager::TReadPreparation owner, joined;
+        std::optional<TIntegrityManager::TOperationResult> readyResult;
         size_t detachedNotifications = 0, joinedNotifications = 0;
         const auto launches = manager.GetHostLaunchCount();
         manager.InActor([&](NActors::IActor&) {
-            owner = manager.PrepareRead(key, 0, blocks * IntegrityUnitSize);
-            UNIT_ASSERT(!owner.Result);
+            owner = manager.PrepareRead(key, 0, blocks * IntegrityUnitSize, readyResult);
+            UNIT_ASSERT(!readyResult);
             UNIT_ASSERT_VALUES_EQUAL(owner.Reads.size(), 2);
             owner.Pending.SetCompletionCallback([&] { ++detachedNotifications; });
-            joined = manager.PrepareRead(key, 0, blocks * IntegrityUnitSize);
-            UNIT_ASSERT(!joined.Result);
+            joined = manager.PrepareRead(key, 0, blocks * IntegrityUnitSize, readyResult);
+            UNIT_ASSERT(!readyResult);
             UNIT_ASSERT(joined.Reads.empty());
             joined.Pending.SetCompletionCallback([&] { ++joinedNotifications; });
             owner.Pending.SetCompletionCallback({});
@@ -2154,22 +2155,23 @@ Y_UNIT_TEST_SUITE(TIntegrityManagerTest) {
         UNIT_ASSERT_VALUES_EQUAL(writes.size(), 1);
         const auto launches = manager.GetHostLaunchCount();
         TIntegrityManager::TReadPreparation read;
+        std::optional<TIntegrityManager::TOperationResult> readyResult;
         manager.InActor([&](NActors::IActor&) {
-            read = manager.PrepareRead(key, 0, 2 * IntegrityUnitSize);
+            read = manager.PrepareRead(key, 0, 2 * IntegrityUnitSize, readyResult);
         });
-        UNIT_ASSERT(read.Result);
+        UNIT_ASSERT(readyResult);
         UNIT_ASSERT(read.Reads.empty());
-        UNIT_ASSERT_EQUAL(read.Result->Status, TIntegrityManager::EOperationStatus::Ok);
-        UNIT_ASSERT_EQUAL(read.Result->ReadPlan.Kind, TReadPlan::Mixed);
-        UNIT_ASSERT_VALUES_EQUAL(read.Result->Checksums, (std::vector<ui64>{0xAA, GetZeroBlockChecksum()}));
+        UNIT_ASSERT_EQUAL(readyResult->Status, TIntegrityManager::EOperationStatus::Ok);
+        UNIT_ASSERT_EQUAL(readyResult->ReadPlan.Kind, TReadPlan::Mixed);
+        UNIT_ASSERT_VALUES_EQUAL(readyResult->Checksums, (std::vector<ui64>{0xAA, GetZeroBlockChecksum()}));
         UNIT_ASSERT_VALUES_EQUAL(manager.GetHostLaunchCount(), launches);
         UNIT_ASSERT(!manager.HasActions());
         UNIT_ASSERT(manager.TakeCompletedOperations().empty());
         CompleteWrites(manager, writes);
         UNIT_ASSERT_EQUAL(TakeOnlyCompletion(manager).Status, TIntegrityManager::EOperationStatus::Ok);
-        UNIT_ASSERT_VALUES_EQUAL(read.Result->Checksums, (std::vector<ui64>{0xAA, GetZeroBlockChecksum()}));
-        UNIT_ASSERT(read.Result->ReadPlan.UsedBlocks.Get(0));
-        UNIT_ASSERT(!read.Result->ReadPlan.UsedBlocks.Get(1));
+        UNIT_ASSERT_VALUES_EQUAL(readyResult->Checksums, (std::vector<ui64>{0xAA, GetZeroBlockChecksum()}));
+        UNIT_ASSERT(readyResult->ReadPlan.UsedBlocks.Get(0));
+        UNIT_ASSERT(!readyResult->ReadPlan.UsedBlocks.Get(1));
     }
 
     Y_UNIT_TEST(StoppedReadPublishesFailureButRetainsSharedLoadPins) {
@@ -2180,9 +2182,10 @@ Y_UNIT_TEST_SUITE(TIntegrityManagerTest) {
         NIntegrityTest::TFixture manager(MultiBlockChunkSize, TestDDiskId, TestPDiskGuid);
         manager.ApplyMappingSnapshot(original.SnapshotMapping());
         TIntegrityManager::TReadPreparation read;
+        std::optional<TIntegrityManager::TOperationResult> readyResult;
         size_t notifications = 0;
         manager.InActor([&](NActors::IActor&) {
-            read = manager.PrepareRead(key, 0, (ChecksumsPerIntegrityBlock + 1) * IntegrityUnitSize);
+            read = manager.PrepareRead(key, 0, (ChecksumsPerIntegrityBlock + 1) * IntegrityUnitSize, readyResult);
             read.Pending.SetCompletionCallback([&] { ++notifications; });
             manager.Stop();
         });
