@@ -16,6 +16,86 @@ Run one workload at a time per load tablet, and finish it before deleting the ta
 
 {% endnote %}
 
+## Automation with dstool {#automation}
+
+Use `ydb-dstool nbs-load` for scripts and recoverable runs. It calls the existing legacy `TestShardControl` gRPC method; it never falls back to HTTP. Deploy server support first, including the load service on the coordinator and generator nodes and tablets supporting automation protocol version 1. Each command requires an explicit database (or a saved handle containing it) and administrator authorization. Capability checks reject unsupported servers and stale coordinator incarnations.
+
+The legacy gRPC service is not enabled by default on TLS endpoints or when an explicit service list excludes it. Add `legacy` to `GRpcConfig.ServicesEnabled` (textproto), or merge this setting into the server YAML configuration:
+
+```yaml
+grpc_config:
+  services_enabled:
+    - legacy
+```
+
+Preserve other enabled services and ensure `legacy` is absent from `services_disabled`, which takes precedence. The `test_shard` service is a separate service and does not enable this legacy RPC. This workflow does not change server service-enablement defaults.
+
+Use dedicated load tablets. Serialize create and delete for each Hive owner index, including operations from the HTTP interface. Reserve distinct owner indices across databases that share a Hive. Concurrent lifecycle mutations from independent controllers are unsupported. The coordinator rejects overlapping runs it knows about and deletion of a tablet with a known active run; this is not a cluster-wide lock. Do not concurrently run workloads through another coordinator against the same tablets.
+
+### Configuration and commands
+
+Allocation files use the `TAllocConfig` example in [Create a Tablet](#create). In this gRPC workflow, `TabletStoragePools` supplies the ordered tablet-channel bindings and is required when the database has no default channel pools. Repeated create reuses an allocation only when its database/domain, effective allocation, and actual ordered bindings match; other reuse conflicts. The preflight checks do not make creation atomic against another controller. Each operation sends at most one create or delete request; after an ambiguous transport failure, inspect the owner index and reported tablet ID before deciding whether to repeat it. A partial failure reports the tablet identity for recovery. An already absent tablet can be deleted again.
+
+For three explicit channel bindings, append these fields to the allocation example, replacing `tablet-storage` with an ordinary tablet-storage pool in your database. Repeated entries preserve channel order, even when all channels use the same pool:
+
+```proto
+TabletStoragePools: "tablet-storage"
+TabletStoragePools: "tablet-storage"
+TabletStoragePools: "tablet-storage"
+```
+
+Run files use a complete `TEvLoadTestRequest` containing only `NbsDbgLikeLoad`, as in [Run a Workload](#run). They must not contain tags, UUIDs, timestamps, cookies, or internal readiness/configuration bookkeeping. `DurationSeconds` must be positive and exceed `DelayBeforeMeasurementsSeconds`; a count limit is an additional stopping condition. Omitted fields use protobuf defaults, not monitoring-form defaults. Use either `NbsDbgLikeTabletId` or unique `Targets`, not both. If neither is in the file, provide `--tablet-id`.
+
+Both textproto and protobuf JSON are accepted. A `.json` suffix selects JSON; other filenames select textproto. Override with `--config-format json|textproto`; this option is required for `--config -` (stdin). For example, the following JSON is a single-tablet run with a 60-second duration and the protobuf defaults for other settings:
+
+```json
+{
+  "NbsDbgLikeLoad": {
+    "NbsDbgLikeTabletId": "72057594000000001",
+    "WorkloadConfig": {"DurationSeconds": 60}
+  }
+}
+```
+
+Use the usual dstool TLS and credential options and an explicit `grpc://` or `grpcs://` endpoint. Replace the database, endpoint, owner index, and tablet ID in these recipes:
+
+```bash
+DSTOOL_ENDPOINT=grpcs://node.example:2135
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load create --database /Root/test --owner-index 1 --config nbs-dbg-alloc.txt --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load list --database /Root/test --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load describe --database /Root/test --owner-index 1 --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load run --database /Root/test --config nbs-dbg-run.txt --output-dir ./run-01 --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load results --handle ./run-01 --wait --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load stop --handle ./run-01 --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load sweep --database /Root/test --config nbs-dbg-run.txt --inflights 1,8,32 --trials 3 --output-dir ./sweep-01 --format jsonl
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load delete --database /Root/test --owner-index 1 --format json
+```
+
+`create` waits for readiness. `run` waits by default; `--no-wait` returns the handle and artifact location. `results` retrieves the current state; `--wait` waits for a terminal result. `stop` addresses one run and waits for confirmed termination. For a sweep trial, use `results` or `stop` with `--database`, `--node-id`, `--incarnation`, and `--request-id` from its checkpoint instead of `--handle`.
+
+The receiving node is the default coordinator; `--node-id` selects another. The client pins the coordinator node and service incarnation before submission. Later requests may enter through another gateway and are forwarded to that coordinator. Missing load services or database context cause an error. Each new run, including every sweep trial, resolves current Hive placement. Omitted target `NodeId` colocates the generator with its tablet; an explicit nonzero value overrides placement, and explicit zero uses the coordinator node. Accepted runs retain their placement snapshot on retry and do not automatically relocate or restart.
+
+Automation waits for the entire requested DBG prefix and acknowledged configuration of its per-DBG actors before generating load. It neither uses the HTTP zero-ready fallback nor silently reduces the requested workload. A `NumDirectBlockGroupsToUse` greater than the allocated count is rejected. Defaults are a 90-second RPC timeout, a 60-second startup readiness/configuration budget, and a 2-second polling interval; override with `--rpc-timeout`, `--startup-timeout`, and `--poll-interval`. One RPC timeout is shared across gateway retries and capped by the remaining overall operation budget; both gRPC and gateway `RpcTimeoutMs` receive that cap. Trial budgets begin before START or recovery GET, result waits before the initial GET, readiness before DESCRIBE, and stops before STOP. The runner's default overall wait is startup budget + workload duration + 210 seconds for drain and bounded transport slack; `--wait-timeout` overrides it. Confirmed completion means client-request drain, not completion of background flush or erase. Check `Run.TerminationConfirmed`: without confirmed drain, the service keeps the run in `STOPPING` with `ExecutionError`, `TerminationConfirmed: false`, and no `FinishedAtMs`, even after a worker watchdog reports failure. Such unresolved runs continue blocking reuse of their tablets on the same coordinator. A late terminal reply is saved but still has a timeout verdict. Cancellation has its own bounded budget; a failed or unconfirmed outcome must not permit the next trial.
+
+### Results, recovery, and sweeps
+
+`--format json` keeps stdout machine-readable; progress and diagnostics go to stderr. Protobuf JSON represents 64-bit identifiers and counters as strings. The CLI result contains `response.Run` and a separate `passed` verdict (pending results have no final verdict). Execution states are `IN_PROGRESS`, `STOPPING`, `SUCCEEDED`, `FAILED`, and `CANCELLED`. `SUCCEEDED` alone does not establish a passing measurement: inspect `Stats.WritesErr` and `Stats.ReadsErr`. Measured I/O errors, execution failure, cancellation, timeout, and missing/lost results cause a nonzero exit. `--allow-io-errors` relaxes only the measured-error check.
+
+The typed result includes execution errors, effective configuration with resolved placement, build information, timestamps, measured milliseconds, counts, bytes, rates, latency histograms in microseconds, and per-tablet statistics. Histograms are merged for aggregate latency, not averaged as percentiles. Browser metric fields remain a separate compatibility projection.
+
+`run` and `sweep` default to `./nbs-load-results/<client-generated-uuid>/`. An explicit output directory must not already exist unless resuming. `config.json` and an atomically written `checkpoint.json` preserve settings, pinned coordinator identity, request IDs, targets, and trial states before submission. Each `result-NNNN.json` is saved before the checkpoint marks that trial complete. Artifacts contain no credentials.
+
+```bash
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load run --resume ./run-01 --format json
+ydb-dstool -e "$DSTOOL_ENDPOINT" nbs-load sweep --resume ./sweep-01 --format jsonl
+```
+
+Resume uses saved run settings; conflicting new settings are rejected. `results --handle` and `stop --handle` also save terminal results before marking the checkpoint complete. They reconcile an interrupted result/checkpoint write and serve saved terminal results offline, including after coordinator history is lost. Dry runs do not alter artifacts. Nonterminal replies remain pending. Resume skips saved completed trials, retrieves previously submitted work, and starts only never-submitted trials. A fully completed run or sweep can be resumed from saved results without a live coordinator. An interrupted submission is ambiguous: an unknown or expired handle must never trigger replacement work automatically. Accepted bounded work belongs to the service and continues after client disconnection. Completed server results and deduplication records are retained in memory for 24 hours; each coordinator accepts at most 1,024 active/retained records and rejects new runs at capacity. A coordinator restart loses this history and changes its incarnation. Coordinator loss does not prove remote workers stopped; investigate before launching more work against those tablets.
+
+Sweeps preserve the ordered inflight list and all trials, changing only `WorkloadConfig.MaxInFlight`. They run sequentially, stop at the first failed verdict, and save `summary.json` selecting the median trial by write IOPS (the upper middle trial for an even count). On timeout or interruption the runner requests scoped cancellation and confirms termination before it can continue; an unconfirmed outcome remains unresolved. Allocation deletion is always explicit. The global `--dry-run` option validates and displays intended requests without mutations or simulated results.
+
+For agent-assisted operation, see the scoped [ydb-nbs-dbg-load skill](https://github.com/ydb-platform/ydb/blob/main/ydb/apps/dstool/.agents/skills/ydb-nbs-dbg-load/SKILL.md). The remaining sections describe the compatible HTTP workflow and the shared workload parameters.
+
 ## Create a Tablet {#create}
 
 Choose a distinct `owner_idx` for each tablet within the selected Hive. Hive maps this index, together with the load service's fixed owner ID, to the actual tablet ID. Keep both values: deletion uses `owner_idx`, while workloads use the Hive-assigned tablet ID.
@@ -132,7 +212,7 @@ The tablet page pre-fills `MaxInFlight: 2048` and `MaxInflightLsns: 65536` for a
 | `DurationSeconds` | `0` | Time from workload start to stopping request generation, including warm-up. Set this or `StopOnWritesDoneCount` to a positive value. |
 | `DelayBeforeMeasurementsSeconds` | `15` | Warm-up interval excluded from measured results. Must be less than a positive `DurationSeconds`. |
 | `MaxInFlight` | `32` | Combined concurrent write/read limit per target tablet. Use a positive value. Random workloads split large limits among workers; sequential workloads use one worker. |
-| `ReadRatio` | `0` | Reads issued per 100 writes, based on issued request counts. `100` means approximately one read per write, or half of all requests. It does not select a read-only workload. |
+| `ReadRatio` | `0` | Reads issued per 100 writes, based on issued request counts. `100` means approximately one read per write, or half of all requests. Values above `100` are allowed; `200` means approximately two reads per write. It does not select a read-only workload. |
 | `Sequential` | `false` | Sequential traversal of the flat address space when true; uniform random selection otherwise. |
 | `ReadWriteSizeKiB` | `4` | Fixed I/O size, at least 4 KiB and a multiple of 4 KiB. It must fit in and evenly divide a vChunk. |
 | `NumDirectBlockGroupsToUse` | `0` | Use a prefix of the available DBGs. Zero or a value exceeding the available count uses all available DBGs. |
