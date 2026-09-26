@@ -1,3 +1,5 @@
+#include <google/protobuf/util/message_differencer.h>
+#include <ydb/core/base/services/blobstorage_service_id.h>
 #include "events.h"
 #include "nbs_dbg_like_load_service.h"
 
@@ -81,9 +83,33 @@ TString NbsTabletHtmlEscape(TStringBuf in) {
 
 struct TNbsHiveListAccumRow {
     NKikimrHive::TTabletInfo Hive;
+    NKikimr::TEvNbsLoadTabletGetSummaryResult Summary;
+    std::vector<TString> ChannelPools;
     TString PoolCell = "-";
     TString NumDbgCell = "-";
 };
+
+// Storage info contains the assigned pools. Channel history in HiveInfo does not.
+bool ExtractChannelPools(const NKikimrHive::TEvGetTabletStorageInfoResult& result,
+    ui64 tabletId, std::vector<TString>& pools)
+{
+    if (result.GetTabletID() != tabletId || result.GetStatus() != NKikimrProto::OK
+        || !result.HasInfo() || result.GetInfo().GetTabletID() != tabletId) {
+        return false;
+    }
+    std::vector<std::pair<ui32, TString>> ordered;
+    for (const auto& channel : result.GetInfo().GetChannels()) {
+        ordered.emplace_back(channel.GetChannel(), channel.GetStoragePool());
+    }
+    Sort(ordered.begin(), ordered.end());
+    if (ordered.empty()) { return false; }
+    for (ui32 index = 0; index < ordered.size(); ++index) {
+        if (ordered[index].first != index || ordered[index].second.empty()) { return false; }
+    }
+    pools.clear();
+    for (const auto& [channel, pool] : ordered) { pools.push_back(pool); }
+    return true;
+}
 
 class TNbsLoadTabletListPageActor : public TActorBootstrapped<TNbsLoadTabletListPageActor> {
 public:
@@ -95,6 +121,9 @@ public:
         : Parent(std::move(parent))
         , HttpRequestId(httpRequestId)
     {}
+
+    TNbsLoadTabletListPageActor(const NKikimrClient::TNbsLoadControl& request, TActorId parent, ui64 cookie)
+        : ControlCookie(cookie), Typed(true), ControlRequest(request), Parent(parent) {}
 
     void Bootstrap() {
         Become(&TThis::StateWork);
@@ -125,7 +154,7 @@ private:
             HiveTabletId = *domainsInfo->HiveTabletId;
             DomainSchemeShard = domainsInfo->Domain->SchemeRoot;
             DomainPathId = 1;
-            FilterByObjectDomain = false;
+            FilterByObjectDomain = Typed;
             OpenHivePipe();
             return;
         }
@@ -177,6 +206,7 @@ private:
     }
 
     void FinishError(const TString& msg) {
+        ControlError = msg;
         TStringStream html;
         html << "<div class='alert alert-danger'>" << NbsTabletHtmlEscape(msg) << "</div>";
         SendDone(html.Str());
@@ -191,6 +221,23 @@ private:
             NTabletPipe::CloseClient(SelfId(), SummaryPipe);
             SummaryPipe = {};
         }
+        if (Typed) {
+            auto response = std::make_unique<TEvLoad::TEvNbsLoadControlResponse>();
+            auto& r = response->Record;
+            r.SetStatus(ControlError.empty() ? 1 : 128);
+            r.SetError(ControlError);
+            for (const auto& row : Accum) {
+                auto* tablet = r.AddTablets();
+                tablet->SetTabletId(row.Hive.GetTabletID());
+                tablet->SetOwnerIndex(row.Hive.GetTabletOwner().GetOwnerIdx());
+                tablet->SetNodeId(row.Hive.GetNodeID());
+                *tablet->MutableSummary() = row.Summary;
+                for (const auto& pool : row.ChannelPools) { tablet->AddChannelPools(pool); }
+            }
+            Send(Parent, response.release(), 0, ControlCookie);
+            PassAway();
+            return;
+        }
         auto ev = std::make_unique<TEvLoad::TEvNbsTabletListPageReady>();
         ev->HttpRequestId = HttpRequestId;
         ev->HtmlFragment = html;
@@ -199,6 +246,9 @@ private:
     }
 
     void FinalizeTableHtml() {
+        if (Typed) {
+            return SendDone({});
+        }
         Sort(Accum.begin(), Accum.end(), [](const TNbsHiveListAccumRow& a, const TNbsHiveListAccumRow& b) {
             const ui64 oa = a.Hive.GetTabletOwner().GetOwnerIdx();
             const ui64 ob = b.Hive.GetTabletOwner().GetOwnerIdx();
@@ -274,7 +324,8 @@ private:
 
     void ProceedSummary() {
         while (SummaryIndex < Accum.size()) {
-            if (!ShouldQuerySummary(Accum[SummaryIndex].Hive)) {
+            if ((Typed && ControlRequest.GetOperation() == NKikimrClient::TNbsLoadControl::DELETE)
+                || !ShouldQuerySummary(Accum[SummaryIndex].Hive)) {
                 ++SummaryIndex;
                 continue;
             }
@@ -283,7 +334,18 @@ private:
             SummaryPipe = Register(NTabletPipe::CreateClient(SelfId(), SummaryTabletId, pipeConfig));
             return;
         }
+        if (Typed && (ControlRequest.GetOperation() == NKikimrClient::TNbsLoadControl::LIST
+            || ControlRequest.GetOperation() == NKikimrClient::TNbsLoadControl::DESCRIBE)) {
+            SummaryIndex = 0;
+            return ProceedStorageInfo();
+        }
         FinalizeTableHtml();
+    }
+
+    void ProceedStorageInfo() {
+        if (SummaryIndex >= Accum.size()) { return FinalizeTableHtml(); }
+        NTabletPipe::SendData(SelfId(), HivePipe,
+            new TEvHive::TEvGetTabletStorageInfo(Accum[SummaryIndex].Hive.GetTabletID()));
     }
 
     STRICT_STFUNC(StateWork,
@@ -291,6 +353,8 @@ private:
         hFunc(TEvTabletPipe::TEvClientConnected, HandlePipeConnected)
         hFunc(TEvTabletPipe::TEvClientDestroyed, HandlePipeDestroyed)
         hFunc(TEvHive::TEvResponseHiveInfo, HandleHiveInfo)
+        hFunc(TEvHive::TEvGetTabletStorageInfoResult, HandleStorageInfo)
+        hFunc(TEvHive::TEvGetTabletStorageInfoRegistered, HandleStorageRegistered)
         hFunc(TEvLoad::TEvNbsLoadTabletGetSummaryResult, HandleSummaryResult)
         hFunc(TEvents::TEvWakeup, HandleTimeout)
     )
@@ -361,6 +425,7 @@ private:
             if (t.GetTabletType() != NKikimrTabletBase::TTabletTypes::NbsLoadTablet) {
                 continue;
             }
+            if (Typed && !MatchesControlRequest(t)) { continue; }
             TNbsHiveListAccumRow row;
             row.Hive = t;
             Accum.push_back(std::move(row));
@@ -369,9 +434,26 @@ private:
         ProceedSummary();
     }
 
+    bool MatchesControlRequest(const NKikimrHive::TTabletInfo& tablet) const {
+        const auto op = ControlRequest.GetOperation();
+        if (op == NKikimrClient::TNbsLoadControl::LIST) { return true; }
+        if (op == NKikimrClient::TNbsLoadControl::START) {
+            const auto& load = ControlRequest.GetLoad().GetNbsDbgLikeLoad();
+            if (load.GetNbsDbgLikeTabletId() == tablet.GetTabletID()) { return true; }
+            for (const auto& target : load.GetTargets()) {
+                if (target.GetTabletId() == tablet.GetTabletID()) { return true; }
+            }
+            return false;
+        }
+        return (ControlRequest.HasTabletId() && ControlRequest.GetTabletId() == tablet.GetTabletID())
+            || (ControlRequest.HasOwnerIndex()
+                && ControlRequest.GetOwnerIndex() == tablet.GetTabletOwner().GetOwnerIdx());
+    }
+
     void HandleSummaryResult(TEvLoad::TEvNbsLoadTabletGetSummaryResult::TPtr& ev) {
         const auto& r = ev->Get()->Record;
         if (SummaryIndex < Accum.size() && Accum[SummaryIndex].Hive.GetTabletID() == SummaryTabletId) {
+            Accum[SummaryIndex].Summary = r;
             if (r.GetStatus() == NBSLT_OK) {
                 TStringStream pools;
                 pools << r.GetDDiskPoolName();
@@ -385,13 +467,46 @@ private:
         }
         if (SummaryPipe) {
             NTabletPipe::CloseClient(SelfId(), SummaryPipe);
+            SummaryPipe = {};
         }
+        ++SummaryIndex;
+        ProceedSummary();
     }
 
-    void HandleTimeout(TEvents::TEvWakeup::TPtr&) {
-        FinishError("tablet list request timed out");
+    void HandleStorageRegistered(TEvHive::TEvGetTabletStorageInfoRegistered::TPtr& ev) {
+        if (SummaryIndex < Accum.size()
+            && ev->Get()->Record.GetTabletID() != Accum[SummaryIndex].Hive.GetTabletID()) {
+            return FinishError("storage information tablet identity mismatch");
+        }
+        // Hive sends the final result after group assignment.
     }
 
+    void HandleStorageInfo(TEvHive::TEvGetTabletStorageInfoResult::TPtr& ev) {
+        if (SummaryIndex >= Accum.size()) { return; }
+        auto& row = Accum[SummaryIndex];
+        if (ev->Get()->Record.GetTabletID() != row.Hive.GetTabletID()) {
+            return FinishError("storage information tablet identity mismatch");
+        }
+        if (!ExtractChannelPools(ev->Get()->Record, row.Hive.GetTabletID(), row.ChannelPools)) {
+            if (ev->Get()->Record.GetStatus() == NKikimrProto::OK) {
+                Schedule(TDuration::MilliSeconds(200), new TEvents::TEvWakeup(1));
+                return;
+            }
+            return FinishError("tablet channel storage information unavailable");
+        }
+        ++SummaryIndex;
+        ProceedStorageInfo();
+    }
+
+    void HandleTimeout(TEvents::TEvWakeup::TPtr& ev) {
+        if (ev->Get()->Tag == 1) { return ProceedStorageInfo(); }
+        FinishError("tablet list or channel assignment deadline expired");
+    }
+
+    ui64 ControlCookie = 0;
+    bool Typed = false;
+    NKikimrClient::TNbsLoadControl ControlRequest;
+    TString ControlError;
     TActorId Parent;
     ui32 HttpRequestId = 0;
 
@@ -448,6 +563,17 @@ public:
         , StoragePoolNames(SplitStoragePools(storagePoolsText))
     {}
 
+    TNbsLoadTabletRequestActor(const NKikimrClient::TNbsLoadControl& request, TActorId origin, ui64 cookie)
+        : Op(request.GetOperation() == NKikimrClient::TNbsLoadControl::CREATE ? EOp::Create : EOp::Delete)
+        , OwnerIdx(request.GetOwnerIndex())
+        , Origin(origin)
+        , SubRequestId(0)
+        , StoragePoolNames(request.GetAllocation().GetTabletStoragePools().begin(), request.GetAllocation().GetTabletStoragePools().end())
+        , Typed(true)
+        , ControlCookie(cookie)
+        , Allocation(request.GetAllocation())
+    {}
+
     void Bootstrap() {
         Become(&TThis::StateWork);
 
@@ -457,6 +583,16 @@ public:
             << " OwnerIdx# " << OwnerIdx
             << " Timeout# " << timeout
             << " Origin# " << Origin);
+        if (Op == EOp::Create) {
+            if (!Typed && !google::protobuf::TextFormat::ParseFromString(ConfigText, &Allocation)) {
+                return ReplyError(400, "failed to parse AllocConfig text-proto");
+            }
+            if (!Allocation.GetNumDirectBlockGroups() || !Allocation.GetTargetNumVChunks()
+                || !Allocation.GetVChunkSizeBytes() || Allocation.GetVChunkSizeBytes() % 4096
+                || Allocation.GetHostsPerDbg() < 3 || Allocation.GetHostsPerDbg() > 5) {
+                return ReplyError(400, "invalid allocation geometry");
+            }
+        }
         ResolveTenantDomainAndProceed();
     }
 
@@ -561,6 +697,15 @@ private:
             << " HiveTabletId# " << HiveTabletId
             << " HivePipe# " << HivePipe);
 
+        if (Typed) {
+            if (Op == EOp::Create && EffectivePools().empty()) {
+                return ReplyError(400, "explicit TabletStoragePools required when database has no default channel pools");
+            }
+            auto request = std::make_unique<TEvHive::TEvRequestHiveInfo>();
+            request->Record.SetTabletType(NKikimrTabletBase::TTabletTypes::NbsLoadTablet);
+            NTabletPipe::SendData(SelfId(), HivePipe, request.release());
+            return;
+        }
         switch (Op) {
             case EOp::Create:
                 SendCreate();
@@ -569,6 +714,102 @@ private:
                 SendLookup();
                 break;
         }
+    }
+
+    void HandleHiveInfo(TEvHive::TEvResponseHiveInfo::TPtr& ev) {
+        if (ev->Get()->Record.HasForwardRequest()) {
+            return ReplyError(409, "Hive forwarded lifecycle lookup");
+        }
+        for (const auto& tablet : ev->Get()->Record.GetTablets()) {
+            if (tablet.GetFollowerID() || tablet.GetTabletOwner().GetOwner() != kLoadOwner
+                || tablet.GetTabletOwner().GetOwnerIdx() != OwnerIdx) {
+                continue;
+            }
+            TabletId = tablet.GetTabletID();
+            if (tablet.GetObjectDomain().GetSchemeShard() != DomainSchemeShard
+                || tablet.GetObjectDomain().GetPathId() != DomainPathId) {
+                return ReplyError(409, "owner index belongs to a different database");
+            }
+            if (Op == EOp::Create) {
+                Existing = true;
+                return RequestStorageInfo();
+            }
+            OpenTabletPipe();
+            return;
+        }
+        if (Op == EOp::Delete) {
+            return ReplyOk("tablet already absent");
+        }
+        SendCreate();
+    }
+
+    std::vector<TString> EffectivePools() const {
+        auto pools = StoragePoolNames;
+        if (pools.empty() && !TenantStoragePools.empty()) {
+            for (ui32 i = 0; i < kDefaultChannelCount; ++i) {
+                pools.push_back(TenantStoragePools[i % TenantStoragePools.size()]);
+            }
+        }
+        return pools;
+    }
+
+    void RequestStorageInfo() {
+        WaitingForStorageInfo = true;
+        NTabletPipe::SendData(SelfId(), HivePipe, new TEvHive::TEvGetTabletStorageInfo(TabletId));
+    }
+
+    void HandleStorageRegistered(TEvHive::TEvGetTabletStorageInfoRegistered::TPtr& ev) {
+        if (ev->Get()->Record.GetTabletID() != TabletId) {
+            ReplyError(409, "storage information tablet identity mismatch");
+        }
+        // Hive sends a final result after assignment; the helper deadline still applies.
+    }
+
+    void HandleStorageInfo(TEvHive::TEvGetTabletStorageInfoResult::TPtr& ev) {
+        const auto& result = ev->Get()->Record;
+        if (result.GetTabletID() != TabletId || (result.HasInfo() && result.GetInfo().GetTabletID() != TabletId)) {
+            return ReplyError(409, "storage information tablet identity mismatch");
+        }
+        std::vector<TString> actual;
+        if (!ExtractChannelPools(result, TabletId, actual)) {
+            if (result.GetStatus() == NKikimrProto::OK) {
+                Schedule(TDuration::MilliSeconds(200), new TEvents::TEvWakeup(1));
+                return;
+            }
+            return ReplyError(503, "tablet channel storage information unavailable");
+        }
+        if (actual != EffectivePools()) {
+            return ReplyError(409, "ordered channel storage pools conflict with existing tablet");
+        }
+        WaitingForStorageInfo = false;
+        OpenTabletPipe();
+    }
+
+    void HandleSummary(TEvLoad::TEvNbsLoadTabletGetSummaryResult::TPtr& ev) {
+        const auto& summary = ev->Get()->Record;
+        if (summary.HasAllocation()) {
+            auto actual = summary.GetAllocation();
+            auto expected = Allocation;
+            actual.ClearTabletId();
+            expected.ClearTabletId();
+            // The assigned channel pools were checked through storage info.
+            actual.ClearTabletStoragePools();
+            expected.ClearTabletStoragePools();
+            if (!google::protobuf::util::MessageDifferencer::Equivalent(actual, expected)) {
+                return ReplyError(409, "allocation conflicts with existing tablet");
+            }
+        }
+        if (summary.GetStatus() == NBSLT_NOT_INITIALIZED) {
+            Existing = false;
+            auto request = std::make_unique<TEvLoad::TEvNbsLoadTabletAllocateGroups>();
+            *request->Record.MutableAllocConfig() = Allocation;
+            NTabletPipe::SendData(SelfId(), TabletPipe, request.release());
+            return;
+        }
+        if (summary.GetStatus() != NBSLT_OK || !summary.HasAllocation()) {
+            return ReplyError(409, "existing tablet cannot report allocation; retry after readiness");
+        }
+        ReplyOk("matching tablet already exists");
     }
 
     void SendCreate() {
@@ -584,6 +825,7 @@ private:
         auto* domain = rec.AddAllowedDomains();
         domain->SetSchemeShard(DomainSchemeShard);
         domain->SetPathId(DomainPathId);
+        if (Typed) { *rec.MutableObjectDomain() = *domain; }
         std::vector<TString> effectivePoolNames = StoragePoolNames;
         if (effectivePoolNames.empty() && !TenantStoragePools.empty()) {
             for (ui32 i = 0; i < kDefaultChannelCount; ++i) {
@@ -626,6 +868,7 @@ private:
         // For Lookup (Run/Delete), Hive replies NODATA when the OwnerIdx is
         // unknown (hive_impl.cpp:2236-2245).
         if (Op != EOp::Create && status == NKikimrProto::NODATA) {
+            if (Typed) { return ReplyOk("tablet already absent"); }
             return ReplyError(404, "tablet not found in Hive");
         }
         if (status != NKikimrProto::OK && status != NKikimrProto::ALREADY) {
@@ -635,6 +878,10 @@ private:
         TabletId = rec.GetTabletID();
 
         if (Op == EOp::Create) {
+            if (Typed) {
+                WaitingForTabletCreation = false;
+                return RequestStorageInfo();
+            }
             if (status == NKikimrProto::ALREADY) {
                 // Tablet was previously created by Hive but we don't know whether
                 // its TEvNbsLoadTabletAllocateGroups succeeded. Bypass TEvTabletCreationResult
@@ -683,14 +930,14 @@ private:
         LOG_D("Opened tablet pipe Op# " << OpName(Op)
             << " TabletId# " << TabletId
             << " TabletPipe# " << TabletPipe);
+        if (Typed && Existing) {
+            NTabletPipe::SendData(SelfId(), TabletPipe, new TEvLoad::TEvNbsLoadTabletGetSummary);
+            return;
+        }
         switch (Op) {
             case EOp::Create: {
                 auto ev = std::make_unique<TEvLoad::TEvNbsLoadTabletAllocateGroups>();
-                NKikimr::TEvLoadTestRequest::TNbsDbgLikeLoad::TAllocConfig cfg;
-                if (!google::protobuf::TextFormat::ParseFromString(ConfigText, &cfg)) {
-                    return ReplyError(400, "failed to parse AllocConfig text-proto");
-                }
-                *ev->Record.MutableAllocConfig() = std::move(cfg);
+                *ev->Record.MutableAllocConfig() = Allocation;
                 LOG_D("Dispatch tablet create request TabletId# " << TabletId);
                 NTabletPipe::SendData(SelfId(), TabletPipe, ev.release());
                 break;
@@ -709,6 +956,10 @@ private:
         if (rec.GetStatus() == NBSLT_OK) {
             LOG_N("Tablet create completed TabletId# " << TabletId);
             return ReplyOk("Tablet created");
+        }
+        if (Typed && rec.GetStatus() == NBSLT_ALREADY_INITIALIZED) {
+            NTabletPipe::SendData(SelfId(), TabletPipe, new TEvLoad::TEvNbsLoadTabletGetSummary);
+            return;
         }
         if (rec.GetStatus() == NBSLT_ALREADY_INITIALIZED) {
             LOG_N("Tablet already initialized TabletId# " << TabletId);
@@ -756,11 +1007,12 @@ private:
 
     void Handle(TEvTabletPipe::TEvClientDestroyed::TPtr&) {}
 
-    void HandleTimeout(TEvents::TEvWakeup::TPtr&) {
+    void HandleTimeout(TEvents::TEvWakeup::TPtr& ev) {
+        if (ev->Get()->Tag == 1) { return RequestStorageInfo(); }
         LOG_E("Operation timeout Op# " << OpName(Op)
             << " OwnerIdx# " << OwnerIdx
             << " TabletId# " << TabletId);
-        ReplyError(504, "operation timeout");
+        ReplyError(504, WaitingForStorageInfo ? "channel assignment deadline expired" : "operation timeout");
     }
 
     static TString FormatBytes(ui64 bytes) {
@@ -799,6 +1051,7 @@ private:
     }
 
     void ReplyOk(const TString& message) {
+        if (Typed) { return ReplyControl(1, {}); }
         TStringStream html;
         html << "<div class='alert alert-success'>"
              << "<strong>" << HtmlEscape(message) << "</strong>";
@@ -808,6 +1061,7 @@ private:
     }
 
     void ReplyAlready(const TString& message) {
+        if (Typed) { return ReplyControl(128, "allocation already exists; inspect and retry matching configuration"); }
         TStringStream html;
         html << "<div class='alert alert-warning'>"
              << "<strong>" << HtmlEscape(message) << "</strong>";
@@ -817,6 +1071,7 @@ private:
     }
 
     void ReplyError(ui32 httpStatus, const TString& msg) {
+        if (Typed) { return ReplyControl(128, msg); }
         LOG_E("Reply error Op# " << OpName(Op)
             << " HttpStatus# " << httpStatus
             << " Reason# " << msg);
@@ -827,6 +1082,19 @@ private:
         if (TabletId) html << " &nbsp; (TabletId=" << TabletId << ")";
         html << "</div>";
         ReplyHtml(httpStatus, html.Str());
+    }
+
+    void ReplyControl(ui32 status, const TString& error) {
+        auto response = std::make_unique<TEvLoad::TEvNbsLoadControlResponse>();
+        response->Record.SetStatus(status);
+        response->Record.SetError(error);
+        if (TabletId) {
+            auto* tablet = response->Record.AddTablets();
+            tablet->SetTabletId(TabletId);
+            tablet->SetOwnerIndex(OwnerIdx);
+        }
+        Send(Origin, response.release(), 0, ControlCookie);
+        Cleanup();
     }
 
     void ReplyHtml(ui32 httpStatus, const TString& body) {
@@ -863,6 +1131,10 @@ private:
     STRICT_STFUNC(StateWork,
         hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle)
         hFunc(TEvHive::TEvCreateTabletReply, Handle)
+        hFunc(TEvHive::TEvResponseHiveInfo, HandleHiveInfo)
+        hFunc(TEvHive::TEvGetTabletStorageInfoResult, HandleStorageInfo)
+        hFunc(TEvHive::TEvGetTabletStorageInfoRegistered, HandleStorageRegistered)
+        hFunc(TEvLoad::TEvNbsLoadTabletGetSummaryResult, HandleSummary)
         hFunc(TEvHive::TEvTabletCreationResult, Handle)
         hFunc(TEvHive::TEvDeleteTabletReply, Handle)
         hFunc(TEvLoad::TEvNbsLoadTabletAllocateGroupsResult, Handle)
@@ -888,6 +1160,11 @@ private:
     const ui32 SubRequestId;
     const std::vector<TString> StoragePoolNames;
 
+    bool Existing = false;
+    bool WaitingForStorageInfo = false;
+    bool Typed = false;
+    ui64 ControlCookie = 0;
+    NKikimr::TEvLoadTestRequest::TNbsDbgLikeLoad::TAllocConfig Allocation;
     TActorId HivePipe;
     TActorId TabletPipe;
     TString TenantName;
@@ -899,7 +1176,56 @@ private:
     bool WaitingForTabletCreation = false;
 };
 
+class TNbsLoadServiceProbe : public TActorBootstrapped<TNbsLoadServiceProbe> {
+    NKikimrClient::TNbsLoadControl Request;
+    TActorId Origin;
+    ui64 Cookie;
+public:
+    TNbsLoadServiceProbe(const NKikimrClient::TNbsLoadControl& request, TActorId origin, ui64 cookie)
+        : Request(request), Origin(origin), Cookie(cookie) {}
+    void Bootstrap() {
+        Become(&TThis::StateWork);
+        auto event = std::make_unique<TEvLoad::TEvNbsLoadControl>();
+        event->Record = Request;
+        Send(MakeLoadServiceID(Request.GetCoordinatorNodeId()), event.release(), IEventHandle::FlagTrackDelivery);
+        Schedule(TDuration::Seconds(Request.GetStartupTimeoutSeconds()), new TEvents::TEvWakeup);
+    }
+    void Handle(TEvLoad::TEvNbsLoadControlResponse::TPtr& ev) {
+        auto event = std::make_unique<TEvLoad::TEvNbsLoadControlResponse>();
+        event->Record = ev->Get()->Record;
+        Send(Origin, event.release(), 0, Cookie);
+        PassAway();
+    }
+    void Fail() {
+        auto event = std::make_unique<TEvLoad::TEvNbsLoadControlResponse>();
+        event->Record.SetStatus(128);
+        event->Record.SetError("remote load service unavailable or capability deadline exceeded");
+        Send(Origin, event.release(), 0, Cookie);
+        PassAway();
+    }
+    STRICT_STFUNC(StateWork,
+        hFunc(TEvLoad::TEvNbsLoadControlResponse, Handle)
+        cFunc(TEvents::TSystem::Undelivered, Fail)
+        cFunc(TEvents::TSystem::Wakeup, Fail)
+    )
+};
+
 } // anonymous namespace
+
+NActors::IActor* CreateNbsLoadServiceProbe(const NKikimrClient::TNbsLoadControl& request, TActorId origin, ui64 cookie) {
+    return new TNbsLoadServiceProbe(request, origin, cookie);
+}
+
+NActors::IActor* CreateNbsLoadTabletControl(
+    const NKikimrClient::TNbsLoadControl& request, TActorId origin, ui64 cookie)
+{
+    return new TNbsLoadTabletRequestActor(request, origin, cookie);
+}
+
+NActors::IActor* CreateNbsLoadTabletListControl(const NKikimrClient::TNbsLoadControl& request,
+    TActorId origin, ui64 cookie) {
+    return new TNbsLoadTabletListPageActor(request, origin, cookie);
+}
 
 NActors::IActor* CreateNbsDbgLikeLoadTabletHttpRequest(
     ENbsLoadTabletOp op, ui64 ownerIdx, TString configText,

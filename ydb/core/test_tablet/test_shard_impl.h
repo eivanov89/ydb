@@ -80,6 +80,12 @@ namespace NKikimr::NTestShard {
                     Execute(CreateTxInitialize(record.GetInitialize(), ev->Sender, ev->Cookie), ctx);
                     break;
 
+                case NKikimrClient::TTestShardControlRequest::kNbsLoadControl:
+                    // This command belongs to the load service, never to a TestShard tablet.
+                    ctx.Send(ev->Sender, new TEvents::TEvUndelivered(
+                        ev->GetTypeRewrite(), TEvents::TEvUndelivered::ReasonUnknown), 0, ev->Cookie);
+                    break;
+
                 case NKikimrClient::TTestShardControlRequest::COMMAND_NOT_SET:
                     break;
             }

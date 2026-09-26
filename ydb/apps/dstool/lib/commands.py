@@ -60,12 +60,15 @@ try:
 except ImportError:
     _nbs_partition_modules = []
 
+import ydb.apps.dstool.lib.dstool_cmd_nbs_load as nbs_load
+
 import sys
 import ydb.apps.dstool.lib.common as common
 
 MODULE_PREFIX = 'dstool_cmd_'
 
 modules = [
+    nbs_load,
     cluster_balance, cluster_get, cluster_set, cluster_list, cluster_workload_run,
     node_list,
     box_list,
@@ -78,6 +81,7 @@ modules = [
 ]
 
 default_structure = [
+    'nbs-load',
     ('device', ['list']),
     ('pdisk', ['add-by-serial', 'remove-by-serial', 'set', 'list', 'stop', 'restart', 'readonly', 'move', 'populate']),
     ('vdisk', ['evict', 'list', 'set-read-only', 'remove-donor', 'wipe', 'compact']),

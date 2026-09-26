@@ -6,6 +6,8 @@ PY_SRCS(
     cluster_workload_config.py
     commands.py
     common.py
+    nbs_load.py
+    dstool_cmd_nbs_load.py
     grouptool.py
     table.py
 

@@ -1,4 +1,6 @@
 #include "service_actor.h"
+#include "nbs_load_registry.h"
+#include <library/cpp/svnversion/svnversion.h>
 
 #include "events.h"
 #include "nbs_dbg_like_load.h"
@@ -249,7 +251,7 @@ class TLoadActor : public TActorBootstrapped<TLoadActor> {
     TActorId RecordInsertionActor;
 
     // key is a tag, value is an actor that sent the request to this node
-    THashMap<ui32, TActorId> RequestSender;
+    THashMap<ui64, TActorId> RequestSender;
 
     // currently running load actors
     TMap<ui64, TActorId> LoadActors;
@@ -478,6 +480,302 @@ public:
         Become(&TLoadActor::StateFunc);
     }
 
+    using TNbsControl = NKikimrClient::TNbsLoadControl;
+    using TNbsResult = NKikimrClient::TNbsLoadResult;
+    NNbsDbgLike::TRunRegistry NbsRuns;
+    THashMap<ui64, TString> NbsRunByTag;
+    struct TNbsPending {
+        TNbsControl Request;
+        TActorId Origin;
+        ui64 Cookie = 0;
+        bool Executing = false;
+    };
+    THashMap<ui64, TNbsPending> NbsPending;
+    ui64 NextNbsCookie = 1;
+
+    TString NbsDatabase() const {
+        if (AppData()->TenantName) {
+            return AppData()->TenantName;
+        }
+        if (const auto* info = AppData()->DomainsInfo.Get(); info && info->Domain) {
+            return "/" + info->Domain->Name;
+        }
+        return {};
+    }
+
+    void NbsReply(const TActorId& origin, ui64 cookie, const TNbsControl& request,
+        NKikimrClient::TNbsLoadControlResponse response = {})
+    {
+        if (!response.HasStatus()) {
+            response.SetStatus(NMsgBusProxy::MSTATUS_OK);
+        }
+        response.SetProtocolVersion(1);
+        response.SetCoordinatorNodeId(SelfId().NodeId());
+        response.SetIncarnation(NbsRuns.Incarnation);
+        response.SetDatabase(NbsDatabase());
+        response.SetRequestId(request.GetRequestId());
+        if (response.HasRun()) {
+            if (auto it = NbsRuns.Runs.find(request.GetRequestId()); it != NbsRuns.Runs.end()) {
+                for (const auto& tablet : it->second.Placements) { *response.AddTablets() = tablet; }
+            }
+        }
+        auto event = std::make_unique<TEvLoad::TEvNbsLoadControlResponse>();
+        event->Record = std::move(response);
+        Send(origin, event.release(), 0, cookie);
+    }
+
+    void NbsError(const TActorId& origin, ui64 cookie, const TNbsControl& request, const TString& error) {
+        NKikimrClient::TNbsLoadControlResponse response;
+        response.SetStatus(NMsgBusProxy::MSTATUS_ERROR);
+        response.SetError(error);
+        NbsReply(origin, cookie, request, std::move(response));
+    }
+
+    bool NbsTabletBusy(ui64 tabletId) const {
+        for (const auto& [cookie, pending] : NbsPending) {
+            if (pending.Request.GetOperation() == TNbsControl::DELETE
+                && pending.Request.GetTabletId() == tabletId) {
+                return true;
+            }
+        }
+        for (const auto& [id, run] : NbsRuns.Runs) {
+            if (!NNbsDbgLike::TRunRegistry::Active(run) && run.Result.GetTerminationConfirmed()) {
+                continue;
+            }
+            const auto& load = run.Input.GetLoad().GetNbsDbgLikeLoad();
+            if (load.GetNbsDbgLikeTabletId() == tabletId) {
+                return true;
+            }
+            for (const auto& target : load.GetTargets()) {
+                if (target.GetTabletId() == tabletId) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void NbsFailRun(NNbsDbgLike::TRunRegistry::TRun& run, const TString& error) {
+        run.Result.SetState(TNbsResult::FAILED);
+        run.Result.SetTerminationConfirmed(true);
+        run.Result.SetExecutionError(error);
+        run.Result.SetFinishedAtMs(TAppData::TimeProvider->Now().MilliSeconds());
+    }
+
+    void Handle(TEvLoad::TEvNbsLoadControl::TPtr& ev) {
+        const auto& request = ev->Get()->Record;
+        const auto op = request.GetOperation();
+        auto fail = [&](const TString& error) { NbsError(ev->Sender, ev->Cookie, request, error); };
+        NbsRuns.Prune(TAppData::TimeProvider->Now());
+        if (!request.HasOperation()) { return fail("explicit operation is required"); }
+        if (request.GetDatabase().empty() || request.GetDatabase() != NbsDatabase()) {
+            return fail("explicit database does not match coordinator database context");
+        }
+        if (op == TNbsControl::CAPABILITIES) {
+            NKikimrClient::TNbsLoadControlResponse response;
+            for (auto operation : {TNbsControl::CAPABILITIES, TNbsControl::CREATE, TNbsControl::LIST,
+                TNbsControl::DESCRIBE, TNbsControl::DELETE, TNbsControl::START, TNbsControl::GET, TNbsControl::STOP}) {
+                response.AddOperations(operation);
+            }
+            return NbsReply(ev->Sender, ev->Cookie, request, std::move(response));
+        }
+        if (request.GetIncarnation() != NbsRuns.Incarnation) {
+            return fail("coordinator incarnation lost; remote workers may still be running");
+        }
+        if (op == TNbsControl::GET || op == TNbsControl::STOP) {
+            auto it = NbsRuns.Runs.find(request.GetRequestId());
+            if (it == NbsRuns.Runs.end()) {
+                return fail("unknown or expired run; never automatically submit replacement work");
+            }
+            auto& run = it->second;
+            if (op == TNbsControl::STOP && NNbsDbgLike::TRunRegistry::Active(run)) {
+                run.Result.SetState(TNbsResult::STOPPING);
+                if (auto actor = LoadActors.find(run.Tag); run.Tag && actor != LoadActors.end()) {
+                    Send(actor->second, new TEvents::TEvPoisonPill);
+                }
+            }
+            NKikimrClient::TNbsLoadControlResponse response;
+            *response.MutableRun() = run.Result;
+            return NbsReply(ev->Sender, ev->Cookie, request, std::move(response));
+        }
+        if (op == TNbsControl::START) {
+            const auto& load = request.GetLoad();
+            const auto& cmd = load.GetNbsDbgLikeLoad();
+            const auto& wc = cmd.GetWorkloadConfig();
+            if (request.GetRequestId().empty() || request.GetRequestId().size() > 128
+                || !load.HasNbsDbgLikeLoad() || load.HasTag() || load.HasUuid() || load.HasCookie() || load.HasTimestamp()
+                || cmd.HasTag() || wc.HasTag() || cmd.HasRequireReady() || cmd.HasStartupTimeoutSeconds()
+                || wc.GetTabletConfig().HasConfigurationId()
+                || !wc.GetDurationSeconds() || !wc.GetMaxInFlight() || !request.GetStartupTimeoutSeconds()) {
+                return fail("invalid automation request: positive duration, inflight limit, request ID and startup budget required; service bookkeeping forbidden");
+            }
+            if (auto it = NbsRuns.Runs.find(request.GetRequestId()); it != NbsRuns.Runs.end()) {
+                if (!NNbsDbgLike::TRunRegistry::SameInput(it->second.Input, request)) {
+                    return fail("request ID conflicts with original logical inputs");
+                }
+                NKikimrClient::TNbsLoadControlResponse response;
+                *response.MutableRun() = it->second.Result;
+                return NbsReply(ev->Sender, ev->Cookie, request, std::move(response));
+            }
+            THashSet<ui64> targets;
+            if (cmd.GetNbsDbgLikeTabletId()) {
+                targets.insert(cmd.GetNbsDbgLikeTabletId());
+            }
+            if (cmd.TargetsSize() && !targets.empty()) {
+                return fail("specify either single tablet ID or Targets");
+            }
+            for (const auto& target : cmd.GetTargets()) {
+                if (!target.GetTabletId() || !targets.insert(target.GetTabletId()).second) {
+                    return fail("target IDs must be nonzero and unique");
+                }
+            }
+            if (targets.empty()) {
+                return fail("no target tablets");
+            }
+            for (ui64 id : targets) {
+                if (NbsTabletBusy(id)) { return fail("target tablet has an active run on this coordinator"); }
+            }
+            TString error;
+            auto* run = NbsRuns.Admit(request, TAppData::TimeProvider->Now(), error);
+            if (!run) { return fail(error); }
+            run->Result.SetBuild(GetProgramSvnVersion());
+            NKikimrClient::TNbsLoadControlResponse response;
+            *response.MutableRun() = run->Result;
+            NbsReply(ev->Sender, ev->Cookie, request, std::move(response));
+        } else if (op != TNbsControl::CREATE && op != TNbsControl::LIST
+            && op != TNbsControl::DESCRIBE && op != TNbsControl::DELETE) {
+            return fail("unsupported control operation");
+        }
+        const ui64 cookie = NextNbsCookie++;
+        NbsPending.emplace(cookie, TNbsPending{request, ev->Sender, ev->Cookie});
+        if (op == TNbsControl::CREATE) {
+            if (!request.HasOwnerIndex()) {
+                NbsPending.erase(cookie);
+                return fail("explicit owner index required for lifecycle operations");
+            }
+            NbsPending[cookie].Executing = true;
+            Register(NNbsDbgLike::CreateNbsLoadTabletControl(request, SelfId(), cookie));
+        } else {
+            Register(NNbsDbgLike::CreateNbsLoadTabletListControl(request, SelfId(), cookie));
+        }
+    }
+
+    void StartNbsRun(NNbsDbgLike::TRunRegistry::TRun& run) {
+        const auto& request = run.Input;
+        auto load = run.Result.GetEffectiveConfig();
+        while (TakenTags.contains(NextTag) || LoadActors.contains(NextTag)) { ++NextTag; }
+        run.Tag = NextTag++;
+        load.SetTag(run.Tag);
+        load.SetUuid(request.GetRequestId());
+        NbsRunByTag.emplace(run.Tag, request.GetRequestId());
+        try {
+            ProcessCmd(load);
+        } catch (const std::exception& error) {
+            NbsRunByTag.erase(run.Tag);
+            NbsFailRun(run, error.what());
+        }
+    }
+
+    void Handle(TEvLoad::TEvNbsLoadControlResponse::TPtr& ev) {
+        auto it = NbsPending.find(ev->Cookie);
+        if (it == NbsPending.end()) { return; }
+        auto pending = it->second;
+        NbsPending.erase(it);
+        auto response = ev->Get()->Record;
+        const auto& request = pending.Request;
+        if (request.GetOperation() == TNbsControl::START) {
+            auto& run = NbsRuns.Runs.at(request.GetRequestId());
+            if (run.Result.HasFinishedAtMs()) { return; }
+            if (run.Result.GetState() == TNbsResult::STOPPING) {
+                run.Result.SetState(TNbsResult::CANCELLED);
+                run.Result.SetTerminationConfirmed(true);
+                run.Result.SetFinishedAtMs(TAppData::TimeProvider->Now().MilliSeconds());
+                return;
+            }
+            if (response.GetStatus() != NMsgBusProxy::MSTATUS_OK) {
+                return NbsFailRun(run, response.GetError());
+            }
+            if (pending.Executing) {
+                if (response.GetProtocolVersion() != 1 || response.GetDatabase() != request.GetDatabase()) {
+                    return NbsFailRun(run, "remote service protocol or database mismatch");
+                }
+                if (--run.PendingCapabilities == 0) { StartNbsRun(run); }
+                return;
+            }
+            auto* cmd = run.Result.MutableEffectiveConfig()->MutableNbsDbgLikeLoad();
+            if (cmd->GetNbsDbgLikeTabletId()) {
+                cmd->AddTargets()->SetTabletId(cmd->GetNbsDbgLikeTabletId());
+                cmd->ClearNbsDbgLikeTabletId();
+            }
+            for (auto& target : *cmd->MutableTargets()) {
+                bool found = false;
+                for (const auto& tablet : response.GetTablets()) {
+                    if (target.GetTabletId() != tablet.GetTabletId()) { continue; }
+                    found = true;
+                    run.Placements.push_back(tablet);
+                    if (tablet.GetSummary().GetAutomationProtocolVersion() < 1) {
+                        return NbsFailRun(run, "tablet unavailable or required protocol unsupported");
+                    }
+                    if (!target.HasNodeId()) {
+                        if (!tablet.GetNodeId()) { return NbsFailRun(run, "tablet placement unavailable"); }
+                        target.SetNodeId(tablet.GetNodeId());
+                    } else if (!target.GetNodeId()) {
+                        target.SetNodeId(SelfId().NodeId());
+                    }
+                    break;
+                }
+                if (!found) { return NbsFailRun(run, "target is not a dedicated load tablet in this database"); }
+            }
+            cmd->SetRequireReady(true);
+            cmd->SetStartupTimeoutSeconds(request.GetStartupTimeoutSeconds());
+            THashSet<ui32> nodes;
+            for (const auto& target : cmd->GetTargets()) { nodes.insert(target.GetNodeId()); }
+            run.PendingCapabilities = nodes.size();
+            for (ui32 node : nodes) {
+                TNbsControl probe;
+                probe.SetOperation(TNbsControl::CAPABILITIES);
+                probe.SetDatabase(request.GetDatabase());
+                probe.SetCoordinatorNodeId(node);
+                probe.SetStartupTimeoutSeconds(request.GetStartupTimeoutSeconds());
+                const ui64 cookie = NextNbsCookie++;
+                auto check = pending;
+                check.Executing = true;
+                NbsPending.emplace(cookie, std::move(check));
+                Register(NNbsDbgLike::CreateNbsLoadServiceProbe(probe, SelfId(), cookie));
+            }
+            return;
+        }
+        if (pending.Executing || response.GetStatus() != NMsgBusProxy::MSTATUS_OK
+            || request.GetOperation() == TNbsControl::LIST) {
+            return NbsReply(pending.Origin, pending.Cookie, request, std::move(response));
+        }
+        const NKikimrClient::TNbsLoadTablet* found = nullptr;
+        for (const auto& tablet : response.GetTablets()) {
+            if ((request.HasTabletId() && tablet.GetTabletId() == request.GetTabletId())
+                || (request.HasOwnerIndex() && tablet.GetOwnerIndex() == request.GetOwnerIndex())) {
+                found = &tablet;
+                break;
+            }
+        }
+        if (request.GetOperation() == TNbsControl::DESCRIBE) {
+            if (!found) { return NbsError(pending.Origin, pending.Cookie, request, "tablet not found in database"); }
+            auto tablet = *found;
+            response.ClearTablets();
+            *response.AddTablets() = std::move(tablet);
+            return NbsReply(pending.Origin, pending.Cookie, request, std::move(response));
+        }
+        if (request.GetOperation() == TNbsControl::DELETE && found && NbsTabletBusy(found->GetTabletId())) {
+            return NbsError(pending.Origin, pending.Cookie, request, "tablet has an active run on this coordinator");
+        }
+        if (!request.HasOwnerIndex()) {
+            return NbsError(pending.Origin, pending.Cookie, request, "explicit owner index required for lifecycle operations");
+        }
+        if (found) { pending.Request.SetTabletId(found->GetTabletId()); }
+        pending.Executing = true;
+        NbsPending.emplace(ev->Cookie, pending);
+        Register(NNbsDbgLike::CreateNbsLoadTabletControl(request, SelfId(), ev->Cookie));
+    }
+
     void Handle(TEvLoad::TEvLoadTestRequest::TPtr& ev) {
         const auto& record = GetFixedRequest(ev);
         LOG_N("Load test request arrived from " << ev->Sender.ToString() <<
@@ -485,16 +783,26 @@ public:
             ", uuid# " << record.GetUuid());
         ui32 status = NMsgBusProxy::MSTATUS_OK;
         TString error;
+        bool registered = false;
         try {
-            Y_ENSURE(!RequestSender.contains(record.GetTag()),
-                "node is currently handling another request with tag# " << record.GetTag());
-            RequestSender[record.GetTag()] = ev->Sender;
-            UuidByTag[record.GetTag()] = record.GetUuid();
+            if (!record.HasStop()) {
+                if (RequestSender.contains(record.GetTag())) {
+                    ythrow TLoadActorException() << "node is currently handling another request with tag# " << record.GetTag();
+                }
+                registered = true;
+                RequestSender[record.GetTag()] = ev->Sender;
+                UuidByTag[record.GetTag()] = record.GetUuid();
+            }
             ProcessCmd(record);
         } catch (const TLoadActorException& ex) {
             LOG_E("Exception while creating load actor, what# " << ex.what());
             status = NMsgBusProxy::MSTATUS_ERROR;
             error = ex.what();
+        }
+        if (registered && status != NMsgBusProxy::MSTATUS_OK) {
+            RequestSender.erase(record.GetTag());
+            UuidByTag.erase(record.GetTag());
+            TakenTags.erase(record.GetTag());
         }
         auto response = std::make_unique<TEvLoad::TEvLoadTestResponse>();
         response->Record.SetStatus(status);
@@ -747,6 +1055,42 @@ public:
         LoadActors.erase(iter);
         const TInstant finishTime = TAppData::TimeProvider->Now();
 
+        if (auto it = NbsRunByTag.find(msg->Tag); it != NbsRunByTag.end()) {
+            auto& run = NbsRuns.Runs.at(it->second);
+            const bool stopping = run.Result.GetState() == TNbsResult::STOPPING;
+            run.Result.SetState(stopping && msg->TerminationConfirmed ? TNbsResult::CANCELLED
+                : (msg->ErrorReason.empty() ? TNbsResult::SUCCEEDED : TNbsResult::FAILED));
+            run.Result.SetTerminationConfirmed(msg->TerminationConfirmed);
+            run.Result.SetExecutionError(msg->ErrorReason);
+            run.Result.SetFinishedAtMs(finishTime.MilliSeconds());
+            if (const auto* stats = GetNbsDbgLikeFinishStats(*msg)) {
+                FillNbsStats(*stats, *run.Result.MutableStats());
+                const double seconds = stats->MeasuredMs / 1000.0;
+                if (seconds > 0) {
+                    run.Result.SetWriteIOPS(stats->WritesOk / seconds);
+                    run.Result.SetReadIOPS((stats->ReadsPbOk + stats->ReadsDDiskOk) / seconds);
+                    run.Result.SetWriteBytesPerSecond(stats->WriteBytes / seconds);
+                    run.Result.SetReadBytesPerSecond((stats->ReadsPbBytes + stats->ReadsDDiskBytes) / seconds);
+                }
+            } else {
+                run.Result.SetState(TNbsResult::FAILED);
+                run.Result.SetExecutionError("worker returned no typed execution statistics");
+            }
+            for (const auto& tablet : msg->NbsTablets) {
+                *run.Result.AddTablets() = tablet;
+            }
+            if (!msg->TerminationConfirmed) {
+                // A watchdog or lost pipe cannot prove that remote requests drained.
+                run.Result.SetState(TNbsResult::STOPPING);
+                run.Result.ClearFinishedAtMs();
+                if (run.Result.GetExecutionError().empty()) {
+                    run.Result.SetExecutionError("termination is unconfirmed; workers or requests may still be active");
+                }
+            }
+            NbsRunByTag.erase(it);
+            return;
+        }
+
         Y_ENSURE(UuidByTag.contains(msg->Tag), "Not found uuid corresponding for tag# " << msg->Tag);
         {
             auto nodeFinishResponse = MakeHolder<TEvLoad::TEvNodeFinishResponse>();
@@ -755,6 +1099,7 @@ public:
             record.SetUuid(uuid);
             record.SetNodeId(SelfId().NodeId());
             record.SetSuccess(msg->Report != nullptr);
+            record.SetNbsTerminationConfirmed(msg->TerminationConfirmed);
             record.SetFinishTimestamp(finishTime.Seconds());
             record.SetErrorReason(msg->ErrorReason);
 
@@ -809,6 +1154,10 @@ public:
             LOG_N("Sending TEvNodeFinishResponse back to sender# " << requestSender.ToString());
             Send(requestSender, nodeFinishResponse.Release());
             RequestSender.erase(msg->Tag);
+            if (!RequestsInProcessing.contains(uuid)) {
+                UuidByTag.erase(msg->Tag);
+                TakenTags.erase(msg->Tag);
+            }
         }
 
         auto it = InfoRequests.begin();
@@ -942,7 +1291,12 @@ public:
             // send messages to subactors
             info.HttpInfoResPending = 0;
             for (const auto& [tag, actorId] : LoadActors) {
-                auto reqIt = RequestsInProcessing.find(UuidByTag.at(tag));
+                if (NbsRunByTag.contains(tag)) {
+                    continue;
+                }
+                auto uuidIt = UuidByTag.find(tag);
+                auto reqIt = uuidIt == UuidByTag.end() ? RequestsInProcessing.end()
+                    : RequestsInProcessing.find(uuidIt->second);
                 if (info.ResultsUuid) {
                     if (reqIt == RequestsInProcessing.end() || reqIt->second.GetUuid() != info.ResultsUuid) {
                         continue;
@@ -1655,6 +2009,8 @@ public:
         hFunc(TEvLoad::TEvLoadTestRequest, Handle)
         hFunc(TEvLoad::TEvLoadTestResponse, Handle)
         hFunc(TEvLoad::TEvLoadTestFinished, Handle)
+        hFunc(TEvLoad::TEvNbsLoadControl, Handle)
+        hFunc(TEvLoad::TEvNbsLoadControlResponse, Handle)
         hFunc(TEvLoad::TEvNodeFinishResponse, Handle)
         hFunc(TEvLoad::TEvNbsTabletListPageReady, Handle)
         hFunc(NMon::TEvHttpInfo, Handle)
