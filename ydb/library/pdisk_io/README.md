@@ -17,7 +17,7 @@ for those layers.
 | [uring_router.h](uring_router.h), [uring_router.cpp](uring_router.cpp) | One io_uring and its dedicated I/O thread |
 | [uring_router_client.h](uring_router_client.h) | Submit-only interface and shared router configuration |
 | [uring_router_backend.h](uring_router_backend.h) | Backend seam used to isolate liburing calls in tests |
-| [uring_operation.h](uring_operation.h), [uring_operation.cpp](uring_operation.cpp) | Operation lifetime, scalar/scatter-gather buffers, result and retry cursor |
+| [uring_operation.h](uring_operation.h), [uring_operation.cpp](uring_operation.cpp) | Operation lifetime, scalar/scatter-gather buffers, independent read ranges and completion cursors |
 | [buffers.h](buffers.h), [buffer_pool.h](buffer_pool.h) | Aligned buffers and pooling |
 | [file_params.h](file_params.h), [drivedata.h](drivedata.h), [device_type.h](device_type.h) | File/device geometry and drive information |
 | [device_io_sample.h](device_io_sample.h) | Timing sample exchanged with device estimation |
@@ -118,6 +118,45 @@ operation must call `ResetSubmissionState()` before preparing new I/O; do not
 carry its previous offset, result, fixed-buffer index or retry cursor forward.
 Alignment requirements come from the opened device and caller contract.
 
+`PrepareReadParts` accepts a nonempty array of `TReadPart` descriptors containing
+independent `{DiskOffset, Size, Buffer}` ranges. Every size must be positive;
+offset and total-size arithmetic is checked. Preparation copies the descriptors,
+including when the input is a slice of the operation's own `GetReadParts()`
+array. Callers retain every backing buffer through the terminal callback.
+One range uses the scalar path. Multiple ranges use stable internal cursors
+with independent offsets, destinations and short-read progress. Their number
+may exceed both SQ depth and the 64-segment scatter/gather limit.
+
+Submit the prepared operation through the existing read interface. Operations
+with read-part descriptors require `EREAD`; `Submit` checks this programmer
+contract synchronously before admission. The complete set is one admitted
+parent with one terminal callback after all ranges retire. `GetInflight()`
+counts parent admissions, not outstanding physical requests. Only the parent
+enters the producer queue.
+When the SQ is full, the router retains unissued ranges; a freed SQ slot lets
+the next range proceed without waiting for an earlier range's completion.
+Each short read continues independently. Scheduling does not guarantee fairness
+between a pending parent's ranges and other operations. Fixed-file registration
+applies to these submissions as usual; multipart reads do not use fixed buffers.
+
+`GetReadPartResult(index)` retains each range's requested byte count on success
+or a negative errno on failure, in descriptor order. Zero progress with bytes
+remaining becomes `-EIO`. `GetResult()` reports the total requested bytes on
+success, or the first negative result in descriptor order regardless of
+completion order. Device samples and short-I/O accounting describe physical
+submissions. Caller-side backends may populate the slots with
+`SetReadPartResult` and supply the aggregate with `SetResult`. Every multipart
+resubmission requires a new `PrepareReadParts` call and a new admission; for a
+selective retry, prepare only the selected ranges. Rejection leaves the parent
+and all buffers with the caller and delivers no callback. Recycling or preparing
+a different operation shape clears multipart state.
+
+In `DevNullMode`, the I/O thread zero-fills every multipart buffer, sets each
+range's result to its requested size and completes the parent with the total
+byte count. It preserves CPU accounting and emits no data SQEs or device
+samples. Each drain pass processes at most `QueueDepth` synthetic parents,
+including multipart parents, before returning to other I/O-thread work.
+
 ## Shutdown
 
 `StopAsync()` atomically closes admission and returns without waiting. A
@@ -134,6 +173,12 @@ work with an `IOSQE_IO_DRAIN` marker. Short-I/O continuations canceled by
 shutdown complete with `-ECANCELED`. Normal shutdown has no drain deadline.
 Callback state and backing buffers must survive until their terminal callbacks
 return; the actor system must remain usable through `StopSync()`.
+
+For multipart reads, shutdown cancels unissued ranges and pending short-read
+continuations with `-ECANCELED`, while draining submitted siblings. The parent
+gets `OnDrop()` if no range reached the kernel; otherwise it gets `OnComplete()`
+after all ranges retire. The callback may delete or recycle the parent, and
+the router never accesses its descriptors, cursors or buffers afterward.
 
 Before returning, `StopSync()` destroys the ring and closes the duplicated
 device handle. The wake eventfd remains valid until router destruction, which
