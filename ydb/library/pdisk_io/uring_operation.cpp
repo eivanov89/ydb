@@ -34,6 +34,8 @@ void TUringOperationBase::PrepareIov(void* buf, size_t size, ui64 offset) {
 
 void TUringOperationBase::PrepareReadParts(TConstArrayRef<TReadPart> parts) {
     Y_ABORT_UNLESS(!parts.empty());
+    Y_ABORT_UNLESS(parts.size() <= MAX_MULTI_PARTS,
+        "PrepareReadParts accepts at most MAX_MULTI_PARTS ranges");
     // The singleton keeps the existing scalar submission and completion path.
     // Copy it first because the supplied descriptors may belong to this object.
     const TReadPart first = parts.front();

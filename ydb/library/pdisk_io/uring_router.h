@@ -213,9 +213,11 @@ private:
 
     struct io_uring_sqe* GetSqe();
     void PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op);
+
     static bool IsReadPart(const TUringOperationBase* op);
     static TUringOperationBase::TReadCursor* GetReadCursor(TUringOperationBase* op);
     static TUringOperationBase* EncodeReadCursor(TUringOperationBase::TReadCursor* cursor);
+
     void PrepareReadPartSqe(struct io_uring_sqe* sqe, TUringOperationBase::TReadCursor* cursor);
     void ReapReadPart(TUringOperationBase::TReadCursor* cursor, i32 result);
     void CompleteReadPart(TUringOperationBase::TReadCursor* cursor, i64 result);

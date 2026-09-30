@@ -118,14 +118,15 @@ operation must call `ResetSubmissionState()` before preparing new I/O; do not
 carry its previous offset, result, fixed-buffer index or retry cursor forward.
 Alignment requirements come from the opened device and caller contract.
 
-`PrepareReadParts` accepts a nonempty array of `TReadPart` descriptors containing
-independent `{DiskOffset, Size, Buffer}` ranges. Every size must be positive;
-offset and total-size arithmetic is checked. Preparation copies the descriptors,
-including when the input is a slice of the operation's own `GetReadParts()`
-array. Callers retain every backing buffer through the terminal callback.
-One range uses the scalar path. Multiple ranges use stable internal cursors
-with independent offsets, destinations and short-read progress. Their number
-may exceed both SQ depth and the 64-segment scatter/gather limit.
+`PrepareReadParts` accepts 1 to `MAX_MULTI_PARTS` (2) `TReadPart` descriptors
+containing independent `{DiskOffset, Size, Buffer}` ranges. Requesting more
+than `MAX_MULTI_PARTS` aborts. The same limit will apply to multipart writes.
+Every size must be positive; offset and total-size arithmetic is checked.
+Preparation copies the descriptors, including when the input is a slice of the
+operation's own `GetReadParts()` array. Callers retain every backing buffer
+through the terminal callback. One range uses the scalar path. Multiple ranges
+use stable internal cursors with independent offsets, destinations and
+short-read progress.
 
 Submit the prepared operation through the existing read interface. Operations
 with read-part descriptors require `EREAD`; `Submit` checks this programmer

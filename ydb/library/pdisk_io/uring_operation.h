@@ -1,10 +1,9 @@
 #pragma once
 
-#include <util/system/types.h>
-#include <util/generic/array_ref.h>
 #include <library/cpp/containers/stack_vector/stack_vec.h>
 
-#include <vector>
+#include <util/generic/array_ref.h>
+#include <util/system/types.h>
 
 #if defined(__linux__)
 #include <sys/uio.h>
@@ -23,9 +22,17 @@ class TUringOperationBase {
 
 public:
     struct TReadPart {
-        ui64 DiskOffset;
-        size_t Size;
-        void* Buffer;
+        ui64 DiskOffset = 0;
+        size_t Size = 0;
+        void* Buffer = nullptr;
+
+        TReadPart() = default;
+
+        TReadPart(ui64 diskOffset, size_t size, void* buffer)
+            : DiskOffset(diskOffset)
+            , Size(size)
+            , Buffer(buffer)
+        {}
     };
 
     // NHPTimer cycle count captured by TUringRouter right before the operation
@@ -64,11 +71,16 @@ public:
     // buf must remain valid until OnComplete/OnDrop is called.
     void PrepareIov(void* buf, size_t size, ui64 offset);
 
-    // Independent disk ranges, completed as one accepted operation. Descriptors
-    // are copied; all buffers must survive the single terminal callback. Call
-    // again with only failed ranges to prepare a selective retry. Unlike
-    // scatter/gather, the number of ranges is not limited by MAX_IOVS or SQ depth.
+    // Maximum number of independent disk ranges in one multipart read or write.
+    // PrepareReadParts aborts when more ranges are requested.
+    static constexpr size_t MAX_MULTI_PARTS = 2;
+
+    // Independent disk ranges, completed as one accepted operation. The range
+    // count must be in [1, MAX_MULTI_PARTS]. Descriptors are copied; all buffers
+    // must survive the single terminal callback. Call again with only failed
+    // ranges to prepare a selective retry.
     void PrepareReadParts(TConstArrayRef<TReadPart> parts);
+
     TConstArrayRef<TReadPart> GetReadParts() const {
         return ReadParts;
     }
@@ -200,8 +212,10 @@ public:
 #endif
 
 private:
-    // Stable cursors are allocated only for a genuine multi-range read. An SQE
-    // refers to its cursor, never to a child operation or an additional admission.
+    // Stable cursors exist only for a genuine multi-range read. An SQE refers to
+    // its cursor, never to a child operation or an additional admission. Inline
+    // capacity is MAX_MULTI_PARTS, so a legal prepare cannot move a cursor out
+    // from under an SQE.
     struct TReadCursor {
         TUringOperationBase* Parent = nullptr;
         ui64 DiskOffset = 0;
@@ -214,8 +228,8 @@ private:
 #endif
     };
 
-    TStackVec<TReadPart, 1> ReadParts;
-    std::vector<TReadCursor> ReadCursors;
+    TStackVec<TReadPart, MAX_MULTI_PARTS> ReadParts;
+    TStackVec<TReadCursor, MAX_MULTI_PARTS> ReadCursors;
     size_t NextReadPart = 0;
     size_t RemainingReadParts = 0;
     bool ReadPartReachedKernel = false;

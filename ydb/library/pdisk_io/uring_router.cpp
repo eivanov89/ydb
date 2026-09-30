@@ -20,9 +20,9 @@
 
 #include <cerrno>
 #include <chrono>
-#include <optional>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <utility>
 
 using NActors::TActorSystem;
@@ -485,6 +485,7 @@ void TUringRouter::PrepareSqe(struct io_uring_sqe* sqe, TUringOperationBase* op)
         PrepareReadPartSqe(sqe, GetReadCursor(op));
         return;
     }
+
     // Use vectored SQEs for genuine scatter-gather and oversized singleton
     // requests; scalar SQEs take an unsigned byte count and would narrow the latter.
     const int fd = FixedFdIndex >= 0 ? FixedFdIndex : static_cast<FHANDLE>(Fd);
