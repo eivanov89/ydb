@@ -38,7 +38,16 @@ public:
     virtual bool IsRestoreIo() const noexcept { return false; }
     virtual bool IsIntegrityIo() const noexcept { return false; }
     virtual bool IsChunkFormatIo() const noexcept { return false; }
+    virtual bool IsReadPartsIo() const noexcept {
+        return false;
+    }
+
     bool IsCriticalDDiskIo() const noexcept { return IsIntegrityIo() || IsChunkFormatIo(); }
+
+    // Selective retries may submit fewer bytes than the original logical request.
+    virtual ui64 GetAccountingSize() const noexcept {
+        return GetTotalSize();
+    }
 
     virtual void ClearForRecycle() noexcept;
 
@@ -53,17 +62,20 @@ public:
 
     void SetCookie(ui64 cookie) { Cookie = cookie; }
     ui64 GetCookie() const { return Cookie; }
+    void SetCompletionCookie(ui64 cookie) {
+        CompletionCookie = cookie;
+    }
 
-    // Read-path integrity zero mask (TIntegrityManager::TReadPlan::Mixed): bit i covers the i-th
-    // IntegrityUnitSize block of the read range; unset bits are zero-filled before replying. Must
-    // live in the op because the reply happens on the uring I/O thread.
-    void SetReadUsedBlocksMask(TDynBitMap&& usedBlocks) { ReadUsedBlocksMask.emplace(std::move(usedBlocks)); }
+    ui64 GetCompletionCookie() const {
+        return CompletionCookie;
+    }
 
     const TActorId& GetDDiskId() const { return DDiskId; }
     const TActorId& GetOriginalRequester() const { return OriginalRequester; }
     const TActorId& GetInterconnectSession() const { return InterconnectSession; }
 
     TRope ExtractData();
+    TReadPayload ExtractReadPayload();
 
     double TimePassed() const;
 
@@ -82,9 +94,8 @@ protected:
     const TActorId DDiskId;
 
     virtual void SelfRecycle() noexcept { delete this; }
+    virtual bool PrepareRetry() noexcept;
 
-    // Zero-fills the blocks of freshly read data whose ReadUsedBlocksMask bits are unset.
-    void ApplyReadUsedBlocksMask(TRope& data) noexcept;
 
 private:
     class TCompletionGuard;
@@ -103,10 +114,10 @@ private:
 
     NWilson::TSpan Span;
 
+    ui64 CompletionCookie = 0;
     TRcBuf AlignedDataHolder;
     std::optional<TRope> Data;
 
-    std::optional<TDynBitMap> ReadUsedBlocksMask;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -126,26 +137,104 @@ public:
     void ClearForRecycle() noexcept override;
     void SelfRecycle() noexcept override;
 
+    void Reinit(const IEventHandle* ev = nullptr) {
+        TDirectIoOpBase::Reinit(ev);
+        IndexedReadToken = 0;
+    }
+
+    void SetIndexedReadToken(ui64 token) {
+        IndexedReadToken = token;
+    }
+
+    ui64 GetIndexedReadToken() const {
+        return IndexedReadToken;
+    }
+
     void SetChunkKey(ui64 tabletId, ui64 vChunkIndex) {
         TabletId = tabletId;
         VChunkIndex = vChunkIndex;
         HasChunkKey = true;
     }
 
-    void SetIntegrityOperationId(ui64 operationId) {
-        IntegrityOperationId = operationId;
-    }
-
-    void SetReadChecksums(std::vector<ui64> checksums) {
-        Checksums = std::move(checksums);
-    }
-
 private:
+    ui64 IndexedReadToken = 0;
     ui64 TabletId = 0;
     ui64 VChunkIndex = 0;
     bool HasChunkKey = false;
-    ui64 IntegrityOperationId = 0;
-    std::vector<ui64> Checksums;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TDDiskActor::TReadPartsIoOp
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// One logical cold read owns the data buffer and any newly claimed metadata
+// buffers. Shared metadata loads remain independent of the initiating reader.
+// Completion only publishes an event; metadata and reader state are actor-local.
+class TDDiskActor::TReadPartsIoOp final : public TDDiskActor::TDirectIoOpBase {
+public:
+    struct TPart {
+        ui64 Id = 0; // zero denotes client data; nonzero denotes a metadata load
+        TChunkIdx ChunkIdx = 0;
+        ui32 OffsetInBytes = 0;
+        ui32 Size = 0;
+        ui64 DiskOffset = 0;
+    };
+
+    explicit TReadPartsIoOp(TDDiskActor& actor)
+        : TDirectIoOpBase(actor) {
+    }
+
+    void PrepareParts(TConstArrayRef<TPart> parts);
+
+    bool IsReadPartsIo() const noexcept override {
+        return true;
+    }
+
+    ui64 GetAccountingSize() const noexcept override {
+        return AccountingSize;
+    }
+
+    size_t GetActivePartCount() const {
+        return ActiveParts.size();
+    }
+
+#if defined(__linux__)
+    // Consumes this object, including on rejection. The submission guard keeps
+    // it alive even if every accepted scalar callback runs before Read returns.
+    bool SubmitParts(NPDisk::IUringRouterClient& router, NActors::TActorSystem* actorSystem);
+#endif
+
+    const TPart& GetFallbackPart(size_t activeIndex) const;
+    void SetFallbackPartResult(size_t activeIndex, i64 result, TRope&& data);
+    void FinishFallbackReadParts();
+
+    void Reply(NActors::TActorSystem* actorSystem,
+        NKikimrBlobStorage::NDDisk::TReplyStatus::E status, TString reason = {}) noexcept override;
+
+protected:
+    bool PrepareRetry() noexcept override;
+
+private:
+    class TPartIoOp;
+
+    struct TOwnedPart {
+        TPart Part;
+        TRcBuf Buffer;
+        std::optional<TRope> FallbackData;
+        i64 Result = 0;
+        ui64 ShortIoCount = 0;
+        bool Completed = false;
+        bool Dropped = false;
+        bool Rejected = false;
+    };
+
+    void PrepareActiveParts();
+    void ReleasePart(NActors::TActorSystem* actorSystem) noexcept;
+
+    std::vector<TOwnedPart> Parts;
+    std::vector<size_t> ActiveParts;
+    std::atomic<size_t> Pending{0};
+    ui64 AccountingSize = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -198,36 +287,14 @@ public:
     void ClearForRecycle() noexcept override;
     void SelfRecycle() noexcept override;
 
-    void SetRequestId(ui64 requestId) {
-        RequestId = requestId;
-    }
 
-    void SetSegment(ui64 begin, ui64 end) {
-        SegmentBegin = begin;
-        SegmentEnd = end;
-    }
-
-    void SetSyncId(ui64 syncId) {
-        SyncId = syncId;
-    }
-
-    void SetIntegrityOperationId(ui64 operationId) {
-        IntegrityOperationId = operationId;
-    }
-
-private:
-    ui64 SyncId = 0;
-    ui64 RequestId = 0;
-    ui64 SegmentBegin = 0;
-    ui64 SegmentEnd = 0;
-    ui64 IntegrityOperationId = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // TDDiskActor::TIntegrityIoOp
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Executes one TIntegrityManager TWriteIo / TReadIo and posts TEvPrivate::TEvIntegrityIoResult
+// Executes one integrity host read/write and posts TEvPrivate::TEvIntegrityIoResult
 // back to the actor.
 class TDDiskActor::TIntegrityIoOp final : public TDDiskActor::TDirectIoOpBase {
 public:
@@ -243,12 +310,7 @@ public:
     void ClearForRecycle() noexcept override;
     void SelfRecycle() noexcept override;
 
-    void SetIoId(ui64 ioId) {
-        IoId = ioId;
-    }
 
-private:
-    ui64 IoId = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

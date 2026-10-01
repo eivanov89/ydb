@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <util/generic/scope.h>
 
 namespace NKikimr::NDDisk {
 
-TIntegrityManager::TIntegrityManager(ui64 dataChunkSizeBytes, ui64 ddiskId, ui64 pdiskGuid,
+TIntegrityManager::TIntegrityManager(IHost& host, ui64 dataChunkSizeBytes, ui64 ddiskId, ui64 pdiskGuid,
         ui64 checksumCacheBytes)
-    : DataChunkSize(dataChunkSizeBytes)
+    : Host(host)
+    , DataChunkSize(dataChunkSizeBytes)
     , DataBlocksPerChunkCount(dataChunkSizeBytes / IntegrityUnitSize)
     , BlocksPerExtentCount((DataBlocksPerChunkCount + ChecksumsPerIntegrityBlock - 1) / ChecksumsPerIntegrityBlock)
     , ExtentOnDiskSizeBytes(size_t(BlocksPerExtentCount) * IntegrityUnitSize * IntegrityPairSlots)
@@ -21,14 +23,6 @@ TIntegrityManager::TIntegrityManager(ui64 dataChunkSizeBytes, ui64 ddiskId, ui64
     Y_ABORT_UNLESS(dataChunkSizeBytes % IntegrityUnitSize == 0);
     Y_ABORT_UNLESS(dataChunkSizeBytes > IntegrityChunkHeaderRegionSize);
     Y_ABORT_UNLESS(ExtentsPerChunkCount >= 1);
-}
-
-std::vector<TIntegrityManager::TAction> TIntegrityManager::TakeActions() {
-    return std::exchange(Actions, {});
-}
-
-std::vector<TIntegrityManager::TDataChunkKey> TIntegrityManager::TakePlacedKeys() {
-    return std::exchange(PlacedKeys, {});
 }
 
 ui32 TIntegrityManager::ChunkHeaderReplicaOffset(ui32 replica) const {
@@ -48,7 +42,7 @@ ui32 TIntegrityManager::ExtentOffset(ui32 extentSlot) const {
 // Data chunk lifecycle
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void TIntegrityManager::OnDataChunkAllocated(TDataChunkKey key, TChunkIdx dataChunkIdx) {
+TIntegrityManager::TExtent TIntegrityManager::StartExtent(TDataChunkKey key, TChunkIdx dataChunkIdx) {
     const auto [it, inserted] = Extents.try_emplace(key);
     Y_ABORT_UNLESS(inserted, "data chunk already tracked, TabletId# %" PRIu64 " VChunkIndex# %" PRIu64,
         key.TabletId, key.VChunkIndex);
@@ -65,8 +59,10 @@ void TIntegrityManager::OnDataChunkAllocated(TDataChunkKey key, TChunkIdx dataCh
     }
 
     PendingExtents.push_back(key);
-    EnsureChunkCapacity();
+    auto completion = extent.Completion;
     TryAssignExtents();
+    EnsureChunkCapacity();
+    return TExtent(std::move(completion));
 }
 
 void TIntegrityManager::PrepareTabletChunksDeletion(ui64 tabletId) {
@@ -102,72 +98,25 @@ void TIntegrityManager::CommitTabletChunksDeletion(ui64 tabletId) {
         }
     }
     Y_ABORT_UNLESS(found, "tablet deletion was not prepared, TabletId# %" PRIu64, tabletId);
+    DrainPairWork();
 }
 
 void TIntegrityManager::FreeExtent(TDataChunkKey key, TExtentInfo& extent) {
-    std::vector<ui64> operationIds;
-    for (const auto& [operationId, operation] : PendingOperations) {
-        if (operation.Key == key) {
-            operationIds.push_back(operationId);
-        }
+    for (const auto& pair : extent.Pairs) {
+        Y_ABORT_UNLESS(!pair.OperationPins);
     }
-    for (const ui64 operationId : operationIds) {
-        CompleteOperation(operationId, EOperationStatus::Corrupted, "integrity extent was deleted");
+    for (const auto& [_, runtime] : extent.PairRuntime) {
+        Y_ABORT_UNLESS(!runtime->Loading && !runtime->Flushing);
     }
-
-    auto cancelQueuedIo = [&](ui64 ioId) {
-        if (!ioId) {
-            return;
-        }
-        const size_t oldSize = Actions.size();
-        std::erase_if(Actions, [ioId](const TAction& action) {
-            return std::visit(TOverloaded{
-                [](const TAllocateIntegrityChunk&) { return false; },
-                [ioId](const TWriteIo& io) { return io.IoId == ioId; },
-                [ioId](const TReadIo& io) { return io.IoId == ioId; },
-            }, action);
-        });
-        Y_ABORT_UNLESS(Actions.size() + 1 == oldSize,
-            "attempt to delete an extent with submitted pair I/O, IoId# %" PRIu64, ioId);
-        Y_ABORT_UNLESS(IosInFlight.erase(ioId) == 1);
-    };
-    for (const auto& [pairIdx, runtime] : extent.PairRuntime) {
-        Y_UNUSED(pairIdx);
-        cancelQueuedIo(runtime.ReadIoId);
-        cancelQueuedIo(runtime.WriteIoId);
-    }
-    extent.PairRuntime.clear();
-
+    extent.Completion->Failed = true;
     DropBlockStates(extent);
-    switch (extent.State) {
-        case EExtentState::Pending:
-            // Still queued for assignment: drop it from the queue.
-            std::erase(PendingExtents, key);
-            break;
-
-        case EExtentState::Formatting: {
-            if (extent.FormatIoId) {
-                // The format write is still in flight: the slot must not be reused until it
-                // settles, otherwise the old write could land after the new extent's format write
-                // and leave a stale-generation image on disk. Orphan the I/O; its completion
-                // releases the slot.
-                const auto ioIt = IosInFlight.find(extent.FormatIoId);
-                Y_ABORT_UNLESS(ioIt != IosInFlight.end());
-                ioIt->second = TOrphanedExtentFormatRef{extent.Ref.IntegrityChunkIdx, extent.Ref.ExtentSlot};
-            } else {
-                // Format write already landed; the extent was waiting for chunk headers.
-                TIntegrityChunkInfo& chunk = IntegrityChunks.at(extent.Ref.IntegrityChunkIdx);
-                std::erase(chunk.WaitingForChunkReady, key);
-                ReleaseSlot(extent.Ref.IntegrityChunkIdx, extent.Ref.ExtentSlot);
-            }
-            break;
-        }
-
-        case EExtentState::Ready:
-            // No I/O in flight: the slot is immediately reusable.
-            ReleaseSlot(extent.Ref.IntegrityChunkIdx, extent.Ref.ExtentSlot);
-            break;
+    if (extent.State == EExtentState::Pending) {
+        std::erase(PendingExtents, key);
+    } else if (!extent.Formatting) {
+        ReleaseSlot(extent.Ref.IntegrityChunkIdx, extent.Ref.ExtentSlot);
     }
+    // A submitted format retains the original slot until its result, including after key reuse.
+    PairWork.emplace_back(extent.Completion);
 }
 
 void TIntegrityManager::ReleaseSlot(TChunkIdx chunkIdx, ui32 extentSlot) {
@@ -182,21 +131,23 @@ void TIntegrityManager::ReleaseSlot(TChunkIdx chunkIdx, ui32 extentSlot) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void TIntegrityManager::EnsureChunkCapacity() {
-    size_t supply = size_t(PendingChunkAllocations) * ExtentsPerChunkCount;
+    if (Stopped) {
+        return;
+    }
+    size_t supply = PendingChunkAllocations.size() * ExtentsPerChunkCount;
     for (const auto& [chunkIdx, chunk] : IntegrityChunks) {
         supply += chunk.FreeSlots.size();
     }
     while (supply < PendingExtents.size()) {
-        Actions.emplace_back(TAllocateIntegrityChunk{});
-        ++PendingChunkAllocations;
+        const ui64 token = NextAllocationToken++;
+        PendingChunkAllocations.insert(token);
         supply += ExtentsPerChunkCount;
+        PairWork.emplace_back(TAllocationSubmission{token});
     }
+    DrainPairWork();
 }
 
 void TIntegrityManager::OnIntegrityChunkAllocated(TChunkIdx chunkIdx) {
-    Y_ABORT_UNLESS(PendingChunkAllocations > 0);
-    --PendingChunkAllocations;
-
     const auto [it, inserted] = IntegrityChunks.try_emplace(chunkIdx);
     Y_ABORT_UNLESS(inserted, "integrity chunk already in use, ChunkIdx# %" PRIu32, chunkIdx);
 
@@ -208,29 +159,30 @@ void TIntegrityManager::OnIntegrityChunkAllocated(TChunkIdx chunkIdx) {
     }
 
     chunk.HeaderWritesRemaining = ChunkHeaderReplicaCount;
+    // Publish all descriptors before the first host submission can complete inline.
     for (ui32 replica = 0; replica < ChunkHeaderReplicaCount; ++replica) {
-        QueueChunkHeaderWrite(chunkIdx, replica);
+        const ui64 id = NextPairWriteId++;
+        FormatWrites.emplace(id, TFormatWrite{EWriteIoKind::ChunkHeader, chunkIdx,
+            chunk.Generation, {}, {}, chunk.Completion});
+        PairWork.emplace_back(TWriteSubmission{id, chunkIdx, ChunkHeaderReplicaOffset(replica),
+            MakeHeaderImage(chunkIdx, chunk.Generation), EWriteIoKind::ChunkHeader});
     }
     TryAssignExtents();
+    DrainPairWork();
 }
 
 bool TIntegrityManager::CancelChunkAllocationIfExcess() {
-    Y_ABORT_UNLESS(PendingChunkAllocations > 0);
-    size_t supply = size_t(PendingChunkAllocations - 1) * ExtentsPerChunkCount;
+    size_t supply = PendingChunkAllocations.size() * ExtentsPerChunkCount;
     for (const auto& [chunkIdx, chunk] : IntegrityChunks) {
         supply += chunk.FreeSlots.size();
     }
     if (supply < PendingExtents.size()) {
         return false;
     }
-    --PendingChunkAllocations;
     return true;
 }
 
-void TIntegrityManager::QueueChunkHeaderWrite(TChunkIdx chunkIdx, ui32 replica) {
-    const TIntegrityChunkInfo& chunk = IntegrityChunks.at(chunkIdx);
-    Y_ABORT_UNLESS(chunk.State == EChunkState::Formatting && replica < ChunkHeaderReplicaCount);
-
+TRcBuf TIntegrityManager::MakeHeaderImage(TChunkIdx chunkIdx, ui64 generation) const {
     auto data = TRcBuf::UninitializedPageAligned(sizeof(TIntegrityChunkHeader));
     auto* header = reinterpret_cast<TIntegrityChunkHeader*>(data.GetDataMut());
     memset(header, 0, sizeof(*header));
@@ -240,18 +192,9 @@ void TIntegrityManager::QueueChunkHeaderWrite(TChunkIdx chunkIdx, ui32 replica) 
     header->DDiskId = DDiskId;
     header->PDiskGuid = PDiskGuid;
     header->IntegrityChunkId = chunkIdx;
-    header->IntegrityChunkGeneration = chunk.Generation;
+    header->IntegrityChunkGeneration = generation;
     header->HeaderChecksum = CalculateRawChecksum(header, sizeof(*header));
-
-    const ui64 ioId = NextIoId++;
-    IosInFlight.emplace(ioId, THeaderWriteRef{chunkIdx, replica});
-    Actions.emplace_back(TWriteIo{
-        .IoId = ioId,
-        .ChunkIdx = chunkIdx,
-        .OffsetInBytes = ChunkHeaderReplicaOffset(replica),
-        .Data = std::move(data),
-        .Kind = EWriteIoKind::ChunkHeader,
-    });
+    return data;
 }
 
 std::vector<TChunkIdx> TIntegrityManager::TakeReleasableIntegrityChunks() {
@@ -276,7 +219,7 @@ std::vector<TChunkIdx> TIntegrityManager::TakeReleasableIntegrityChunks() {
 }
 
 void TIntegrityManager::TryAssignExtents() {
-    while (!PendingExtents.empty()) {
+    while (!Stopped && !PendingExtents.empty()) {
         // Find a chunk with a free slot (Formatting or Ready; smallest chunk index first for
         // determinism). Extents may be formatted in parallel with the chunk's own headers.
         TChunkIdx chunkIdx = 0;
@@ -288,7 +231,7 @@ void TIntegrityManager::TryAssignExtents() {
             }
         }
         if (!chunk) {
-            return; // waiting for a chunk allocation
+            break; // waiting for a chunk allocation; still drain previously registered work
         }
 
         const TDataChunkKey key = PendingExtents.front();
@@ -303,14 +246,21 @@ void TIntegrityManager::TryAssignExtents() {
         chunk->FreeSlots.pop_back();
         extent.State = EExtentState::Formatting;
 
-        PlacedKeys.push_back(key);
-        QueueExtentFormatWrite(key, extent);
+        extent.Formatting = true;
+        const auto ref = extent.Ref;
+        auto completion = extent.Completion;
+        const ui64 id = NextPairWriteId++;
+        FormatWrites.emplace(id, TFormatWrite{EWriteIoKind::ExtentFormat, chunkIdx,
+            chunk->Generation, key, ref, completion});
+        PairWork.emplace_back(TWriteSubmission{id, chunkIdx, ExtentOffset(ref.ExtentSlot),
+            MakeExtentImage(key, ref, chunk->Generation), EWriteIoKind::ExtentFormat});
+        extent.Completion->Placed = true;
+        PairWork.emplace_back(completion);
     }
+    DrainPairWork();
 }
 
-void TIntegrityManager::QueueExtentFormatWrite(TDataChunkKey key, TExtentInfo& extent) {
-    const TIntegrityChunkInfo& chunk = IntegrityChunks.at(extent.Ref.IntegrityChunkIdx);
-
+TRcBuf TIntegrityManager::MakeExtentImage(TDataChunkKey key, TExtentRef ref, ui64 generation) const {
     auto data = TRcBuf::UninitializedPageAligned(ExtentOnDiskSizeBytes);
     auto* blocks = reinterpret_cast<TIntegrityBlock*>(data.GetDataMut());
     memset(blocks, 0, ExtentOnDiskSizeBytes);
@@ -324,254 +274,100 @@ void TIntegrityManager::QueueExtentFormatWrite(TDataChunkKey key, TExtentInfo& e
             header.ChecksumBlockIdx = pair;
             header.OwnerId = key.TabletId;
             header.VChunkId = key.VChunkIndex;
-            header.VChunkGeneration = extent.Ref.VChunkGeneration;
-            header.IntegrityChunkId = extent.Ref.IntegrityChunkIdx;
-            header.IntegrityExtentId = extent.Ref.ExtentSlot;
-            header.IntegrityChunkGeneration = chunk.Generation;
+            header.VChunkGeneration = ref.VChunkGeneration;
+            header.IntegrityChunkId = ref.IntegrityChunkIdx;
+            header.IntegrityExtentId = ref.ExtentSlot;
+            header.IntegrityChunkGeneration = generation;
             // Slot A gets sequence 0, slot B gets 1, so B starts as the current slot of each pair.
             header.PairSequenceNumber = slot;
             header.BlockChecksum = CalculateRawChecksum(&block, sizeof(block));
         }
     }
 
-    const ui64 ioId = NextIoId++;
-    extent.FormatIoId = ioId;
-    IosInFlight.emplace(ioId, TExtentFormatRef{key});
-    Actions.emplace_back(TWriteIo{
-        .IoId = ioId,
-        .ChunkIdx = extent.Ref.IntegrityChunkIdx,
-        .OffsetInBytes = ExtentOffset(extent.Ref.ExtentSlot),
-        .Data = std::move(data),
-        .Kind = EWriteIoKind::ExtentFormat,
-    });
+
+    return data;
 }
 
-void TIntegrityManager::MaybeCompleteExtent(TDataChunkKey key, TExtentInfo& extent,
-        std::vector<TDataChunkKey>& readyKeys) {
-    Y_ABORT_UNLESS(extent.State == EExtentState::Formatting);
-    TIntegrityChunkInfo& chunk = IntegrityChunks.at(extent.Ref.IntegrityChunkIdx);
-    if (!extent.FormatComplete || chunk.State != EChunkState::Ready) {
-        if (extent.FormatComplete && chunk.State != EChunkState::Ready) {
-            chunk.WaitingForChunkReady.push_back(key);
-        }
+void TIntegrityManager::MaybeCompleteExtent(TDataChunkKey key, TExtentRef ref,
+        const std::shared_ptr<TExtentState>& completion)
+{
+    const auto it = Extents.find(key);
+    if (it == Extents.end() || it->second.Completion != completion
+            || it->second.Ref.VChunkGeneration != ref.VChunkGeneration
+            || it->second.Formatting || !it->second.Completion->Placed) {
         return;
     }
-    extent.State = EExtentState::Ready;
-    if (!extent.DeletionPending) {
-        readyKeys.push_back(key);
+    const auto chunkIt = IntegrityChunks.find(ref.IntegrityChunkIdx);
+    if (chunkIt == IntegrityChunks.end() || chunkIt->second.HeaderWritesRemaining) {
+        return;
     }
-    for (ui32 pairIdx = 0; pairIdx < extent.Pairs.size(); ++pairIdx) {
-        const auto runtimeIt = extent.PairRuntime.find(pairIdx);
-        if (runtimeIt != extent.PairRuntime.end() && runtimeIt->second.Dirty) {
-            QueuePairWrite(key, extent, pairIdx);
-        }
+    auto& extent = it->second;
+    if (extent.State == EExtentState::Ready || completion->Failed) {
+        return;
     }
+    if (!Stopped && extent.FormatComplete && chunkIt->second.Completion->Ready
+            && !extent.DeletionPending) {
+        extent.State = EExtentState::Ready;
+        completion->Ready = true;
+    } else {
+        completion->Failed = true;
+    }
+    std::vector<std::pair<ui32, std::shared_ptr<TPairRuntime>>> pairs;
+    for (const auto& pair : extent.PairRuntime) {
+        pairs.push_back(pair);
+    }
+    for (const auto& [idx, runtime] : pairs) {
+        FlushPair(key, idx, runtime);
+    }
+    PairWork.emplace_back(completion);
 }
 
-std::vector<TIntegrityManager::TDataChunkKey> TIntegrityManager::OnIoCompleted(ui64 ioId) {
-    const auto ioIt = IosInFlight.find(ioId);
-    Y_ABORT_UNLESS(ioIt != IosInFlight.end(), "unknown IoId# %" PRIu64, ioId);
-    const TIoRef ref = ioIt->second;
-    IosInFlight.erase(ioIt);
-
-    std::vector<TDataChunkKey> readyKeys;
-
-    std::visit(TOverloaded{
-        [&](const THeaderWriteRef& headerRef) {
-            TIntegrityChunkInfo& chunk = IntegrityChunks.at(headerRef.ChunkIdx);
-            Y_ABORT_UNLESS(chunk.State == EChunkState::Formatting && chunk.HeaderWritesRemaining > 0);
-            --chunk.HeaderWritesRemaining;
-            if (chunk.HeaderWritesRemaining > 0) {
-                return;
+void TIntegrityManager::CompleteFormatWrite(TFormatWrite write, bool ok) {
+    const auto chunkIt = IntegrityChunks.find(write.ChunkIdx);
+    if (chunkIt == IntegrityChunks.end() || chunkIt->second.Generation != write.ChunkGeneration) {
+        // The original owner has retired; the same physical index may now have a new
+        // generation. Its free-slot set must never be touched by this stale completion.
+        return;
+    }
+    if (write.Kind == EWriteIoKind::ChunkHeader) {
+        auto& chunk = chunkIt->second;
+        if (!ok) {
+            chunk.Completion->Failed = true;
+        }
+        Y_ABORT_UNLESS(chunk.HeaderWritesRemaining);
+        if (!--chunk.HeaderWritesRemaining) {
+            if (!Stopped && !chunk.Completion->Failed) {
+                chunk.State = EChunkState::Ready;
+                chunk.Completion->Ready = true;
             }
-            chunk.State = EChunkState::Ready;
-            auto waiting = std::exchange(chunk.WaitingForChunkReady, {});
-            for (const TDataChunkKey& key : waiting) {
-                const auto it = Extents.find(key);
-                if (it == Extents.end() || it->second.State != EExtentState::Formatting) {
-                    continue;
+            std::vector<std::pair<TDataChunkKey, std::pair<TExtentRef, std::shared_ptr<TExtentState>>>> extents;
+            for (const auto& [key, extent] : Extents) {
+                if (extent.Ref.IntegrityChunkIdx == write.ChunkIdx && extent.State == EExtentState::Formatting) {
+                    extents.emplace_back(key, std::make_pair(extent.Ref, extent.Completion));
                 }
-                MaybeCompleteExtent(key, it->second, readyKeys);
             }
+            for (const auto& [key, pair] : extents) {
+                MaybeCompleteExtent(key, pair.first, pair.second);
+            }
+            PairWork.emplace_back(chunk.Completion);
+        }
+    } else {
+        const auto it = Extents.find(write.Key);
+        if (it == Extents.end() || it->second.Completion != write.Completion
+                || it->second.Ref.VChunkGeneration != write.Ref.VChunkGeneration) {
+            ReleaseSlot(write.Ref.IntegrityChunkIdx, write.Ref.ExtentSlot);
             TryAssignExtents();
-        },
-        [&](const TExtentFormatRef& formatRef) {
-            // FreeExtent rewrites the ref of a freed extent to TOrphanedExtentFormatRef, so this
-            // completion always belongs to the live extent that issued exactly this write.
-            const auto it = Extents.find(formatRef.Key);
-            Y_ABORT_UNLESS(it != Extents.end() && it->second.State == EExtentState::Formatting
-                && it->second.FormatIoId == ioId);
-            it->second.FormatIoId = 0;
-            it->second.FormatComplete = true;
-            MaybeCompleteExtent(formatRef.Key, it->second, readyKeys);
-        },
-        [&](const TOrphanedExtentFormatRef& orphanRef) {
-            // The format write of a freed extent settled: the slot is now safe to reuse; a pending
-            // extent may have been waiting for it.
-            ReleaseSlot(orphanRef.ChunkIdx, orphanRef.ExtentSlot);
-            TryAssignExtents();
-        },
-        [&](const TPairReadRef&) {
-            Y_ABORT("read integrity I/O completed through the write completion path");
-        },
-        [&](const TPairWriteRef& writeRef) {
-            const auto it = Extents.find(writeRef.Key);
-            if (it == Extents.end()) {
-                return;
-            }
-            TExtentInfo& extent = it->second;
-            TPairMeta& pair = extent.Pairs.at(writeRef.PairIdx);
-            TPairRuntime& runtime = extent.PairRuntime.at(writeRef.PairIdx);
-            Y_ABORT_UNLESS(runtime.WriteIoId == ioId);
-            runtime.WriteIoId = 0;
-            pair.CurrentSlot = writeRef.Slot;
-            TIntegrityBlockState* state = FindBlockState(extent, writeRef.PairIdx);
-            Y_ABORT_UNLESS(state);
-            ++state->PairSequenceNumber;
-            runtime.DurableVersion = Max(runtime.DurableVersion, writeRef.Version);
-            NotifyPairDurable(writeRef.Key, extent, writeRef.PairIdx);
-            if (const auto runtimeIt = extent.PairRuntime.find(writeRef.PairIdx);
-                    runtimeIt != extent.PairRuntime.end() && runtimeIt->second.Dirty) {
-                QueuePairWrite(writeRef.Key, extent, writeRef.PairIdx);
-            }
-            MaybeDropPairRuntime(extent, writeRef.PairIdx);
-            EvictBlockStatesOverBudget();
-        },
-    }, ref);
-
-    return readyKeys;
-}
-
-void TIntegrityManager::NotifyPairDurable(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx) {
-    Y_UNUSED(key);
-    TPairRuntime& runtime = extent.PairRuntime.at(pairIdx);
-    std::vector<std::pair<ui64, ui64>> remaining;
-    std::vector<ui64> durableOperations;
-    for (const auto& [operationId, requiredVersion] : runtime.DurabilityWaiters) {
-        if (requiredVersion > runtime.DurableVersion) {
-            remaining.emplace_back(operationId, requiredVersion);
-            continue;
-        }
-        durableOperations.push_back(operationId);
-    }
-    runtime.DurabilityWaiters = std::move(remaining);
-
-    for (const ui64 operationId : durableOperations) {
-        const auto operationIt = PendingOperations.find(operationId);
-        if (operationIt == PendingOperations.end()) {
-            continue;
-        }
-        TPendingOperation& operation = operationIt->second;
-        Y_ABORT_UNLESS(operation.PendingDurability > 0);
-        if (--operation.PendingDurability == 0) {
-            CompleteOperation(operationId);
-        }
-    }
-}
-
-void TIntegrityManager::CompleteOperation(ui64 operationId, EOperationStatus status,
-        TString errorReason, bool lostWriteDetected) {
-    const auto it = PendingOperations.find(operationId);
-    if (it == PendingOperations.end()) {
-        return;
-    }
-
-    TPendingOperation& operation = it->second;
-    TOperationResult result{
-        .OperationId = operationId,
-        .Kind = operation.Kind,
-        .Status = status,
-        .ErrorReason = std::move(errorReason),
-        .LostWriteDetected = lostWriteDetected,
-    };
-
-    if (status == EOperationStatus::Ok && operation.Kind == EOperationKind::Read) {
-        const ui32 firstBlock = operation.OffsetInBytes / IntegrityUnitSize;
-        const ui32 numBlocks = operation.Size / IntegrityUnitSize;
-        result.Checksums.reserve(numBlocks);
-        const auto extentIt = Extents.find(operation.Key);
-        if (extentIt == Extents.end()) {
-            result.Status = EOperationStatus::Corrupted;
-            result.ErrorReason = "integrity extent is missing for an allocated data chunk";
-            CompletedOperations.push_back(std::move(result));
-            PendingOperations.erase(it);
             return;
         }
-        const TExtentInfo& extent = extentIt->second;
-        for (ui32 blockIdx = firstBlock; blockIdx < firstBlock + numBlocks; ++blockIdx) {
-            const ui32 pairIdx = blockIdx / ChecksumsPerIntegrityBlock;
-            const ui32 slot = blockIdx % ChecksumsPerIntegrityBlock;
-            if (!extent.UsedBlocks.Get(blockIdx)) {
-                result.Checksums.push_back(GetZeroBlockChecksum());
-                continue;
-            }
-            const auto stateIt = extent.BlockStates.find(pairIdx);
-            if (stateIt == extent.BlockStates.end() || !stateIt->second->Known.Get(slot)) {
-                result.Status = EOperationStatus::Corrupted;
-                result.ErrorReason = TStringBuilder()
-                    << "checksum is missing for used data block " << blockIdx;
-                result.Checksums.clear();
-                break;
-            }
-            result.Checksums.push_back(stateIt->second->Checksums[slot]);
-        }
+        it->second.Formatting = false;
+        it->second.FormatComplete = ok;
+        MaybeCompleteExtent(write.Key, write.Ref, write.Completion);
     }
-
-    if (operation.PairsPinned) {
-        const auto extentIt = Extents.find(operation.Key);
-        Y_ABORT_UNLESS(extentIt != Extents.end());
-        TExtentInfo& extent = extentIt->second;
-        for (ui32 pairIdx = FirstPair(operation.OffsetInBytes);
-                pairIdx < EndPair(operation.OffsetInBytes, operation.Size); ++pairIdx) {
-            TPairMeta& pair = extent.Pairs.at(pairIdx);
-            Y_ABORT_UNLESS(pair.OperationPins > 0);
-            --pair.OperationPins;
-            MaybeDropPairRuntime(extent, pairIdx);
-        }
-        operation.PairsPinned = false;
-    }
-
-    CompletedOperations.push_back(std::move(result));
-    PendingOperations.erase(it);
-}
-
-void TIntegrityManager::CompleteReadOperation(ui64 operationId, TPendingOperation& operation) {
-    Y_ABORT_UNLESS(operation.Kind == EOperationKind::Read && operation.PendingLoads == 0);
-    CompleteOperation(operationId);
-}
-
-void TIntegrityManager::NotifyPairLoaded(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx) {
-    TPairMeta& pair = extent.Pairs.at(pairIdx);
-    TPairRuntime& runtime = extent.PairRuntime.at(pairIdx);
-    auto waiters = std::exchange(runtime.LoadWaiters, {});
-    const TString corruptionReason = runtime.CorruptionReason;
-    const bool lostWriteCorruption = runtime.LostWriteCorruption;
-    for (const ui64 operationId : waiters) {
-        const auto operationIt = PendingOperations.find(operationId);
-        if (operationIt == PendingOperations.end()) {
-            continue;
-        }
-        TPendingOperation& operation = operationIt->second;
-        if (pair.Corrupted) {
-            CompleteOperation(operationId, EOperationStatus::Corrupted, corruptionReason,
-                lostWriteCorruption);
-            continue;
-        }
-        Y_ABORT_UNLESS(operation.PendingLoads > 0);
-        if (--operation.PendingLoads != 0) {
-            continue;
-        }
-        if (operation.Kind == EOperationKind::Write) {
-            ApplyWriteOperation(operationId, operation);
-        } else {
-            CompleteReadOperation(operationId, operation);
-        }
-    }
-    Y_UNUSED(key);
 }
 
 bool TIntegrityManager::LoadPairImage(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx,
-        const TRope& data, TString* errorReason, bool* lostWriteDetected) {
+        const TReadPayload& data, TString* errorReason, bool* lostWriteDetected)
+{
     *lostWriteDetected = false;
     if (data.size() != IntegrityPairSlots * sizeof(TIntegrityBlock)) {
         *errorReason = TStringBuilder() << "short integrity pair read: expected "
@@ -580,7 +376,7 @@ bool TIntegrityManager::LoadPairImage(TDataChunkKey key, TExtentInfo& extent, ui
     }
 
     TIntegrityBlock slots[IntegrityPairSlots];
-    data.Begin().ExtractPlainDataAndAdvance(slots, sizeof(slots));
+    data.CopyTo(slots, sizeof(slots));
     const i32 winner = SelectIntegrityBlockWinner(slots, MakeBlockIdentity(key, extent, pairIdx));
     if (winner < 0) {
         *errorReason = TStringBuilder() << "both integrity slots are invalid for pair " << pairIdx;
@@ -622,44 +418,6 @@ bool TIntegrityManager::LoadPairImage(TDataChunkKey key, TExtentInfo& extent, ui
             PDiskGuid, key.TabletId, key.VChunkIndex, blockIdx);
     }
     return true;
-}
-
-void TIntegrityManager::OnReadIoCompleted(ui64 ioId, TRope data) {
-    const auto ioIt = IosInFlight.find(ioId);
-    Y_ABORT_UNLESS(ioIt != IosInFlight.end(), "unknown read IoId# %" PRIu64, ioId);
-    const auto* readRef = std::get_if<TPairReadRef>(&ioIt->second);
-    Y_ABORT_UNLESS(readRef);
-    const TPairReadRef ref = *readRef;
-    IosInFlight.erase(ioIt);
-
-    const auto extentIt = Extents.find(ref.Key);
-    if (extentIt == Extents.end()) {
-        return;
-    }
-    TExtentInfo& extent = extentIt->second;
-    TPairMeta& pair = extent.Pairs.at(ref.PairIdx);
-    {
-        TPairRuntime& runtime = extent.PairRuntime.at(ref.PairIdx);
-        Y_ABORT_UNLESS(runtime.ReadIoId == ioId);
-        runtime.ReadIoId = 0;
-
-        TString errorReason;
-        bool lostWriteDetected = false;
-        if (!LoadPairImage(ref.Key, extent, ref.PairIdx, data, &errorReason, &lostWriteDetected)) {
-            pair.Corrupted = true;
-            runtime.LostWriteCorruption = lostWriteDetected;
-            runtime.CorruptionReason = std::move(errorReason);
-        }
-    }
-    NotifyPairLoaded(ref.Key, extent, ref.PairIdx);
-    if (!pair.Corrupted) {
-        if (const auto runtimeIt = extent.PairRuntime.find(ref.PairIdx);
-                runtimeIt != extent.PairRuntime.end() && runtimeIt->second.Dirty) {
-            QueuePairWrite(ref.Key, extent, ref.PairIdx);
-        }
-    }
-    MaybeDropPairRuntime(extent, ref.PairIdx);
-    EvictBlockStatesOverBudget();
 }
 
 bool TIntegrityManager::IsExtentReady(TDataChunkKey key) const {
@@ -714,9 +472,8 @@ void TIntegrityManager::EvictBlockStatesOverBudget() {
             const auto runtimeIt = extent.PairRuntime.find(candidate->PairIdx);
             if (extent.Pairs.at(candidate->PairIdx).OperationPins == 0
                     && (runtimeIt == extent.PairRuntime.end()
-                    || (!runtimeIt->second.ReadIoId && !runtimeIt->second.WriteIoId
-                        && !runtimeIt->second.Dirty && runtimeIt->second.LoadWaiters.empty()
-                        && runtimeIt->second.DurabilityWaiters.empty()))) {
+                    || (!runtimeIt->second->Loading && !runtimeIt->second->Flushing
+                        && !runtimeIt->second->Dirty))) {
                 victim = candidate;
                 break;
             }
@@ -763,9 +520,28 @@ TIntegrityBlockIdentity TIntegrityManager::MakeBlockIdentity(TDataChunkKey key,
     };
 }
 
-TIntegrityManager::TPairRuntime& TIntegrityManager::GetPairRuntime(
-        TExtentInfo& extent, ui32 pairIdx) {
-    return extent.PairRuntime[pairIdx];
+std::shared_ptr<TIntegrityManager::TPairRuntime> TIntegrityManager::GetPairRuntime(
+        TExtentInfo& extent, ui32 pairIdx)
+{
+    auto& runtime = extent.PairRuntime[pairIdx];
+    if (!runtime) {
+        runtime = std::make_shared<TPairRuntime>();
+        runtime->VChunkGeneration = extent.Ref.VChunkGeneration;
+    }
+    return runtime;
+}
+
+TIntegrityManager::TExtentInfo* TIntegrityManager::FindCurrentPair(TDataChunkKey key,
+        ui32 pairIdx, const std::shared_ptr<TPairRuntime>& runtime)
+{
+    const auto it = Extents.find(key);
+    if (it == Extents.end() || it->second.Ref.VChunkGeneration != runtime->VChunkGeneration
+            || pairIdx >= it->second.Pairs.size()) {
+        return nullptr;
+    }
+    const auto runtimeIt = it->second.PairRuntime.find(pairIdx);
+    return runtimeIt != it->second.PairRuntime.end() && runtimeIt->second == runtime
+        ? &it->second : nullptr;
 }
 
 void TIntegrityManager::MaybeDropPairRuntime(TExtentInfo& extent, ui32 pairIdx) {
@@ -773,32 +549,11 @@ void TIntegrityManager::MaybeDropPairRuntime(TExtentInfo& extent, ui32 pairIdx) 
     if (it == extent.PairRuntime.end()) {
         return;
     }
-    const TPairRuntime& runtime = it->second;
-    const TPairMeta& pair = extent.Pairs.at(pairIdx);
-    if (!pair.Corrupted && pair.OperationPins == 0 && !runtime.ReadIoId && !runtime.WriteIoId
-            && !runtime.Dirty && runtime.LoadWaiters.empty()
-            && runtime.DurabilityWaiters.empty()) {
+    const auto& runtime = *it->second;
+    const auto& pair = extent.Pairs.at(pairIdx);
+    if (!pair.Corrupted && !pair.OperationPins && !runtime.Loading && !runtime.Flushing) {
         extent.PairRuntime.erase(it);
     }
-}
-
-void TIntegrityManager::QueuePairRead(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx) {
-    TPairMeta& pair = extent.Pairs.at(pairIdx);
-    TPairRuntime& runtime = GetPairRuntime(extent, pairIdx);
-    if (runtime.ReadIoId || pair.Resident || pair.Corrupted) {
-        return;
-    }
-
-    const ui64 ioId = NextIoId++;
-    runtime.ReadIoId = ioId;
-    IosInFlight.emplace(ioId, TPairReadRef{key, pairIdx});
-    Actions.emplace_back(TReadIo{
-        .IoId = ioId,
-        .ChunkIdx = extent.Ref.IntegrityChunkIdx,
-        .OffsetInBytes = ExtentOffset(extent.Ref.ExtentSlot)
-            + pairIdx * IntegrityPairSlots * static_cast<ui32>(IntegrityUnitSize),
-        .Size = IntegrityPairSlots * static_cast<ui32>(IntegrityUnitSize),
-    });
 }
 
 bool TIntegrityManager::PairHasAllUsedChecksums(const TExtentInfo& extent, ui32 pairIdx,
@@ -813,14 +568,8 @@ bool TIntegrityManager::PairHasAllUsedChecksums(const TExtentInfo& extent, ui32 
     return true;
 }
 
-void TIntegrityManager::QueuePairWrite(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx) {
-    TPairMeta& pair = extent.Pairs.at(pairIdx);
-    TPairRuntime& runtime = GetPairRuntime(extent, pairIdx);
-    if (extent.State != EExtentState::Ready || runtime.ReadIoId || runtime.WriteIoId
-            || !pair.Resident || pair.Corrupted || !runtime.Dirty) {
-        return;
-    }
-
+TRcBuf TIntegrityManager::MakePairImage(TDataChunkKey key, TExtentInfo& extent, ui32 pairIdx) {
+    const auto& pair = extent.Pairs.at(pairIdx);
     TIntegrityBlockState& state = GetOrCreateBlockState(key, extent, pairIdx);
     Y_ABORT_UNLESS(PairHasAllUsedChecksums(extent, pairIdx, state),
         "used data block without a checksum in pair# %" PRIu32, pairIdx);
@@ -856,184 +605,19 @@ void TIntegrityManager::QueuePairWrite(TDataChunkKey key, TExtentInfo& extent, u
     }
     header.BlockChecksum = CalculateRawChecksum(block, sizeof(*block));
 
-    const EPairSlot targetSlot = pair.CurrentSlot == EPairSlot::A ? EPairSlot::B : EPairSlot::A;
-    const ui32 targetSlotIdx = targetSlot == EPairSlot::A ? 0 : 1;
-    const ui64 ioId = NextIoId++;
-    runtime.WriteIoId = ioId;
-    runtime.WriteVersion = runtime.MutationVersion;
-    runtime.Dirty = false;
-    IosInFlight.emplace(ioId, TPairWriteRef{key, pairIdx, runtime.WriteVersion, targetSlot});
-    Actions.emplace_back(TWriteIo{
-        .IoId = ioId,
-        .ChunkIdx = extent.Ref.IntegrityChunkIdx,
-        .OffsetInBytes = ExtentOffset(extent.Ref.ExtentSlot)
-            + (pairIdx * IntegrityPairSlots + targetSlotIdx) * static_cast<ui32>(IntegrityUnitSize),
-        .Data = std::move(data),
-        .Kind = EWriteIoKind::Pair,
-    });
-}
-
-ui64 TIntegrityManager::BeginBlocksWrite(TDataChunkKey key, ui32 offsetInBytes, ui32 size,
-        const std::vector<ui64>& checksums) {
-    const auto it = Extents.find(key);
-    Y_ABORT_UNLESS(it != Extents.end(), "write to unknown data chunk, TabletId# %" PRIu64 " VChunkIndex# %" PRIu64,
-        key.TabletId, key.VChunkIndex);
-    TExtentInfo& extent = it->second;
-
-    Y_ABORT_UNLESS(size > 0 && ui64(offsetInBytes) + size <= DataChunkSize);
-
-    const ui32 firstBlock = offsetInBytes / IntegrityUnitSize;
-    const ui32 endBlock = (offsetInBytes + size) / IntegrityUnitSize;
-    Y_ABORT_UNLESS(offsetInBytes % IntegrityUnitSize == 0 && size % IntegrityUnitSize == 0
-            && checksums.size() == endBlock - firstBlock,
-        "checksums must be per-4KiB-block of an aligned range: offset# %" PRIu32 " size# %" PRIu32
-        " checksums# %zu", offsetInBytes, size, checksums.size());
-
-    const ui64 operationId = NextOperationId++;
-    auto [operationIt, inserted] = PendingOperations.emplace(operationId, TPendingOperation{
-        .Kind = EOperationKind::Write,
-        .Key = key,
-        .OffsetInBytes = offsetInBytes,
-        .Size = size,
-        .Checksums = checksums,
-    });
-    Y_ABORT_UNLESS(inserted);
-    TPendingOperation& operation = operationIt->second;
-
-    for (ui32 pairIdx = FirstPair(offsetInBytes); pairIdx < EndPair(offsetInBytes, size); ++pairIdx) {
-        const TPairMeta& pair = extent.Pairs.at(pairIdx);
-        if (pair.Corrupted) {
-            CompleteOperation(operationId, EOperationStatus::Corrupted,
-                extent.PairRuntime.at(pairIdx).CorruptionReason,
-                extent.PairRuntime.at(pairIdx).LostWriteCorruption);
-            return operationId;
-        }
-    }
-
-    operation.PairsPinned = true;
-    for (ui32 pairIdx = FirstPair(offsetInBytes); pairIdx < EndPair(offsetInBytes, size); ++pairIdx) {
-        TPairMeta& pair = extent.Pairs.at(pairIdx);
-        ++pair.OperationPins;
-        if (!pair.Resident) {
-            GetPairRuntime(extent, pairIdx).LoadWaiters.push_back(operationId);
-            ++operation.PendingLoads;
-            QueuePairRead(key, extent, pairIdx);
-        }
-    }
-    if (!operation.PendingLoads) {
-        ApplyWriteOperation(operationId, operation);
-    }
-    return operationId;
-}
-
-void TIntegrityManager::ApplyWriteOperation(ui64 operationId, TPendingOperation& operation) {
-    Y_ABORT_UNLESS(operation.Kind == EOperationKind::Write && !operation.Applied
-        && operation.PendingLoads == 0);
-    TExtentInfo& extent = Extents.at(operation.Key);
-    const ui32 firstBlock = operation.OffsetInBytes / IntegrityUnitSize;
-    const ui32 endBlock = (operation.OffsetInBytes + operation.Size) / IntegrityUnitSize;
-
-    operation.Applied = true;
-    for (ui32 block = firstBlock; block < endBlock; ++block) {
-        extent.UsedBlocks.Set(block);
-
-        const ui32 blockStateIdx = block / ChecksumsPerIntegrityBlock;
-        const ui32 slot = block % ChecksumsPerIntegrityBlock;
-        const ui64 generation = extent.Ref.VChunkGeneration;
-        TPairMeta& pair = extent.Pairs.at(blockStateIdx);
-
-        TIntegrityBlockState& state = GetOrCreateBlockState(operation.Key, extent, blockStateIdx);
-        const ui64 newCsum = operation.Checksums[block - firstBlock];
-        if (state.Known.Get(slot)) {
-            UpdateRoot(pair.Digest, generation, block, state.Checksums[slot], newCsum);
-        } else {
-            pair.Digest ^= Contribution(generation, block, newCsum);
-            state.Known.Set(slot);
-        }
-        state.Checksums[slot] = newCsum;
-        pair.DigestKnown = true;
-    }
-
-    for (ui32 pairIdx = FirstPair(operation.OffsetInBytes);
-            pairIdx < EndPair(operation.OffsetInBytes, operation.Size); ++pairIdx) {
-        TPairRuntime& runtime = GetPairRuntime(extent, pairIdx);
-        ++runtime.MutationVersion;
-        runtime.Dirty = true;
-        runtime.DurabilityWaiters.emplace_back(operationId, runtime.MutationVersion);
-        ++operation.PendingDurability;
-        QueuePairWrite(operation.Key, extent, pairIdx);
-    }
-    if (!operation.PendingDurability) {
-        CompleteOperation(operationId);
-    }
-    EvictBlockStatesOverBudget();
+    return data;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Read path
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-ui64 TIntegrityManager::BeginChecksumRead(TDataChunkKey key, ui32 offsetInBytes, ui32 size) {
-    Y_ABORT_UNLESS(size > 0 && offsetInBytes % IntegrityUnitSize == 0
-        && size % IntegrityUnitSize == 0 && ui64(offsetInBytes) + size <= DataChunkSize);
-
-    const ui64 operationId = NextOperationId++;
-    auto [operationIt, inserted] = PendingOperations.emplace(operationId, TPendingOperation{
-        .Kind = EOperationKind::Read,
-        .Key = key,
-        .OffsetInBytes = offsetInBytes,
-        .Size = size,
-    });
-    Y_ABORT_UNLESS(inserted);
-    TPendingOperation& operation = operationIt->second;
-
-    const auto extentIt = Extents.find(key);
-    if (extentIt == Extents.end()) {
-        CompleteOperation(operationId, EOperationStatus::Corrupted,
-            "integrity extent is missing for an allocated data chunk");
-        return operationId;
-    }
-    TExtentInfo& extent = extentIt->second;
-
-    for (ui32 pairIdx = FirstPair(offsetInBytes); pairIdx < EndPair(offsetInBytes, size); ++pairIdx) {
-        const TPairMeta& pair = extent.Pairs.at(pairIdx);
-        if (pair.Corrupted) {
-            CompleteOperation(operationId, EOperationStatus::Corrupted,
-                extent.PairRuntime.at(pairIdx).CorruptionReason,
-                extent.PairRuntime.at(pairIdx).LostWriteCorruption);
-            return operationId;
-        }
-    }
-
-    operation.PairsPinned = true;
-    for (ui32 pairIdx = FirstPair(offsetInBytes); pairIdx < EndPair(offsetInBytes, size); ++pairIdx) {
-        TPairMeta& pair = extent.Pairs.at(pairIdx);
-        ++pair.OperationPins;
-        if (!pair.Resident) {
-            GetPairRuntime(extent, pairIdx).LoadWaiters.push_back(operationId);
-            ++operation.PendingLoads;
-            QueuePairRead(key, extent, pairIdx);
-        } else {
-            // Read hits keep hot metadata in the LRU. Fresh empty pairs have no cached state.
-            FindBlockState(extent, pairIdx);
-        }
-    }
-    if (!operation.PendingLoads) {
-        CompleteReadOperation(operationId, operation);
-    }
-    return operationId;
-}
-
-std::vector<TIntegrityManager::TOperationResult> TIntegrityManager::TakeCompletedOperations() {
-    return std::exchange(CompletedOperations, {});
-}
-
 TIntegrityManager::TReadPlan TIntegrityManager::MakeReadPlan(TDataChunkKey key, ui32 offsetInBytes, ui32 size) const {
     TReadPlan plan;
 
     const auto it = Extents.find(key);
     if (it == Extents.end()) {
-        // BeginChecksumRead rejects allocated chunks without an integrity extent, so this fallback
+        // StartRead rejects allocated chunks without an integrity extent, so this fallback
         // is unreachable through the actor read path.
         return plan;
     }
@@ -1043,7 +627,7 @@ TIntegrityManager::TReadPlan TIntegrityManager::MakeReadPlan(TDataChunkKey key, 
             && ui64(offsetInBytes) + size <= DataChunkSize) {
         for (ui32 pairIdx = FirstPair(offsetInBytes); pairIdx < EndPair(offsetInBytes, size); ++pairIdx) {
             if (!extent.Pairs.at(pairIdx).BitmapKnown) {
-                // A restored pair has not been read yet; pass through until BeginChecksumRead
+                // A restored pair has not been read yet; pass through until StartRead
                 // restores its exact bitmap.
                 return plan;
             }
@@ -1109,7 +693,7 @@ TIntegrityManager::TMappingSnapshot TIntegrityManager::SnapshotMapping() const {
 }
 
 void TIntegrityManager::ApplyMappingSnapshot(const TMappingSnapshot& snapshot) {
-    Y_ABORT_UNLESS(IntegrityChunks.empty() && Extents.empty() && PendingExtents.empty() && IosInFlight.empty(),
+    Y_ABORT_UNLESS(IntegrityChunks.empty() && Extents.empty() && PendingExtents.empty(),
         "mapping snapshot must be applied to a fresh manager");
 
     // Resume the generation counter past everything ever persisted. Generations handed out after
@@ -1124,6 +708,7 @@ void TIntegrityManager::ApplyMappingSnapshot(const TMappingSnapshot& snapshot) {
         Y_ABORT_UNLESS(inserted);
         it->second.Generation = entry.Generation;
         it->second.State = EChunkState::Ready;
+        it->second.Completion->Ready = true;
         GenerationCounter = Max(GenerationCounter, entry.Generation);
     }
 
@@ -1137,6 +722,7 @@ void TIntegrityManager::ApplyMappingSnapshot(const TMappingSnapshot& snapshot) {
         TExtentInfo& extent = it->second;
         extent.Ref = entry.Ref;
         extent.State = EExtentState::Ready;
+        extent.Completion->Ready = extent.Completion->Placed = true;
         extent.DataChunkIdx = entry.DataChunkIdx;
         // Pinned pair state is reconstructed lazily by adjacent 8 KiB A/B reads.
         extent.Pairs.resize(BlocksPerExtentCount);
@@ -1215,24 +801,743 @@ bool TIntegrityManager::GetBlockChecksum(TDataChunkKey key, ui32 blockIdx, ui64*
 }
 
 bool TIntegrityManager::HasInFlightOperationsForTablet(ui64 tabletId) const {
-    for (const auto& [operationId, operation] : PendingOperations) {
-        Y_UNUSED(operationId);
-        if (operation.Key.TabletId == tabletId) {
-            return true;
+    for (const auto& [key, extent] : Extents) {
+        if (key.TabletId != tabletId) {
+            continue;
         }
-    }
-    for (const auto& [ioId, ref] : IosInFlight) {
-        Y_UNUSED(ioId);
-        if (const auto* read = std::get_if<TPairReadRef>(&ref);
-                read && read->Key.TabletId == tabletId) {
-            return true;
+        for (const auto& pair : extent.Pairs) {
+            if (pair.OperationPins) {
+                return true;
+            }
         }
-        if (const auto* write = std::get_if<TPairWriteRef>(&ref);
-                write && write->Key.TabletId == tabletId) {
-            return true;
+        for (const auto& [_, runtime] : extent.PairRuntime) {
+            if (runtime->Loading || runtime->Flushing) {
+                return true;
+            }
         }
     }
     return false;
+}
+
+NActors::async<bool> TIntegrityManager::TExtent::WaitImpl(NActors::IActor& actor,
+        std::shared_ptr<TExtentState> state, bool ready)
+{
+    Y_UNUSED(actor);
+    while (!(ready ? state->Ready : state->Placed) && !state->Failed) {
+        co_await state->Changed.Wait();
+    }
+    co_return ready ? state->Ready : state->Placed;
+}
+
+void TIntegrityManager::Stop() {
+    Stopped = true;
+    // Snapshot all observers before notification: a resumed coroutine can retire an extent.
+    std::vector<std::shared_ptr<TOperationState>> reads;
+    reads.reserve(PendingReads.size());
+    for (const auto& [_, read] : PendingReads) {
+        reads.push_back(read->Completion);
+    }
+    std::vector<std::shared_ptr<TExtentState>> milestones;
+    milestones.reserve(IntegrityChunks.size() + Extents.size());
+    for (auto& [_, chunk] : IntegrityChunks) {
+        chunk.Completion->Failed = true;
+        milestones.push_back(chunk.Completion);
+    }
+    for (auto& [_, extent] : Extents) {
+        extent.Completion->Failed = true;
+        milestones.push_back(extent.Completion);
+    }
+    std::vector<std::shared_ptr<TPendingWrite>> writes;
+    for (const auto& [_, write] : PendingWrites) {
+        writes.push_back(write);
+    }
+    for (const auto& write : writes) {
+        PairWork.emplace_back(write);
+    }
+    for (const auto& completion : reads) {
+        TOperationResult result;
+        result.Status = EOperationStatus::Failed;
+        PairWork.emplace_back(TCompletionNotification{completion, std::move(result)});
+    }
+    for (const auto& milestone : milestones) {
+        PairWork.emplace_back(milestone);
+    }
+    DrainPairWork();
+}
+
+void TIntegrityManager::CompleteAllocation(ui64 token, TChunkIdx chunkIdx) {
+    if (!PendingChunkAllocations.erase(token)) {
+        return;
+    }
+    if (!chunkIdx) {
+        return;
+    }
+    if (Stopped || CancelChunkAllocationIfExcess()) {
+        Host.ReturnChunk(chunkIdx);
+    } else {
+        OnIntegrityChunkAllocated(chunkIdx);
+    }
+    DrainPairWork();
+}
+
+TIntegrityManager::TPairRead TIntegrityManager::ClaimPairRead(TDataChunkKey key,
+        TExtentInfo& extent, ui32 pairIdx, const std::shared_ptr<TPairRuntime>& runtime)
+{
+    Y_ABORT_UNLESS(!runtime->Loading);
+    runtime->Loading = true;
+    const ui64 id = NextPairReadId++;
+    PairLoads.emplace(id, TPairLoad{key, pairIdx, runtime});
+    return {
+        id,
+        extent.Ref.IntegrityChunkIdx,
+        static_cast<ui32>(ExtentOffset(extent.Ref.ExtentSlot)
+            + pairIdx * IntegrityPairSlots * IntegrityUnitSize),
+        IntegrityPairSlots * IntegrityUnitSize,
+    };
+}
+
+void TIntegrityManager::CompleteOperation(const std::shared_ptr<TOperationState>& completion,
+        TOperationResult result)
+{
+    if (!completion->Result) {
+        completion->Result.emplace(std::move(result));
+        completion->Changed.NotifyAll();
+    }
+    if (!completion->Settled) {
+        return;
+    }
+    auto callback = std::move(completion->CompletionCallback);
+    if (callback) {
+        callback();
+    }
+}
+
+void TIntegrityManager::CompletePairReads(TConstArrayRef<TPairReadResult> results) {
+    std::vector<TPairLoad> completed;
+    completed.reserve(results.size());
+    // Apply every image before waking either readers or writers. A callback can submit more
+    // work, so no reference into PairLoads or Extents survives notification.
+    for (const auto& result : results) {
+        const auto it = PairLoads.find(result.Id);
+        if (it == PairLoads.end()) {
+            continue;
+        }
+        // Duplicate or retired completion.
+        auto load = std::move(it->second);
+        PairLoads.erase(it);
+        auto& runtime = *load.Runtime;
+        Y_ABORT_UNLESS(runtime.Loading);
+        runtime.Loading = false;
+        runtime.Failed = !result.Result.Ok;
+        if (auto* extent = FindCurrentPair(load.Key, load.PairIdx, load.Runtime)) {
+            if (result.Result.Ok && !LoadPairImage(load.Key, *extent, load.PairIdx, result.Result.Data,
+                    &runtime.CorruptionReason, &runtime.LostWriteCorruption)) {
+                extent->Pairs.at(load.PairIdx).Corrupted = true;
+            }
+        } else {
+            runtime.Failed = true;
+        }
+        completed.push_back(std::move(load));
+    }
+    std::vector<std::shared_ptr<TPendingRead>> ready;
+    for (const auto& load : completed) {
+        auto readers = std::exchange(load.Runtime->Readers, {});
+        for (const auto& weak : readers) {
+            if (auto read = weak.lock()) {
+                Y_ABORT_UNLESS(read->Remaining);
+                if (!--read->Remaining) {
+                    ready.push_back(std::move(read));
+                }
+            }
+        }
+        if (auto* extent = FindCurrentPair(load.Key, load.PairIdx, load.Runtime)) {
+            MaybeDropPairRuntime(*extent, load.PairIdx);
+        }
+    }
+    for (const auto& read : ready) {
+        FinishPendingRead(read);
+    }
+    for (const auto& load : completed) {
+        NotifyWriters(load.Runtime);
+    }
+    EvictBlockStatesOverBudget();
+    DrainPairWork();
+}
+
+void TIntegrityManager::FinishPendingRead(const std::shared_ptr<TPendingRead>& read) {
+    Y_ABORT_UNLESS(!read->Remaining);
+    auto it = Extents.find(read->Key);
+    TExtentInfo* extent = it != Extents.end() && it->second.Ref.VChunkGeneration == read->VChunkGeneration
+        ? &it->second : nullptr;
+    const ui32 first = FirstPair(read->Offset), end = EndPair(read->Offset, read->Size);
+    TOperationResult result;
+    if (!extent) {
+        result.Status = EOperationStatus::Failed;
+    }
+    if (extent && !read->Completion->Result) {
+        for (ui32 idx = first; idx < end; ++idx) {
+            const auto runtimeIt = extent->PairRuntime.find(idx);
+            if (extent->Pairs.at(idx).Corrupted) {
+                Y_ABORT_UNLESS(runtimeIt != extent->PairRuntime.end());
+                result.Status = EOperationStatus::Corrupted;
+                result.ErrorReason = runtimeIt->second->CorruptionReason;
+                result.LostWriteDetected = runtimeIt->second->LostWriteCorruption;
+                break;
+            }
+            if (runtimeIt != extent->PairRuntime.end() && runtimeIt->second->Failed) {
+                result.Status = EOperationStatus::Failed;
+            }
+        }
+        if (Stopped) {
+            result.Status = EOperationStatus::Failed;
+        }
+        if (result.Status == EOperationStatus::Ok) {
+            CollectReadResult(*extent, read->Offset, read->Size, result, false);
+        }
+    }
+    if (extent) {
+        for (ui32 idx = first; idx < end; ++idx) {
+            Y_ABORT_UNLESS(extent->Pairs.at(idx).OperationPins);
+            --extent->Pairs.at(idx).OperationPins;
+            MaybeDropPairRuntime(*extent, idx);
+        }
+    }
+    PendingReads.erase(read->Id);
+    EvictBlockStatesOverBudget();
+    read->Completion->Settled = true;
+    PairWork.emplace_back(TCompletionNotification{read->Completion, std::move(result)});
+}
+
+void TIntegrityManager::FlushPair(TDataChunkKey key, ui32 pairIdx,
+        const std::shared_ptr<TPairRuntime>& runtime)
+{
+    if (runtime->Flushing || runtime->Failed || !runtime->Dirty || Stopped) {
+        return;
+    }
+    auto* current = FindCurrentPair(key, pairIdx, runtime);
+    if (!current) {
+        runtime->Failed = true;
+        NotifyWriters(runtime);
+        return;
+    }
+    auto& extent = *current;
+    if (extent.Completion->Failed) {
+        runtime->Failed = true;
+        NotifyWriters(runtime);
+        return;
+    }
+    if (!extent.Completion->Ready) {
+        return;
+    }
+    const auto slot = extent.Pairs.at(pairIdx).CurrentSlot == EPairSlot::A ? EPairSlot::B : EPairSlot::A;
+    const auto ref = extent.Ref;
+    auto image = MakePairImage(key, extent, pairIdx);
+    const ui64 id = NextPairWriteId++;
+    PairWrites.emplace(id, TPairWrite{key, pairIdx, runtime, runtime->MutationVersion, slot});
+    runtime->Dirty = false;
+    runtime->Flushing = true;
+    const size_t offset = ExtentOffset(ref.ExtentSlot)
+        + (pairIdx * IntegrityPairSlots + (slot == EPairSlot::A ? 0 : 1)) * IntegrityUnitSize;
+    Y_ABORT_UNLESS(offset <= Max<ui32>());
+    PairWork.emplace_back(TWriteSubmission{id, ref.IntegrityChunkIdx,
+        static_cast<ui32>(offset),
+        std::move(image), EWriteIoKind::Pair});
+}
+
+void TIntegrityManager::CompleteWrite(ui64 id, bool ok) {
+    if (auto it = FormatWrites.find(id); it != FormatWrites.end()) {
+        auto write = std::move(it->second);
+        FormatWrites.erase(it);
+        CompleteFormatWrite(std::move(write), ok);
+    } else {
+        PairWork.emplace_back(TPairWriteCompletion{id, ok});
+    }
+    DrainPairWork();
+}
+
+void TIntegrityManager::ProcessPairWriteCompletion(ui64 id, bool ok) {
+    const auto it = PairWrites.find(id);
+    if (it == PairWrites.end()) {
+        return;
+    }
+    // Duplicate or retired completion.
+    auto write = std::move(it->second);
+    PairWrites.erase(it);
+    const auto runtime = write.Runtime;
+    runtime->Flushing = false;
+    auto* extent = FindCurrentPair(write.Key, write.PairIdx, runtime);
+    if (ok && extent) {
+        extent->Pairs.at(write.PairIdx).CurrentSlot = write.Slot;
+        auto* state = FindBlockState(*extent, write.PairIdx);
+        Y_ABORT_UNLESS(state);
+        ++state->PairSequenceNumber;
+        runtime->DurableVersion = write.Version;
+    } else {
+        runtime->Failed = true;
+    }
+    // Follow-up submission may complete inline. It queues its own result, leaving this frame's
+    // bookkeeping intact until we finish and the queue advances.
+    if (extent) {
+        FlushPair(write.Key, write.PairIdx, runtime);
+    }
+    if (auto* current = FindCurrentPair(write.Key, write.PairIdx, runtime)) {
+        MaybeDropPairRuntime(*current, write.PairIdx);
+    }
+    NotifyWriters(runtime);
+    EvictBlockStatesOverBudget();
+}
+
+void TIntegrityManager::DrainPairWork() {
+    if (DrainingPairWork) {
+        return;
+    }
+    DrainingPairWork = true;
+    Y_DEFER { DrainingPairWork = false; };
+    while (!PairWork.empty()) {
+        auto work = std::move(PairWork.front());
+        PairWork.pop_front();
+        if (auto* pair = std::get_if<TPairWriteCompletion>(&work)) {
+            ProcessPairWriteCompletion(pair->Id, pair->Ok);
+        } else if (auto* write = std::get_if<std::shared_ptr<TPendingWrite>>(&work)) {
+            AdvanceWrite(*write);
+        } else if (auto* notification = std::get_if<TCompletionNotification>(&work)) {
+            CompleteOperation(notification->Completion, std::move(notification->Result));
+        } else if (auto* allocation = std::get_if<TAllocationSubmission>(&work)) {
+            if (PendingChunkAllocations.contains(allocation->Token)) {
+                if (Stopped) {
+                    CompleteAllocation(allocation->Token, 0);
+                }
+                else {
+                    Host.SubmitAllocation(allocation->Token);
+                }
+            }
+        } else if (auto* submission = std::get_if<TWriteSubmission>(&work)) {
+            if (Stopped) {
+                CompleteWrite(submission->Id, false);
+            }
+            else {
+                Host.SubmitWrite(submission->Id, submission->ChunkIdx, submission->Offset,
+                std::move(submission->Data), submission->Kind);
+            }
+        } else {
+            auto milestone = std::get<std::shared_ptr<TExtentState>>(work);
+            milestone->Changed.NotifyAll();
+            if (auto callback = milestone->ProgressCallback) {
+                callback();
+            }
+        }
+    }
+}
+
+TIntegrityManager::TReadPreparation TIntegrityManager::PrepareRead(
+        TDataChunkKey key, ui32 offset, ui32 size, std::optional<TOperationResult>& readyResult)
+{
+    Y_ABORT_UNLESS(!readyResult);
+    ValidateOperationRange(offset, size);
+    TReadPreparation preparation;
+    bool failed = false;
+    const auto it = Extents.find(key);
+    if (Stopped) {
+        readyResult.emplace().Status = EOperationStatus::Failed;
+        return preparation;
+    }
+    if (it == Extents.end() || it->second.DeletionPending) {
+        auto& error = readyResult.emplace();
+        error.Status = EOperationStatus::Corrupted;
+        error.ErrorReason = "integrity extent is missing for an allocated data chunk";
+        return preparation;
+    }
+    auto& extent = it->second;
+    const ui32 first = FirstPair(offset), end = EndPair(offset, size);
+    bool pending = false;
+    for (ui32 idx = first; idx < end; ++idx) {
+        const auto& pair = extent.Pairs.at(idx);
+        const auto runtimeIt = extent.PairRuntime.find(idx);
+        if (pair.Corrupted) {
+            Y_ABORT_UNLESS(runtimeIt != extent.PairRuntime.end());
+            auto& error = readyResult.emplace();
+            error.Status = EOperationStatus::Corrupted;
+            error.ErrorReason = runtimeIt->second->CorruptionReason;
+            error.LostWriteDetected = runtimeIt->second->LostWriteCorruption;
+            return preparation;
+        }
+        if (runtimeIt != extent.PairRuntime.end() && runtimeIt->second->Failed) {
+            failed = true;
+        }
+        pending |= !pair.Resident;
+    }
+    if (failed) {
+        readyResult.emplace().Status = EOperationStatus::Failed;
+        return preparation;
+    }
+    if (!pending) {
+        CollectReadResult(extent, offset, size, readyResult.emplace(), true);
+        EvictBlockStatesOverBudget();
+        return preparation;
+    }
+    // Pin the complete range before claiming any load. No submission or eager coroutine may
+    // evict a cached sibling before the read captures its complete immutable snapshot.
+    for (ui32 idx = first; idx < end; ++idx) {
+        ++extent.Pairs.at(idx).OperationPins;
+    }
+    auto read = std::make_shared<TPendingRead>();
+    read->Id = NextPendingReadId++;
+    read->Key = key;
+    read->VChunkGeneration = extent.Ref.VChunkGeneration;
+    read->Offset = offset;
+    read->Size = size;
+    read->Completion = std::make_shared<TOperationState>();
+    read->Completion->Settled = false;
+    PendingReads.emplace(read->Id, read);
+    preparation.Pending = TOperation(read->Completion);
+    for (ui32 idx = first; idx < end; ++idx) {
+        if (extent.Pairs.at(idx).Resident) {
+            FindBlockState(extent, idx);
+            continue;
+        }
+        auto runtime = GetPairRuntime(extent, idx);
+        if (!runtime->Loading) {
+            preparation.Reads.push_back(ClaimPairRead(key, extent, idx, runtime));
+        }
+        ++read->Remaining;
+        runtime->Readers.push_back(read);
+    }
+    Y_ABORT_UNLESS(read->Remaining);
+    return preparation;
+}
+
+TIntegrityManager::TOperation TIntegrityManager::StartRead(TDataChunkKey key, ui32 offset, ui32 size) {
+    std::optional<TOperationResult> readyResult;
+    auto preparation = PrepareRead(key, offset, size, readyResult);
+    if (readyResult) {
+        auto completion = std::make_shared<TOperationState>();
+        completion->Result.emplace(std::move(*readyResult));
+        return TOperation(std::move(completion));
+    }
+    if (!preparation.Reads.empty()) {
+        Host.SubmitPairReads(std::move(preparation.Reads));
+    }
+    return std::move(preparation.Pending);
+}
+
+void TIntegrityManager::ValidateOperationRange(ui32 offset, ui32 size) const {
+    Y_ABORT_UNLESS(size && offset % IntegrityUnitSize == 0 && size % IntegrityUnitSize == 0
+        && ui64(offset) + size <= DataChunkSize);
+}
+
+void TIntegrityManager::CollectSingleReadResult(TExtentInfo& extent, ui32 block,
+        TOperationResult& result, bool touch)
+{
+    const ui32 pair = block / ChecksumsPerIntegrityBlock;
+    const TIntegrityBlockState* state = nullptr;
+    if (touch) {
+        state = FindBlockState(extent, pair);
+    } else if (const auto it = extent.BlockStates.find(pair); it != extent.BlockStates.end()) {
+        state = it->second.get();
+    }
+    const bool used = extent.UsedBlocks.Get(block);
+    result.ReadPlan.Kind = !used && extent.Pairs.at(pair).BitmapKnown
+        ? TReadPlan::AllZero : TReadPlan::Passthrough;
+    const ui32 slot = block % ChecksumsPerIntegrityBlock;
+    if (!used) {
+        result.Checksums.SetSingle(GetZeroBlockChecksum());
+    } else if (state && state->Known.Get(slot)) {
+        result.Checksums.SetSingle(state->Checksums[slot]);
+    } else {
+        result.Status = EOperationStatus::Corrupted;
+        result.ErrorReason = TStringBuilder() << "checksum is missing for used data block " << block;
+    }
+}
+
+void TIntegrityManager::CollectReadResult(TExtentInfo& extent, ui32 offset, ui32 size,
+        TOperationResult& result, bool touch)
+{
+    const ui32 firstBlock = offset / IntegrityUnitSize;
+    const ui32 endBlock = (offset + size) / IntegrityUnitSize;
+    const ui32 numBlocks = endBlock - firstBlock;
+    if (numBlocks == 1) {
+        CollectSingleReadResult(extent, firstBlock, result, touch);
+        return;
+    }
+    std::vector<ui64> checksums;
+    checksums.reserve(numBlocks);
+    result.ReadPlan.UsedBlocks.Reserve(numBlocks);
+    ui32 usedCount = 0;
+    bool bitmapKnown = true;
+    for (ui32 pair = FirstPair(offset); pair < EndPair(offset, size); ++pair) {
+        bitmapKnown &= extent.Pairs.at(pair).BitmapKnown;
+        const TIntegrityBlockState* state = nullptr;
+        if (touch) {
+            state = FindBlockState(extent, pair);
+        } else if (const auto it = extent.BlockStates.find(pair); it != extent.BlockStates.end()) {
+            state = it->second.get();
+        }
+        const ui32 begin = Max(firstBlock, pair * ChecksumsPerIntegrityBlock);
+        const ui32 end = Min(endBlock, (pair + 1) * ChecksumsPerIntegrityBlock);
+        for (ui32 block = begin; block < end; ++block) {
+            const bool used = extent.UsedBlocks.Get(block);
+            if (used) {
+                ++usedCount;
+                result.ReadPlan.UsedBlocks.Set(block - firstBlock);
+            }
+            // Keep collecting the plan after the first checksum error.
+            if (result.Status != EOperationStatus::Ok) {
+                continue;
+            }
+            const ui32 slot = block % ChecksumsPerIntegrityBlock;
+            if (!used) {
+                checksums.push_back(GetZeroBlockChecksum());
+            } else if (state && state->Known.Get(slot)) {
+                checksums.push_back(state->Checksums[slot]);
+            } else {
+                result.Status = EOperationStatus::Corrupted;
+                result.ErrorReason = TStringBuilder() << "checksum is missing for used data block " << block;
+                checksums.clear();
+            }
+        }
+    }
+    if (result.Status == EOperationStatus::Ok) {
+        result.Checksums.SetMany(std::move(checksums));
+    }
+    if (!bitmapKnown || usedCount == numBlocks) {
+        result.ReadPlan.Kind = TReadPlan::Passthrough;
+        result.ReadPlan.UsedBlocks.Clear();
+    } else if (!usedCount) {
+        result.ReadPlan.Kind = TReadPlan::AllZero;
+        result.ReadPlan.UsedBlocks.Clear();
+    } else {
+        result.ReadPlan.Kind = TReadPlan::Mixed;
+    }
+}
+
+TIntegrityManager::TWritePreparation TIntegrityManager::PrepareWrite(TDataChunkKey key, ui32 offset, ui32 size) {
+    ValidateOperationRange(offset, size);
+    auto completion = std::make_shared<TOperationState>();
+    auto preparation = std::make_shared<TOperationState>();
+    TWritePreparation resultHandle{0, TOperation(preparation), TOperation(completion)};
+    TOperationResult result;
+    auto it = Extents.find(key);
+    if (Stopped) {
+        result.Status = EOperationStatus::Failed;
+        CompleteOperation(preparation, result);
+        CompleteOperation(completion, std::move(result));
+        return resultHandle;
+    }
+    if (it == Extents.end() || it->second.DeletionPending) {
+        result.Status = EOperationStatus::Corrupted;
+        result.ErrorReason = "integrity extent is missing for an allocated data chunk";
+        CompleteOperation(preparation, result);
+        CompleteOperation(completion, std::move(result));
+        return resultHandle;
+    }
+    const ui32 first = FirstPair(offset), end = EndPair(offset, size);
+    for (ui32 idx = first; idx < end; ++idx) {
+        if (it->second.Pairs.at(idx).Corrupted) {
+            const auto& runtime = *it->second.PairRuntime.at(idx);
+            result.Status = EOperationStatus::Corrupted;
+            result.ErrorReason = runtime.CorruptionReason;
+            result.LostWriteDetected = runtime.LostWriteCorruption;
+            CompleteOperation(preparation, result);
+            CompleteOperation(completion, std::move(result));
+            return resultHandle;
+        }
+    }
+    // Own the complete range before claiming loads or allowing synchronous completions.
+    auto write = std::make_shared<TPendingWrite>();
+    write->Id = NextPendingWriteId++;
+    write->Key = key;
+    write->Offset = offset;
+    write->Size = size;
+    write->Completion = completion;
+    write->Preparation = preparation;
+    completion->Settled = false;
+    preparation->Settled = false;
+    resultHandle.Id = write->Id;
+    PendingWrites.emplace(write->Id, write);
+    for (ui32 idx = first; idx < end; ++idx) {
+        ++it->second.Pairs.at(idx).OperationPins;
+    }
+    std::vector<TPairRead> reads;
+    for (ui32 idx = first; idx < end; ++idx) {
+        auto& extent = Extents.at(key);
+        auto runtime = GetPairRuntime(extent, idx);
+        write->Runtimes.push_back(runtime);
+        runtime->Writers.push_back(write);
+        const auto& pair = extent.Pairs.at(idx);
+        if (!Stopped && !pair.Resident && !runtime->Loading && !runtime->Failed) {
+            reads.push_back(ClaimPairRead(key, extent, idx, runtime));
+        } else if (pair.Resident) {
+            FindBlockState(extent, idx);
+        }
+    }
+    if (!reads.empty()) {
+        Host.SubmitPairReads(std::move(reads));
+    }
+    PairWork.emplace_back(write);
+    DrainPairWork();
+    return resultHandle;
+}
+
+void TIntegrityManager::ConsumeWrite(ui64 id, std::vector<ui64> checksums) {
+    const auto it = PendingWrites.find(id);
+    if (it == PendingWrites.end()) {
+        return;
+    }
+    const auto write = it->second;
+    Y_ABORT_UNLESS(!write->Consumed && !write->Cancelled && !write->Applied);
+    Y_ABORT_UNLESS(checksums.size() == write->Size / IntegrityUnitSize);
+    write->Consumed = true;
+    write->Checksums = std::move(checksums);
+    PairWork.emplace_back(write);
+    DrainPairWork();
+}
+
+void TIntegrityManager::CancelWrite(ui64 id) {
+    const auto it = PendingWrites.find(id);
+    if (it == PendingWrites.end() || it->second->Applied) {
+        return;
+    }
+    it->second->Cancelled = true;
+    PairWork.emplace_back(it->second);
+    DrainPairWork();
+}
+
+TIntegrityManager::TOperation TIntegrityManager::StartWrite(TDataChunkKey key, ui32 offset, ui32 size,
+        const std::vector<ui64>& checksums)
+{
+    Y_ABORT_UNLESS(checksums.size() == size / IntegrityUnitSize);
+    auto preparation = PrepareWrite(key, offset, size);
+    if (preparation.Id) {
+        ConsumeWrite(preparation.Id, checksums);
+    }
+    return std::move(preparation.Durable);
+}
+
+void TIntegrityManager::FinishWrite(const std::shared_ptr<TPendingWrite>& write, TOperationResult result) {
+    for (ui32 idx = FirstPair(write->Offset); idx < EndPair(write->Offset, write->Size); ++idx) {
+        if (auto* extent = FindCurrentPair(write->Key, idx,
+                write->Runtimes[idx - FirstPair(write->Offset)])) {
+            Y_ABORT_UNLESS(extent->Pairs.at(idx).OperationPins);
+            --extent->Pairs.at(idx).OperationPins;
+            MaybeDropPairRuntime(*extent, idx);
+        }
+    }
+    PendingWrites.erase(write->Id);
+    EvictBlockStatesOverBudget();
+    if (!write->PreparationNotified) {
+        write->PreparationNotified = true;
+        write->Preparation->Settled = true;
+        PairWork.emplace_back(TCompletionNotification{write->Preparation, result});
+    }
+    write->Completion->Settled = true;
+    PairWork.emplace_back(TCompletionNotification{write->Completion, std::move(result)});
+}
+
+void TIntegrityManager::NotifyWriters(const std::shared_ptr<TPairRuntime>& runtime) {
+    // Writer advancement and completion notification run only through the queue. A callback may
+    // delete and recreate this key or start another mutation with immediately completed I/O.
+    const auto writers = runtime->Writers;
+    for (const auto& weak : writers) {
+        if (auto write = weak.lock()) {
+            PairWork.emplace_back(std::move(write));
+        }
+    }
+    std::erase_if(runtime->Writers, [](const auto& weak) {
+        auto write = weak.lock();
+        return !write || write->Completion->Settled;
+    });
+}
+
+void TIntegrityManager::AdvanceWrite(const std::shared_ptr<TPendingWrite>& write) {
+    if (write->Completion->Settled) {
+        return;
+    }
+    const auto key = write->Key;
+    const ui32 first = FirstPair(write->Offset), end = EndPair(write->Offset, write->Size);
+    auto& runtimes = write->Runtimes;
+    TOperationResult result;
+    if (!write->Applied) {
+        // Failure still joins all accepted sibling loads before releasing any pins.
+        for (const auto& runtime : runtimes) {
+            if (runtime->Loading) {
+                return;
+            }
+        }
+    }
+    for (ui32 idx = first; idx < end; ++idx) {
+        if (!FindCurrentPair(key, idx, runtimes[idx - first])) {
+            result.Status = EOperationStatus::Failed;
+            FinishWrite(write, std::move(result));
+            return;
+        }
+    }
+    if (!write->Applied) {
+        for (ui32 idx = first; idx < end; ++idx) {
+            const auto& runtime = runtimes[idx - first];
+            if (auto* extent = FindCurrentPair(key, idx, runtime); extent && extent->Pairs.at(idx).Corrupted) {
+                result.Status = EOperationStatus::Corrupted;
+                result.ErrorReason = runtime->CorruptionReason;
+                result.LostWriteDetected = runtime->LostWriteCorruption;
+                FinishWrite(write, std::move(result));
+                return;
+            }
+            if (runtime->Failed) {
+                result.Status = EOperationStatus::Failed;
+            }
+        }
+        if (Stopped || write->Cancelled || result.Status == EOperationStatus::Failed) {
+            result.Status = EOperationStatus::Failed;
+            FinishWrite(write, std::move(result));
+            return;
+        }
+        if (!write->PreparationNotified) {
+            write->PreparationNotified = true;
+            write->Preparation->Settled = true;
+            PairWork.emplace_back(TCompletionNotification{write->Preparation, {}});
+        }
+        if (!write->Consumed) {
+            return;
+        }
+        // Apply the complete mutation and capture all versions in one actor turn.
+        auto& extent = *FindCurrentPair(key, first, runtimes.front());
+        for (ui32 block = write->Offset / IntegrityUnitSize;
+                block < (write->Offset + write->Size) / IntegrityUnitSize; ++block) {
+            extent.UsedBlocks.Set(block);
+            const ui32 idx = block / ChecksumsPerIntegrityBlock, slot = block % ChecksumsPerIntegrityBlock;
+            auto& state = GetOrCreateBlockState(key, extent, idx);
+            auto& pair = extent.Pairs.at(idx);
+            const ui64 checksum = write->Checksums[block - write->Offset / IntegrityUnitSize];
+            if (state.Known.Get(slot)) {
+                UpdateRoot(pair.Digest, extent.Ref.VChunkGeneration, block, state.Checksums[slot], checksum);
+            } else {
+                pair.Digest ^= Contribution(extent.Ref.VChunkGeneration, block, checksum);
+                state.Known.Set(slot);
+            }
+            state.Checksums[slot] = checksum;
+            pair.DigestKnown = true;
+        }
+        for (auto& runtime : runtimes) {
+            write->Versions.push_back(++runtime->MutationVersion);
+            runtime->Dirty = true;
+        }
+        write->Applied = true;
+        std::vector<ui64>().swap(write->Checksums);
+        for (ui32 idx = first; idx < end; ++idx) {
+            auto runtime = runtimes[idx - first];
+            FlushPair(key, idx, runtime);
+        }
+        EvictBlockStatesOverBudget();
+    }
+    for (size_t i = 0; i < runtimes.size(); ++i) {
+        const auto& runtime = runtimes[i];
+        if (runtime->DurableVersion < write->Versions[i]) {
+            if (!runtime->Failed && (!Stopped || runtime->Flushing)) {
+                return;
+            }
+            result.Status = EOperationStatus::Failed;
+        }
+    }
+    FinishWrite(write, std::move(result));
 }
 
 } // namespace NKikimr::NDDisk

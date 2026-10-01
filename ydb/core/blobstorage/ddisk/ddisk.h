@@ -722,7 +722,8 @@ struct TPersistentBufferFormat {
 
         TEvReadResult(NKikimrBlobStorage::NDDisk::TReplyStatus::E status,
                 const std::optional<TString>& errorReason = std::nullopt,
-                TRope data = {}, const std::vector<ui64>& checksums = {}) {
+                TRope data = {}, TConstArrayRef<ui64> checksums = {})
+        {
             Record.SetStatus(status);
             if (errorReason) {
                 Record.SetErrorReason(*errorReason);

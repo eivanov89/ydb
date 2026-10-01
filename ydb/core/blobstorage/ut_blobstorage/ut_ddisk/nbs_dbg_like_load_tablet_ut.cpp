@@ -378,6 +378,7 @@ Y_UNIT_TEST_SUITE(NbsDbgLikeLoadTablet) {
         f.Env.Runtime->WrapInActorContext(f.Edge, [&] {
             auto ev = std::make_unique<TEvLoad::TEvConfigureTablet>();
             auto& cfg = ev->Record;
+            cfg.SetConfigurationId(1);
             cfg.SetMaxInflightLsns(4);
             cfg.SetFlushBatchSize(1);
             cfg.SetEraseBatchSize(1);
@@ -387,6 +388,11 @@ Y_UNIT_TEST_SUITE(NbsDbgLikeLoadTablet) {
             cfg.SetIoSizeBytes(blockSize);
             NTabletPipe::SendData(f.Edge, pipe, ev.release());
         });
+        // Configuration drains and reconfigures the workers asynchronously.
+        // Inject the PB failure only after writes can reach those workers.
+        auto configured = f.Env.WaitForEdgeActorEvent<TEvLoad::TEvConfigureTabletResult>(
+            f.Edge, false, f.Deadline(TDuration::Seconds(30)));
+        UNIT_ASSERT(configured && configured->Get()->Record.GetSuccess());
 
         TString firstPeer;
         ui32 injectedReplies = 0;
