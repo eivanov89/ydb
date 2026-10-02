@@ -145,7 +145,7 @@ Y_UNIT_TEST_SUITE(TDDiskActorPDiskTest) {
         TestDevNullWriteAndRead(true);
     }
 
-    Y_UNIT_TEST(CoroutineParkedReadSessionReplacement_Uring) {
+    Y_UNIT_TEST(CoroutineParkedWriteSessionReplacement_Uring) {
         if (!NPDisk::RequireUring()) {
             return;
         }
@@ -173,7 +173,14 @@ Y_UNIT_TEST_SUITE(TDDiskActorPDiskTest) {
             auto empty = ctx.SendAndGrab<TEvGateState>(new TEvControlGate());
             UNIT_ASSERT_VALUES_EQUAL(empty->Get()->Reserved, 0);
             write(creds, 100, 501);
+            // The write parks until a reserve arrives; the read of its unpublished chunk
+            // answers zeroes without waiting for that allocation.
             ctx.Send(new NDDisk::TEvRead(creds, {100, 0, MinBlockSize}, {true}), 502);
+            auto unpublished = ctx.Grab<NDDisk::TEvReadResult>();
+            AssertStatus<NDDisk::TEvReadResult>(unpublished, TReplyStatus::OK);
+            UNIT_ASSERT_VALUES_EQUAL(unpublished->Cookie, 502);
+            UNIT_ASSERT_VALUES_EQUAL(unpublished->Get()->GetPayload(0).ConvertToString(),
+                TString(MinBlockSize, '\0'));
             auto fresh = NDDisk::TQueryCredentials::ToDDisk(994, generation ? 2 : 1,
                 generation ? 0 : 1, std::nullopt, 0);
             auto connected = ctx.SendAndGrab<NDDisk::TEvConnectResult>(new NDDisk::TEvConnect(fresh));
@@ -182,9 +189,6 @@ Y_UNIT_TEST_SUITE(TDDiskActorPDiskTest) {
             fresh.ConnectionToken.emplace(connected->Get()->Record.GetConnectionToken());
             write(fresh, 100, 503, 3);
             ctx.SendAndGrab<TEvGateState>(new TEvControlGate(0, true));
-            auto staleRead = ctx.Grab<NDDisk::TEvReadResult>();
-            AssertStatus<NDDisk::TEvReadResult>(staleRead, TReplyStatus::SESSION_MISMATCH);
-            UNIT_ASSERT_VALUES_EQUAL(staleRead->Cookie, 502);
             std::set<ui64> cookies;
             for (ui32 i = 0; i < 2; ++i) {
                 auto result = ctx.Grab<NDDisk::TEvWriteResult>();
@@ -215,7 +219,7 @@ Y_UNIT_TEST_SUITE(TDDiskActorPDiskTest) {
         write(creds, 0, 'I', 500);
         AssertStatus<NDDisk::TEvWriteResult>(ctx.Grab<NDDisk::TEvWriteResult>(), TReplyStatus::OK);
         ctx.WaitForReservationsSettled();
-        ctx.SendAndGrab<TEvGateState>(new TEvControlGate(NDDisk::TDDiskActor::TEvPrivate::TEvDDiskIoResult::EventType));
+        ctx.SendAndGrab<TEvGateState>(new TEvControlGate(NDDisk::TDDiskActor::TEvPrivate::TEvIoBatchDone::EventType));
         write(creds, 1, 'A', 501);
         WaitNativeGate(ctx);
         write(creds, 2, 'S', 502);

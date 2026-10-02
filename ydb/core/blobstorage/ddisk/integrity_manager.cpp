@@ -902,6 +902,10 @@ void TIntegrityManager::CompleteOperation(const std::shared_ptr<TOperationState>
     if (!completion->Result) {
         completion->Result.emplace(std::move(result));
         completion->Changed.NotifyAll();
+    } else if (completion->Settled) {
+        // Stop publishes a logical failure while the shared loads are still in flight, so
+        // the settle can be the only transition a waiter of a fully owned result sees.
+        completion->Changed.NotifyAll();
     }
     if (!completion->Settled) {
         return;

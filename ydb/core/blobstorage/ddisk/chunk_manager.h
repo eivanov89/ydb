@@ -31,15 +31,15 @@ public:
     using TAllocationResult = std::pair<TAllocation, ui32>;
 
     void Enqueue(TAllocation allocation) {
-        Allocations.push_back(std::move(allocation));
+        PendingAllocations.push_back(std::move(allocation));
     }
 
     std::optional<TAllocationResult> TakeAllocation() {
-        if (Allocations.empty() || ReservedChunks.empty()) {
+        if (PendingAllocations.empty() || ReservedChunks.empty()) {
             return std::nullopt;
         }
-        TAllocationResult result{std::move(Allocations.front()), ReservedChunks.front()};
-        Allocations.pop_front();
+        TAllocationResult result{std::move(PendingAllocations.front()), ReservedChunks.front()};
+        PendingAllocations.pop_front();
         ReservedChunks.pop_front();
         return result;
     }
@@ -54,12 +54,12 @@ public:
         return result;
     }
 
-    bool HasAllocations() const {
-        return !Allocations.empty();
+    bool HasPendingAllocations() const {
+        return !PendingAllocations.empty();
     }
 
     size_t GetPendingAllocationCount() const {
-        return Allocations.size();
+        return PendingAllocations.size();
     }
 
     size_t GetReservedChunkCount() const {
@@ -67,13 +67,13 @@ public:
     }
 
     size_t CountPendingPersistentBufferAllocations() const {
-        return std::count_if(Allocations.begin(), Allocations.end(), [](const TAllocation& allocation) {
+        return std::count_if(PendingAllocations.begin(), PendingAllocations.end(), [](const TAllocation& allocation) {
             return std::holds_alternative<TChunkForPersistentBuffer>(allocation);
         });
     }
 
     void RetainPersistentBufferAllocations() {
-        std::erase_if(Allocations, [](const TAllocation& allocation) {
+        std::erase_if(PendingAllocations, [](const TAllocation& allocation) {
             return !std::holds_alternative<TChunkForPersistentBuffer>(allocation);
         });
     }
@@ -98,7 +98,7 @@ public:
     }
 
 private:
-    std::deque<TAllocation> Allocations;
+    std::deque<TAllocation> PendingAllocations;
     std::deque<ui32> ReservedChunks;
     bool ReservationInFlight = false;
 };

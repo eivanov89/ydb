@@ -4,6 +4,7 @@
 
 #include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_data.h>
 
+#include <util/generic/function_ref.h>
 #include <util/generic/overloaded.h>
 #include <ydb/core/util/stlog.h>
 
@@ -38,9 +39,6 @@ public:
     virtual bool IsRestoreIo() const noexcept { return false; }
     virtual bool IsIntegrityIo() const noexcept { return false; }
     virtual bool IsChunkFormatIo() const noexcept { return false; }
-    virtual bool IsReadPartsIo() const noexcept {
-        return false;
-    }
 
     bool IsCriticalDDiskIo() const noexcept { return IsIntegrityIo() || IsChunkFormatIo(); }
 
@@ -55,10 +53,6 @@ public:
     void PrepareRead(size_t size, ui64 offset, TChunkIdx chunkIdx, ui32 chunkOffset);
 
     void Reinit(const IEventHandle* ev = nullptr);
-
-    void SetSpan(NWilson::TSpan&& span) { Span = std::move(span); }
-    NWilson::TSpan& GetSpan() { return Span; }
-    NWilson::TSpan ExtractSpan() { return std::move(Span); }
 
     void SetCookie(ui64 cookie) { Cookie = cookie; }
     ui64 GetCookie() const { return Cookie; }
@@ -112,8 +106,6 @@ private:
     TChunkIdx ChunkIdx = 0;
     ui32 ChunkOffsetInBytes = 0;
 
-    NWilson::TSpan Span;
-
     ui64 CompletionCookie = 0;
     TRcBuf AlignedDataHolder;
     std::optional<TRope> Data;
@@ -124,6 +116,9 @@ private:
 // TDDiskActor::TDDiskIoOp
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Data-path operation of one read, write, or metadata pair load. Completion invokes
+// the callback of the coroutine frame which owns the request: that frame keeps the
+// result slot alive until its I/O batch releases, so no result event is needed.
 class TDDiskActor::TDDiskIoOp final : public TDDiskActor::TDirectIoOpBase {
 public:
     explicit TDDiskIoOp(TDDiskActor& actor)
@@ -139,102 +134,26 @@ public:
 
     void Reinit(const IEventHandle* ev = nullptr) {
         TDirectIoOpBase::Reinit(ev);
-        IndexedReadToken = 0;
+        Callback.reset();
+        Critical = false;
     }
 
-    void SetIndexedReadToken(ui64 token) {
-        IndexedReadToken = token;
+    void SetCallback(TIoCallback callback) {
+        Callback.emplace(callback);
     }
 
-    ui64 GetIndexedReadToken() const {
-        return IndexedReadToken;
+    // Metadata pair loads share the integrity retry and fail-stop policy.
+    void SetCritical() {
+        Critical = true;
     }
 
-    void SetChunkKey(ui64 tabletId, ui64 vChunkIndex) {
-        TabletId = tabletId;
-        VChunkIndex = vChunkIndex;
-        HasChunkKey = true;
+    bool IsIntegrityIo() const noexcept override {
+        return Critical;
     }
 
 private:
-    ui64 IndexedReadToken = 0;
-    ui64 TabletId = 0;
-    ui64 VChunkIndex = 0;
-    bool HasChunkKey = false;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// TDDiskActor::TReadPartsIoOp
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// One logical cold read owns the data buffer and any newly claimed metadata
-// buffers. Shared metadata loads remain independent of the initiating reader.
-// Completion only publishes an event; metadata and reader state are actor-local.
-class TDDiskActor::TReadPartsIoOp final : public TDDiskActor::TDirectIoOpBase {
-public:
-    struct TPart {
-        ui64 Id = 0; // zero denotes client data; nonzero denotes a metadata load
-        TChunkIdx ChunkIdx = 0;
-        ui32 OffsetInBytes = 0;
-        ui32 Size = 0;
-        ui64 DiskOffset = 0;
-    };
-
-    explicit TReadPartsIoOp(TDDiskActor& actor)
-        : TDirectIoOpBase(actor) {
-    }
-
-    void PrepareParts(TConstArrayRef<TPart> parts);
-
-    bool IsReadPartsIo() const noexcept override {
-        return true;
-    }
-
-    ui64 GetAccountingSize() const noexcept override {
-        return AccountingSize;
-    }
-
-    size_t GetActivePartCount() const {
-        return ActiveParts.size();
-    }
-
-#if defined(__linux__)
-    // Consumes this object, including on rejection. The submission guard keeps
-    // it alive even if every accepted scalar callback runs before Read returns.
-    bool SubmitParts(NPDisk::IUringRouterClient& router, NActors::TActorSystem* actorSystem);
-#endif
-
-    const TPart& GetFallbackPart(size_t activeIndex) const;
-    void SetFallbackPartResult(size_t activeIndex, i64 result, TRope&& data);
-    void FinishFallbackReadParts();
-
-    void Reply(NActors::TActorSystem* actorSystem,
-        NKikimrBlobStorage::NDDisk::TReplyStatus::E status, TString reason = {}) noexcept override;
-
-protected:
-    bool PrepareRetry() noexcept override;
-
-private:
-    class TPartIoOp;
-
-    struct TOwnedPart {
-        TPart Part;
-        TRcBuf Buffer;
-        std::optional<TRope> FallbackData;
-        i64 Result = 0;
-        ui64 ShortIoCount = 0;
-        bool Completed = false;
-        bool Dropped = false;
-        bool Rejected = false;
-    };
-
-    void PrepareActiveParts();
-    void ReleasePart(NActors::TActorSystem* actorSystem) noexcept;
-
-    std::vector<TOwnedPart> Parts;
-    std::vector<size_t> ActiveParts;
-    std::atomic<size_t> Pending{0};
-    ui64 AccountingSize = 0;
+    std::optional<TIoCallback> Callback;
+    bool Critical = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -272,22 +191,6 @@ private:
     ui64 PartCookie = 0;
     bool IsErase = false;
     bool IsRestore = false;
-};
-
-class TDDiskActor::TInternalSyncWriteOp final : public TDDiskActor::TDirectIoOpBase {
-public:
-    explicit TInternalSyncWriteOp(TDDiskActor& actor)
-        : TDirectIoOpBase(actor)
-    {}
-
-    void Reply(
-        NActors::TActorSystem* actorSystem, NKikimrBlobStorage::NDDisk::TReplyStatus::E status,
-        TString reason = {}) noexcept override;
-
-    void ClearForRecycle() noexcept override;
-    void SelfRecycle() noexcept override;
-
-
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -2670,13 +2670,13 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             UNIT_ASSERT_VALUES_EQUAL(metadataReads, 1);
 
             ui32 physicalCompletions = 0;
-            std::multiset<size_t> completedParentSizes;
+            ui32 batchResumes = 0;
             ctx.Runtime.FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
                 using TPrivate = NDDisk::TDDiskActor::TEvPrivate;
                 if (ev->GetTypeRewrite() == NPDisk::TEvChunkReadRawResult::EventType) {
                     ++physicalCompletions;
-                } else if (ev->GetTypeRewrite() == TPrivate::TEvReadPartsResult::EventType) {
-                    completedParentSizes.insert(ev->Get<TPrivate::TEvReadPartsResult>()->Parts.size());
+                } else if (ev->GetTypeRewrite() == TPrivate::TEvIoBatchDone::EventType) {
+                    ++batchResumes;
                 }
                 return true;
             };
@@ -2701,12 +2701,9 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             // outstanding metadata or data still prevents deleting the physical chunks.
             AssertStatus(SendToDDiskAndWait<NDDisk::TEvDeleteTabletChunksResult>(
                 ctx, disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(creds)), TReplyStatus::BUSY);
-            // The initiating read owns data + metadata in one parent. The joined
-            // read owns only data, so it can retire that parent while metadata waits.
-            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.size(), metadataFirst ? 0 : 1);
-            if (!metadataFirst) {
-                UNIT_ASSERT_VALUES_EQUAL(*completedParentSizes.begin(), 1u);
-            }
+            // The initiating read batches data with metadata. The joined read batches
+            // only data, so it is the one which can resume while metadata is outstanding.
+            UNIT_ASSERT_VALUES_EQUAL(batchResumes, metadataFirst ? 0u : 1u);
             complete(!metadataFirst);
             std::set<ui64> cookies;
             for (ui32 i = 0; i < 2; ++i) {
@@ -2717,9 +2714,7 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
                 AssertDirectRead(result, expected, CalculateChecksums(expected));
             }
             ctx.Runtime.FilterFunction = {};
-            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.size(), 2u);
-            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.count(1), 1u);
-            UNIT_ASSERT_VALUES_EQUAL(completedParentSizes.count(2), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(batchResumes, 2u);
             UNIT_ASSERT_VALUES_EQUAL(GetChecksumCounter(ctx, disk, "IntegrityPairReads")->Val(), 1);
         }
     }
@@ -2744,17 +2739,16 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
                 std::swap(first, second);
             }
 
-            // One raw reply cannot retire the vector parent. Shutdown cancels the
-            // parent once; the other raw reply arrives after its terminal result.
+            // One raw reply cannot resume a batch of two. Shutdown cancels the other
+            // operation, which resumes the read once; its raw reply arrives later.
             bool physicalCompleted = false;
-            ui32 parentCompletions = 0;
+            ui32 batchResumes = 0;
             ctx.Runtime.FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
                 using TPrivate = NDDisk::TDDiskActor::TEvPrivate;
                 if (ev->GetTypeRewrite() == NPDisk::TEvChunkReadRawResult::EventType) {
                     physicalCompleted = true;
-                } else if (ev->GetTypeRewrite() == TPrivate::TEvReadPartsResult::EventType) {
-                    ++parentCompletions;
-                    UNIT_ASSERT_VALUES_EQUAL(ev->Get<TPrivate::TEvReadPartsResult>()->Parts.size(), 2u);
+                } else if (ev->GetTypeRewrite() == TPrivate::TEvIoBatchDone::EventType) {
+                    ++batchResumes;
                 }
                 return true;
             };
@@ -2764,7 +2758,7 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             });
             AssertStatus(SendToDDiskAndWait<NDDisk::TEvDeleteTabletChunksResult>(
                 ctx, disk.ServiceId, new NDDisk::TEvDeleteTabletChunks(creds)), TReplyStatus::BUSY);
-            UNIT_ASSERT_VALUES_EQUAL(parentCompletions, 0u);
+            UNIT_ASSERT_VALUES_EQUAL(batchResumes, 0u);
             NDDisk::NTesting::IgnoreShutdownChunkForget(ctx.Runtime);
             SendToDDisk(ctx, disk.ServiceId, new TEvents::TEvPoison());
             auto result = WaitFromDDisk<NDDisk::TEvReadResult>(ctx);
@@ -2775,7 +2769,7 @@ Y_UNIT_TEST_SUITE(TDDiskChecksumTests) {
             // A duplicate read reply would be observed instead and fail this wait.
             WaitFromDDisk<TEvents::TEvGone>(ctx);
             ctx.Runtime.FilterFunction = {};
-            UNIT_ASSERT_VALUES_EQUAL(parentCompletions, 1u);
+            UNIT_ASSERT_VALUES_EQUAL(batchResumes, 1u);
         }
     }
 

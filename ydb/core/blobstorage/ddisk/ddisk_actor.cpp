@@ -304,7 +304,6 @@ namespace {
 
         DdiskIoOpPool.Resize(IoOpPoolCapacity);
         PersistentBufferPartIoOpPool.Resize(IoOpPoolCapacity);
-        InternalSyncWriteOpPool.Resize(IoOpPoolCapacity);
         IntegrityIoOpPool.Resize(IoOpPoolCapacity);
     }
 
@@ -333,7 +332,6 @@ namespace {
         IoStalledCounter = CountersBase->GetCounter("io_stalled", false);
         FillPool(DdiskIoOpPool);
         FillPool(PersistentBufferPartIoOpPool);
-        FillPool(InternalSyncWriteOpPool);
         FillPool(IntegrityIoOpPool);
 
         YDB_LOG_DEBUG("TDDiskActor::Bootstrap",
@@ -416,8 +414,6 @@ namespace {
             WriteCallbacks.erase(it);
             FailDirectIoOp(std::move(op));
         }
-        ReadPartCallbacks.clear();
-        ReadPartsRemaining.clear();
         while (!ReadCallbacks.empty()) {
             auto it = ReadCallbacks.begin();
             auto op = std::move(it->second.Op);
@@ -426,7 +422,6 @@ namespace {
         }
 
         RejectPendingDDiskQueries(NKikimrBlobStorage::NDDisk::TReplyStatus::ERROR, GetBrokenReason());
-        QueueAllPendingWrites();
 
         CancelPendingSyncSources();
         for (auto& [_, allocation] : DataChunkAllocationsInFlight) {
@@ -508,11 +503,7 @@ namespace {
             hFunc(TEvents::TEvGone, HandleGone)
 
             hFunc(TEvReadResult, Handle)
-            hFunc(TEvPrivate::TEvReadPartsResult, Handle)
             hFunc(TEvPrivate::TEvIntegrityIoResult, Handle)
-            hFunc(TEvPrivate::TEvIndexedReadResult, Handle)
-            hFunc(TEvPrivate::TEvDDiskIoResult, Handle)
-            hFunc(TEvPrivate::TEvInternalSyncWriteResult, Handle)
 
             hFunc(NPDisk::TEvYardInitResult, Handle)
             hFunc(NPDisk::TEvReadLogResult, Handle)
@@ -696,7 +687,6 @@ namespace {
                 chunk.CommitReady.NotifyAll();
             }
         }
-        QueueAllPendingWrites();
 
         for (const auto& [tabletId, pending] : TabletChunkDeletionReplies) {
             Y_UNUSED(tabletId);
@@ -767,13 +757,9 @@ namespace {
             hFunc(TEvReadThenWritePersistentBuffers, reject)
             hFunc(TEvPrivate::TEvRetryListPersistentBuffer, rejectListRetry)
 
-            hFunc(TEvPrivate::TEvReadPartsResult, Handle)
             hFunc(TEvPrivate::TEvIntegrityIoResult, Handle)
             hFunc(NPDisk::TEvChunkReserveResult, Handle)
             hFunc(TEvPrivate::TEvChunkFormatIoResult, Handle)
-            hFunc(TEvPrivate::TEvIndexedReadResult, Handle)
-            hFunc(TEvPrivate::TEvDDiskIoResult, Handle)
-            hFunc(TEvPrivate::TEvInternalSyncWriteResult, Handle)
             hFunc(TEvReadResult, Handle)
             hFunc(TEvReadPersistentBufferResult, Handle)
             hFunc(TEvPrivate::TEvReadPersistentBufferPart, Handle)
@@ -824,10 +810,7 @@ namespace {
         }
         FailLogWaiters(false);
         RejectQueuedQueries();
-        QueueAllPendingWrites();
         CancelRetries();
-        ReadPartCallbacks.clear();
-        ReadPartsRemaining.clear();
         for (auto* callbacks : {&ReadCallbacks, &WriteCallbacks}) {
             while (!callbacks->empty()) {
                 auto it = callbacks->begin();
@@ -855,8 +838,7 @@ namespace {
     }
 
     void TDDiskActor::TryCompleteStop() {
-        if (!PoisonReceived || !OwnDrainComplete || ActiveIndexedReads || !PendingDDiskReads.empty() || !PendingDDiskWrites.empty()
-                || !PendingWriteDataCookies.empty() || !SyncsInFlight.empty()
+        if (!PoisonReceived || !OwnDrainComplete || DataRequestsInFlight || !SyncsInFlight.empty()
                 || !SyncSourceCookies.empty() || !IntegrityWriteCookies.empty()
                 || !FormatSlices.empty()
                 || !PersistentBufferGone || ChunkManager.IsReservationInFlight()) {
@@ -929,8 +911,7 @@ namespace {
         if (!(DirectIoState.load(std::memory_order_acquire) & DirectIoStopping)) {
             return;
         }
-        if (ActiveIndexedReads || !PendingDDiskReads.empty() || !PendingDDiskWrites.empty() || !PendingWriteDataCookies.empty()
-                || !SyncsInFlight.empty() || !SyncSourceCookies.empty()
+        if (DataRequestsInFlight || !SyncsInFlight.empty() || !SyncSourceCookies.empty()
                 || !IntegrityWriteCookies.empty() || !FormatSlices.empty()) {
             return;
         }

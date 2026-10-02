@@ -30,9 +30,11 @@ namespace NKikimr::NDDisk {
         HandleChunkReserved();
     }
 
+    // Root coroutine: owns the images of the loads it submits until they are handed back
+    // to TIntegrityManager. These loads serve writers and joined readers, not one request.
     void TDDiskActor::SubmitIntegrityPairReads(std::vector<TIntegrityManager::TPairRead> reads) {
         if (reads.empty()) {
-            return;
+            co_return;
         }
         if (Stopping || IsBroken()) {
             std::vector<TIntegrityManager::TPairReadResult> results;
@@ -40,18 +42,47 @@ namespace NKikimr::NDDisk {
                 results.push_back({read.Id, {}});
             }
             IntegrityManager->CompletePairReads(results);
-            return;
+            co_return;
         }
-        std::vector<TReadPartsIoOp::TPart> parts;
-        for (const auto& read : reads) {
-            parts.push_back({read.Id, read.ChunkIdx, read.OffsetInBytes, read.Size,
-                DiskFormat->Offset(read.ChunkIdx, 0, read.OffsetInBytes)});
+
+        TDataRequestGuard requestGuard(*this);
+        TIoBatch batch(*this);
+        TPairLoads loads;
+        loads.Results.resize(reads.size());
+        loads.Errors.resize(reads.size());
+
+        auto makeCallback = [&](size_t index) {
+            // Each completion owns its own slot, which is what makes concurrent
+            // io_uring threads writing into this frame safe.
+            return [&loads, &batch, index](TIoCompletion&& completion) noexcept {
+                auto& slot = loads.Results[index];
+                slot.Result.Ok = completion.Status == NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
+                if (slot.Result.Ok) {
+                    slot.Result.Data = std::move(completion.Data);
+                } else {
+                    loads.Errors[index] = std::move(completion.ErrorMessage);
+                }
+                batch.Done();
+            };
+        };
+        std::vector<decltype(makeCallback(0))> callbacks;
+        callbacks.reserve(reads.size());
+        for (size_t i = 0; i < reads.size(); ++i) {
+            loads.Results[i].Id = reads[i].Id;
+            callbacks.push_back(makeCallback(i));
         }
+
         *Counters.Checksums.IntegrityPairReads += reads.size();
-        auto readOp = std::make_unique<TReadPartsIoOp>(*this);
-        readOp->PrepareParts(parts);
-        std::unique_ptr<TDirectIoOpBase> op = std::move(readOp);
-        DirectUringOp(op);
+        for (size_t i = 0; i < reads.size(); ++i) {
+            SubmitPairRead(batch, callbacks[i], reads[i]);
+        }
+        co_await batch.Wait();
+
+        CompleteMetadataReads(loads);
+        requestGuard.Release();
+        if (Stopping && !GetDirectIoInflight()) {
+            FinishStopping();
+        }
     }
 
     void TDDiskActor::SubmitIntegrityWrite(ui64 id, TChunkIdx chunk, ui32 offset, TRcBuf data,
@@ -114,25 +145,6 @@ namespace NKikimr::NDDisk {
         Y_ABORT_UNLESS(PendingDataAllocationTokens.emplace(std::make_pair(tabletId, vChunkIndex), token).second);
         ChunkManager.Enqueue(TChunkForData{tabletId, vChunkIndex, token});
         HandleChunkReserved();
-    }
-
-    NActors::async<void> TDDiskActor::WaitForChunk(ui64 tabletId, ui64 vChunkIndex, bool allocate) {
-        // THashMap keeps references stable; deletion is forbidden while a waiter owns this
-        // entry. The guard also releases the pin when forced teardown destroys the frame.
-        TChunkRef& chunkRef = ChunkRefs[tabletId][vChunkIndex];
-        ++chunkRef.AllocationWaiters;
-        Y_DEFER { --chunkRef.AllocationWaiters; };
-
-        if (allocate && !chunkRef.ChunkIdx && !chunkRef.AllocationPending) {
-            IssueChunkAllocation(tabletId, vChunkIndex);
-        }
-        // Allocation may complete synchronously from the reserve. Notifications are not
-        // sticky, so always check the state before subscribing.
-        while (chunkRef.AllocationPending && !Stopping && !IsBroken()) {
-            co_await chunkRef.AllocationReady.Wait();
-        }
-        // Check while the entry is still pinned, before callers re-resolve their request state.
-        Y_DEBUG_ABORT_UNLESS(!allocate || chunkRef.ChunkIdx || Stopping || IsBroken());
     }
 
     void TDDiskActor::Handle(TEvPrivate::TEvIssuePersistentBufferChunkAllocation::TPtr ev) {
@@ -215,7 +227,7 @@ namespace NKikimr::NDDisk {
         if (IsPersistentBufferActor || !PDiskParams || !LogReplayComplete) {
             return;
         }
-        Y_ABORT_UNLESS(Stopping && !GetDirectIoInflight() && !ActiveIndexedReads
+        Y_ABORT_UNLESS(Stopping && !GetDirectIoInflight() && !DataRequestsInFlight
             && IntegrityWriteCookies.empty() && FormatSlices.empty());
 
         TVector<TChunkIdx> chunks = ChunkManager.ExtractReservations();
@@ -385,7 +397,7 @@ namespace NKikimr::NDDisk {
         Y_ABORT_UNLESS(inserted);
         // Pin before starting extent: a synchronous placement callback may wake other actor work.
         auto& chunk = ChunkRefs.at(tabletId).at(vChunkIndex);
-        ++chunk.AllocationWaiters;
+        ++chunk.ChunkRefPins;
         if (Config.EnableChecksums) {
             auto extent = IntegrityManager->StartExtent({tabletId, vChunkIndex}, chunkIdx);
             extent.SetProgressCallback([this, tabletId, vChunkIndex, token] {
@@ -426,7 +438,7 @@ namespace NKikimr::NDDisk {
                 chunk.ChunkIdx = allocation.ChunkIdx;
                 chunk.AllocationPending = false;
                 chunk.AllocationReady.NotifyAll();
-                QueuePendingWritesForChunk(tabletId, vChunkIndex);
+                QueueSyncsForChunk(tabletId, vChunkIndex);
                 it = DataChunkAllocationsInFlight.find(key);
                 if (it == DataChunkAllocationsInFlight.end() || it->second.Token != token) {
                     return;
@@ -561,15 +573,15 @@ namespace NKikimr::NDDisk {
 
         TChunkRef& chunkRef = ChunkRefs[tabletId][vChunkIndex];
         Y_ABORT_UNLESS(chunkRef.ChunkIdx == allocation.ChunkIdx);
-        Y_ABORT_UNLESS(chunkRef.AllocationWaiters);
-        --chunkRef.AllocationWaiters;
+        Y_ABORT_UNLESS(chunkRef.ChunkRefPins);
+        --chunkRef.ChunkRefPins;
 
         const size_t numErased = ChunkMapIncrementsInFlight.erase({tabletId, vChunkIndex, allocation.ChunkIdx});
         Y_ABORT_UNLESS(numErased == 1);
         *Counters.Chunks.ChunksOwned += allocation.NewlyCommittedChunks;
 
         chunkRef.CommitReady.NotifyAll();
-        QueuePendingWritesForChunk(tabletId, vChunkIndex);
+        QueueSyncsForChunk(tabletId, vChunkIndex);
     }
 
     void TDDiskActor::Handle(NPDisk::TEvCutLog::TPtr ev) {
@@ -765,10 +777,10 @@ namespace NKikimr::NDDisk {
             co_return;
         }
 
-        // Allocation waiters pin their chunk entry, including before a physical chunk is
+        // ChunkRefPins keep the chunk entry alive, including before a physical chunk is
         // reserved and while actor-owned destination records wait for readiness.
         for (const auto& [vChunkIndex, chunkRef] : tabletIt->second) {
-            if (chunkRef.AllocationPending || chunkRef.AllocationWaiters) {
+            if (chunkRef.AllocationPending || chunkRef.ChunkRefPins) {
                 SendReply(*ev, std::make_unique<TEvDeleteTabletChunksResult>(
                     NKikimrBlobStorage::NDDisk::TReplyStatus::BUSY,
                     "chunk allocation or integrity-extent write is queued for tablet"));

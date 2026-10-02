@@ -196,6 +196,19 @@ public:
         bool IsSettled() const {
             return State && State->Settled;
         }
+
+        // The result is published and the operation owns it exclusively: for a read this
+        // also means every shared pair load it pinned has retired.
+        bool IsDone() const {
+            return State && State->Result && State->Settled;
+        }
+
+        // Resumes on the next observable transition - the result being published, or the
+        // later settle when Stop published a failure first. Poll IsDone() around it.
+        NActors::NDetail::TAsyncEventAwaiter WaitChanged() const {
+            Y_ABORT_UNLESS(State);
+            return State->Changed.Wait();
+        }
         // Actor-local callback, used by the read's ordinary aggregate awaiter. Passing an empty
         // callback detaches its observer without canceling shared metadata work.
         void SetCompletionCallback(std::function<void()> callback) const {
@@ -390,6 +403,10 @@ public:
     bool GetBlockChecksum(TDataChunkKey key, ui32 blockIdx, ui64* checksum) const;
     // Currently cached TIntegrityBlockState count and the cache capacity (for unit tests).
     size_t CachedBlockStates() const { return BlockStateCount; }
+
+    // Logical reads still owed a checksum result, including those joined to loads started
+    // by another reader.
+    size_t PendingReadCount() const { return PendingReads.size(); }
     size_t MaxCachedBlockStates() const { return MaxBlockStates; }
     bool HasInFlightOperationsForTablet(ui64 tabletId) const;
 

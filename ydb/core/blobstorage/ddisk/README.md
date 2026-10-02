@@ -28,60 +28,67 @@ virtual chunk. Typed log actions are registered before submission and detached
 in a batch before completion actions run. Direct-I/O completions retain buffer
 ownership through retirement.
 
-Read, write, and sync handlers each await one ordinary actor-aware operation.
-Their coroutine frames use the actor runtime's shared TLS allocator, without a
-DDisk-owned frame cache. TLS cache occupancy describes idle frames on executor
-threads, not live frames belonging to an actor.
-Write and Sync release the incoming event after moving their reply route,
-original credentials, payload, and checksums into actor-owned records.
-Each fully validated Sync source reply starts its destination write
-independently; the parent aggregate waits for all accepted destination work
-and returns results in input order. Generic device waits use unique completion
-cookies independent of client cookies; indexed DDisk reads use their own
-tokens and envelope cookie zero. A scoped `TDataIoPin` holds a chunk through
-accepted data I/O.
-For an allocated, formatted chunk, `ReadDDisk` returns one ordinary awaiter to
-the read handler. Ready needs no registry entry. DataEvent uses reusable actor-owned
-indexed slots without aggregate allocation or generic waiter registration; Cold
-joins its parent I/O and shared metadata loads. Slot tokens combine generation
-and index, survive vector growth, and reject stale or duplicate completions. A
-slot is never reused after generation exhaustion. Cancellation detaches the
-awaiter but retains submitted slots and chunk pins until terminal processing;
-completion releases the slot before resuming inline. `TEvIndexedReadResult`
-transfers status, error, span, and owned payload. The coroutine keeps reply routing
-inline; pooled operations do not copy it. Awaiters and cold contexts hold plain
-`TDDiskReadResult` values without a generic heap result.
-`PrepareRead` constructs immediate metadata results in the awaiter's empty optional
+Read, write, and sync requests run as flat root coroutines that await their
+device I/O in place. The read and write event handlers are ordinary functions:
+they validate, answer rejections and unpublished chunks without a frame, and
+only then start `ExecuteDataRead` or `ExecuteDataWrite`. Frames use the actor
+runtime's shared TLS allocator, without a DDisk-owned frame cache. TLS cache
+occupancy describes idle frames on executor threads, not live frames belonging
+to an actor.
+Read, Write, and Sync release the incoming event after moving their reply route,
+original credentials, payload, and checksums into frame-owned records.
+`ExecuteDataWrite` is the single write body: the write handler and each Sync
+destination start one, and it awaits allocation readiness, integrity readiness,
+data, and mapping durability one step at a time, revalidating the original token
+after every wait. Each fully validated Sync source reply starts its destination
+write independently; the parent aggregate waits for all accepted destination work
+and returns results in input order. Device waits use unique completion cookies
+independent of client cookies. A scoped `TDataIoPin` holds a chunk through
+accepted data I/O, and a `TDataRequestGuard` counts the frame in
+`DataRequestsInFlight`.
+`TIoBatch` joins the device operations of one frame. Its atomic pending count
+starts at one submission guard; each submission adds one, and each `TDDiskIoOp`
+callback fills its own result slot and decrements the count. The unique
+transition to zero publishes one `TEvIoBatchDone` through `TActorSystem` to the
+frame's private wait cookie. Awaiting the batch releases the guard: a batch that
+already finished resumes the frame inline and sends no event, otherwise the
+cookie is registered in the same turn. Resuming rearms the counter for the next
+batch. The waiter has no cancellation hook, so an accepted batch cannot unwind
+early. Callbacks are non-owning references to lambdas in the frame and may run
+in any order, including before submission returns; integrity loads mark their
+operation critical.
+For an allocated, formatted chunk, `ExecuteDataRead` keeps everything in its own
+body. An unpublished chunk replies zeroes without I/O. With checksums disabled
+it submits and awaits the data read. Otherwise `PrepareRead` either answers from
+cached metadata, or claims pair loads: reads of at least 32 KiB
+(`MetadataFirstReadThreshold`) await metadata first and skip the data read for an
+all-zero plan, while smaller reads submit data and metadata in one batch.
+`CompleteMetadataReads` then publishes the pair images, and the frame waits for
+its own operation to settle, which also covers loads owned by another request.
+`PrepareRead` constructs immediate metadata results in the caller's empty optional
 or claims missing pair loads without submitting them. Warm reads move owned
 result fields; cold reads inspect the immutable shared plan by const reference.
 The owned `TReadChecksums` stores empty, singleton, or vector snapshots; larger
 vectors move without reallocating, and copies own independent storage. Single-block
 collection resolves one pair and sets AllZero or Passthrough without a mask.
 Multi-block collection uses one reserved vector and gathers checksums and usage
-in one pass by metadata pair before eviction. DDisk combines data and newly
-claimed metadata parts in one logical read, submitting an ordinary scalar router
-operation per part. A shared DDisk-owned completion object allocates stable
-buffers and result slots before submission. Its atomic pending count includes
-every part and one submission guard. Each callback writes its own slot, releases
-its child operation, and decrements the count with acquire/release ordering. The
-unique transition to zero aggregates all slots and publishes through
-`TActorSystem`; releasing the submission guard uses the same path. Callbacks may
-therefore finish in any order, including before submission returns. A rejected
-submission enters Stopping, prevents further submissions, and completes rejected
-and unsubmitted slots locally; accepted siblings still drain before publication.
+in one pass by metadata pair before eviction. A rejected submission enters
+Stopping, prevents further submissions, and fails rejected and unsubmitted
+operations through the same callback path; accepted siblings still drain first.
 Known zero ranges omit data I/O; joins never duplicate existing pair loads.
-PDisk fallback submits one raw read per part and aggregates their completions.
-`TReadPayload` keeps native `TRcBuf` or fallback `TRope` ownership through indexed
-and aggregated completions.
+PDisk fallback submits one raw read per part into the same batch.
+`TReadPayload` keeps native `TRcBuf` or fallback `TRope` ownership through I/O
+callbacks.
 `FinishDDiskRead` zeroes mixed-range holes and converts
 native data to rope once for validation and reply attachment. The reply constructor
 consumes checksum views immediately into protobuf. Metadata retries resubmit only
-overloaded metadata parts and retain successful buffers. Detached cold contexts retain
+overloaded metadata parts and retain successful buffers. Read frames retain
 their pins until both I/O and shared metadata settle.
 
-Read validation resolves native credentials without rewriting protobuf. An
-allocation wait retains the request and revalidates its original credentials
-before chunk lookup. Disconnect/reconnect invalidates an old parked token even
+Read validation resolves native credentials without rewriting protobuf. A read
+does not wait for chunk allocation: until placement publishes a physical chunk,
+including while another request's allocation is still pending, the read returns
+zeroes. Disconnect/reconnect invalidates an old parked token even
 with unchanged generation/session numbers (`SESSION_MISMATCH`, stale when known
 to token history, otherwise invalid); unchanged-token reconnect remains valid.
 
@@ -117,10 +124,10 @@ I/O waits. Failed branches still drain submitted siblings, retaining their
 buffers and physical ownership. Sync abandons pending results from already-sent
 source reads on stop and prevents unsubmitted destination writes; submitted
 destinations finish before their parent aggregate retires.
-Indexed and integrity pair-write completions are handled during Stopping too;
-reservation release and Gone require zero active slots and an empty pair-write
-cookie registry as well as callback drain. Forced destruction
-drains callbacks before releasing remaining registry pins.
+Batch and integrity pair-write completions are handled during Stopping too;
+reservation release and Gone require `DataRequestsInFlight` to be zero and the
+pair-write cookie registry to be empty as well as callback drain. Forced
+destruction drains callbacks before releasing remaining registry pins.
 
 Shutdown tests must distinguish the indefinite normal actor drain from the
 60-second `io_stalled` diagnostic and the 10-second forced-destructor deadline.

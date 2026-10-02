@@ -101,7 +101,7 @@ namespace NKikimr::NDDisk {
         }
 
         // Existing destination metadata loads do not depend on the source payload. The
-        // parent's allocation pin starts before preparation and transfers to the destination
+        // parent's chunk-ref pin starts before preparation and transfers to the destination
         // write record without a gap, so tablet deletion cannot remove this chunk entry.
         if (Config.EnableChecksums) {
             const auto tablet = ChunkRefs.find(creds.TabletId);
@@ -112,8 +112,8 @@ namespace NKikimr::NDDisk {
             if (chunkIt && chunkIt->ChunkIdx && IntegrityManager->FindExtentRef({creds.TabletId, sync->VChunkIndex})) {
                 for (ui32 i = 0; i < sync->Requests.size(); ++i) {
                     auto& input = sync->Requests[i];
-                    ++chunkIt->AllocationWaiters;
-                    input.AllocationPinned = true;
+                    ++chunkIt->ChunkRefPins;
+                    input.ChunkRefPinned = true;
                     input.MetadataStarted = true;
                     input.Metadata = IntegrityManager->PrepareWrite({creds.TabletId, sync->VChunkIndex},
                         input.Selector.OffsetInBytes, input.Selector.Size);
@@ -129,6 +129,15 @@ namespace NKikimr::NDDisk {
 
     void TDDiskActor::QueueSync(ui64 id) {
         SyncWork.push_back(id);
+        DrainSyncWork();
+    }
+
+    void TDDiskActor::QueueSyncsForChunk(ui64 tabletId, ui64 vChunkIndex) {
+        for (const auto& [id, sync] : SyncsInFlight) {
+            if (sync->Creds.TabletId == tabletId && sync->VChunkIndex == vChunkIndex) {
+                SyncWork.push_back(id);
+            }
+        }
         DrainSyncWork();
     }
 
@@ -166,11 +175,11 @@ namespace NKikimr::NDDisk {
                 }
                 input.MetadataStarted = false;
             }
-            if (input.AllocationPinned) {
+            if (input.ChunkRefPinned) {
                 auto& chunk = ChunkRefs.at(sync->Creds.TabletId).at(sync->VChunkIndex);
-                Y_ABORT_UNLESS(chunk.AllocationWaiters);
-                --chunk.AllocationWaiters;
-                input.AllocationPinned = false;
+                Y_ABORT_UNLESS(chunk.ChunkRefPins);
+                --chunk.ChunkRefPins;
+                input.ChunkRefPinned = false;
             }
         }
         if (!done) {

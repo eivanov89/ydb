@@ -39,6 +39,7 @@
 #include <queue>
 #include <variant>
 
+#include <util/generic/function_ref.h>
 #include <util/generic/hash_set.h>
 
 #include <library/cpp/containers/absl/flat_hash_map.h>
@@ -101,9 +102,7 @@ namespace NKikimr::NDDisk {
         class TDirectIoOpBase;
         class TDDiskIoOp;
         class TPersistentBufferPartIoOp;
-        class TInternalSyncWriteOp;
         class TIntegrityIoOp;
-        class TReadPartsIoOp;
         class TChunkFormatIoOp;
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -123,7 +122,6 @@ namespace NKikimr::NDDisk {
 
         TSpscCircularQueue<std::unique_ptr<TDDiskIoOp>> DdiskIoOpPool;
         TSpscCircularQueue<std::unique_ptr<TPersistentBufferPartIoOp>> PersistentBufferPartIoOpPool;
-        TSpscCircularQueue<std::unique_ptr<TInternalSyncWriteOp>> InternalSyncWriteOpPool;
         TSpscCircularQueue<std::unique_ptr<TIntegrityIoOp>> IntegrityIoOpPool;
 
         template <typename T>
@@ -131,7 +129,6 @@ namespace NKikimr::NDDisk {
 
         void ReturnOp(TDDiskIoOp* op);
         void ReturnOp(TPersistentBufferPartIoOp* op);
-        void ReturnOp(TInternalSyncWriteOp* op);
         void ReturnOp(TIntegrityIoOp* op);
 
         template <typename T>
@@ -265,13 +262,11 @@ namespace NKikimr::NDDisk {
                 EvRetryIO,
                 EvWritePersistentBufferPart,
                 EvReadPersistentBufferPart,
-                EvInternalSyncWriteResult,
                 EvIssuePersistentBufferChunkAllocation,
                 EvDeallocatePersistentBufferChunk,
                 EvDeallocatePersistentBufferChunkResult,
                 EvRetryListPersistentBuffer,
-                EvDDiskIoResult,
-                EvIndexedReadResult,
+                EvIoBatchDone,
                 EvIntegrityIoResult,
                 EvChunkFormatIoResult,
                 EvFinishStopping,
@@ -281,7 +276,6 @@ namespace NKikimr::NDDisk {
                 EvRetryIODelayed,
                 EvProcessPersistentBufferRemoval,
                 EvExpirePersistentBufferRegistrationToken,
-                EvReadPartsResult,
             };
 
             struct TEvExpirePersistentBufferRegistrationToken
@@ -385,61 +379,10 @@ namespace NKikimr::NDDisk {
                 ~TEvRetryIO();
             };
 
-            // I/O callback for a client DDisk read/write. The callback only
-            // packages status/data and routing metadata; the actor serializes it with
-            // integrity failures, decides the final reply status, and sends the client response.
-            struct TEvDDiskIoResult : TEventLocal<TEvDDiskIoResult, EvDDiskIoResult> {
-                NPDisk::TUringOperationBase::EOperationType OperationType;
-                NKikimrBlobStorage::NDDisk::TReplyStatus::E Status;
-                TString ErrorMessage;
-                TRope Data;
-                TActorId OriginalRequester;
-                TActorId InterconnectSession;
-                ui64 Cookie = 0;
-                NWilson::TSpan Span;
-                ui64 TotalSize = 0;
-                double RequestTimeMs = 0;
-                ui64 TabletId = 0;
-                ui64 VChunkIndex = 0;
-                bool HasChunkKey = false;
-                std::vector<ui64> Checksums;
-
-                TEvDDiskIoResult(NPDisk::TUringOperationBase::EOperationType operationType,
-                        NKikimrBlobStorage::NDDisk::TReplyStatus::E status, TString errorMessage,
-                        TRope data, TActorId originalRequester, TActorId interconnectSession,
-                        ui64 cookie, NWilson::TSpan span, ui64 totalSize, double requestTimeMs,
-                        ui64 tabletId = 0, ui64 vChunkIndex = 0, bool hasChunkKey = false,
-                        std::vector<ui64> checksums = {})
-                    : OperationType(operationType)
-                    , Status(status)
-                    , ErrorMessage(std::move(errorMessage))
-                    , Data(std::move(data))
-                    , OriginalRequester(originalRequester)
-                    , InterconnectSession(interconnectSession)
-                    , Cookie(cookie)
-                    , Span(std::move(span))
-                    , TotalSize(totalSize)
-                    , RequestTimeMs(requestTimeMs)
-                    , TabletId(tabletId)
-                    , VChunkIndex(vChunkIndex)
-                    , HasChunkKey(hasChunkKey)
-                    , Checksums(std::move(checksums))
-                {}
-            };
-
-            struct TEvIndexedReadResult : TEventLocal<TEvIndexedReadResult, EvIndexedReadResult> {
-                ui64 Token;
-                NKikimrBlobStorage::NDDisk::TReplyStatus::E Status;
-                TString ErrorMessage;
-                NWilson::TSpan Span;
-                TReadPayload Data;
-
-                TEvIndexedReadResult(ui64 token, NKikimrBlobStorage::NDDisk::TReplyStatus::E status,
-                        TString error, NWilson::TSpan span, TReadPayload data)
-                    : Token(token), Status(status), ErrorMessage(std::move(error)),
-                      Span(std::move(span)), Data(std::move(data)) {
-                }
-            };
+            // Resumes the data-path coroutine which owns a TIoBatch once the last
+            // operation of that batch has completed. Carries no payload: every
+            // completion already stored its result into the waiting coroutine frame.
+            struct TEvIoBatchDone : TEventLocal<TEvIoBatchDone, EvIoBatchDone> {};
 
             struct TEvIntegrityIoResult : TEventLocal<TEvIntegrityIoResult, EvIntegrityIoResult> {
                 NKikimrBlobStorage::NDDisk::TReplyStatus::E Status;
@@ -449,19 +392,6 @@ namespace NKikimr::NDDisk {
                         TString errorMessage = {}, TRope data = {})
                     : Status(status), ErrorMessage(std::move(errorMessage)), Data(std::move(data)) {
                 }
-            };
-
-            struct TEvReadPartsResult : TEventLocal<TEvReadPartsResult, EvReadPartsResult> {
-                struct TPartResult {
-                    ui64 Id;
-                    NKikimrBlobStorage::NDDisk::TReplyStatus::E Status;
-                    TString ErrorMessage;
-                    TReadPayload Data;
-                };
-                std::vector<TPartResult> Parts;
-                explicit TEvReadPartsResult(std::vector<TPartResult> parts)
-                    : Parts(std::move(parts))
-                {}
             };
 
             struct TEvChunkFormatIoResult : TEventLocal<TEvChunkFormatIoResult, EvChunkFormatIoResult> {
@@ -482,14 +412,6 @@ namespace NKikimr::NDDisk {
                 {}
             };
 
-            struct TEvInternalSyncWriteResult : TEventLocal<TEvInternalSyncWriteResult, EvInternalSyncWriteResult> {
-                NKikimrBlobStorage::NDDisk::TReplyStatus::E Status;
-                TString ErrorMessage;
-                TEvInternalSyncWriteResult(NKikimrBlobStorage::NDDisk::TReplyStatus::E status,
-                        TString errorMessage = {})
-                    : Status(status), ErrorMessage(std::move(errorMessage))
-                {}
-            };
         };
 
     private:
@@ -614,11 +536,10 @@ namespace NKikimr::NDDisk {
             ui32 InFlightDataIo = 0;
 
             bool AllocationPending = false;
-            ui32 AllocationWaiters = 0;
+            ui32 ChunkRefPins = 0;
             NActors::TAsyncEvent AllocationReady;
 
             NActors::TAsyncEvent CommitReady;
-
         };
 
         class TDataIoPin {
@@ -751,17 +672,10 @@ namespace NKikimr::NDDisk {
 
         THashMap<ui64, TPendingIoOp> WriteCallbacks;
         THashMap<ui64, TPendingIoOp> ReadCallbacks;
-        struct TReadPartCallback {
-            ui64 ParentCookie;
-            size_t Index;
-        };
-        THashMap<ui64, TReadPartCallback> ReadPartCallbacks;
-        THashMap<ui64, size_t> ReadPartsRemaining;
         THashMap<ui64, TPendingIoOp> DelayedRetries;
         ui64 NextRetryId = 0;
 
         void IssueChunkAllocation(ui64 tabletId, ui64 vChunkIndex);
-        NActors::async<void> WaitForChunk(ui64 tabletId, ui64 vChunkIndex, bool allocate);
         void ReserveChunks(size_t count);
         void Handle(NPDisk::TEvChunkReserveResult::TPtr ev);
         void Handle(TEvPrivate::TEvChunkFormatIoResult::TPtr ev);
@@ -872,195 +786,253 @@ namespace NKikimr::NDDisk {
         void Handle(TEvPrivate::TEvIntegrityIoResult::TPtr ev);
         void CountIntegrityResult(const TIntegrityManager::TOperationResult& result);
         bool IsChunkCommitted(ui64 tabletId, ui64 vChunkIndex) const;
+
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Data-path coroutine primitives
+        //
+        // Client reads and writes are flat root coroutines. Their frames own every buffer,
+        // pin, reply route and metadata result for the whole request, so no completion has
+        // to be mirrored into an actor-local map and no completion event carries a payload.
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // Completion of one data-path device operation, delivered on the I/O thread.
+        struct TIoCompletion {
+            NKikimrBlobStorage::NDDisk::TReplyStatus::E Status =
+                NKikimrBlobStorage::NDDisk::TReplyStatus::UNKNOWN;
+            TString ErrorMessage;
+            // Reads only, and only on success.
+            TReadPayload Data;
+        };
+
+        // Non-owning reference to a lambda living in the requesting coroutine frame.
+        using TIoCallback = TFunctionRef<void(TIoCompletion&&) noexcept>;
+
+        // Groups the device operations a data-path coroutine submits before it suspends.
+        //
+        // Pending carries one extra reference - the submission guard - for the whole
+        // submission phase, so a completion landing on the I/O thread while the frame is
+        // still submitting cannot fire the resume event before anybody waits for it.
+        // Wait() releases that guard. Callbacks run on the I/O thread and must call Done()
+        // as their last statement: the frame, and this batch with it, may retire the moment
+        // the last reference goes away.
+        class TIoBatch {
+        public:
+            explicit TIoBatch(TDDiskActor& self);
+
+            TIoBatch(const TIoBatch&) = delete;
+            TIoBatch& operator=(const TIoBatch&) = delete;
+
+            // Actor thread, once per submission, before submitting.
+            void Add() noexcept {
+                Pending.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // Any thread, exactly once per added operation.
+            void Done() noexcept;
+
+            class TWaiter {
+            public:
+                static constexpr bool IsActorAwareAwaiter = true;
+
+                explicit TWaiter(TIoBatch& batch) noexcept
+                    : Batch(batch)
+                {}
+
+                bool await_ready() noexcept {
+                    return Batch.Release();
+                }
+
+                template<class TPromise>
+                void await_suspend(std::coroutine_handle<TPromise> parent) {
+                    Batch.Suspend(parent);
+                }
+
+                void await_resume() noexcept {
+                    Batch.Rearm();
+                }
+
+            private:
+                TIoBatch& Batch;
+            };
+
+            // Releases the submission guard and waits for every operation of the batch.
+            // Deliberately has no cancellation hook: a frame which handed buffers to the
+            // device must not unwind while the device may still write into them.
+            TWaiter Wait() noexcept {
+                return TWaiter(*this);
+            }
+
+        private:
+            bool Release() noexcept;
+
+            template<class TPromise>
+            void Suspend(std::coroutine_handle<TPromise> parent) {
+                EventWaiter.emplace(Cookie);
+                EventWaiter->await_suspend(parent);
+            }
+
+            void Rearm() noexcept {
+                Pending.store(1, std::memory_order_relaxed);
+            }
+
+            using TEventWaiter = decltype(NActors::ActorWaitForEvent<TEvPrivate::TEvIoBatchDone>(0));
+
+            NActors::TActorSystem* const ActorSystem;
+            const TActorId DDiskId;
+            const ui64 Cookie;
+            std::atomic<ui32> Pending{1};
+            std::optional<TEventWaiter> EventWaiter;
+        };
+
+        // Hides the cancellation hooks of an awaiter so that a frame holding accepted
+        // device buffers or integrity pins keeps waiting even under latched cancellation.
+        // The inner awaiter must be a named lvalue that outlives the co_await.
+        template<class TInner>
+        class TNonCancellableAwaiter {
+        public:
+            static constexpr bool IsActorAwareAwaiter = true;
+
+            explicit TNonCancellableAwaiter(TInner& inner) noexcept
+                : Inner(inner)
+            {}
+
+            bool await_ready() {
+                return Inner.await_ready();
+            }
+
+            template<class TPromise>
+            void await_suspend(std::coroutine_handle<TPromise> parent) {
+                Inner.await_suspend(parent);
+            }
+
+            decltype(auto) await_resume() {
+                return Inner.await_resume();
+            }
+
+        private:
+            TInner& Inner;
+        };
+
+        template<class TInner>
+        static TNonCancellableAwaiter<TInner> NonCancellable(TInner& inner) noexcept {
+            return TNonCancellableAwaiter<TInner>(inner);
+        }
+
+        // Where a reply goes once the originating request handle has been dropped.
+        struct TClientReplyRoute {
+            TActorId OriginalRequester;
+            TActorId InterconnectSession;
+            ui64 Cookie = 0;
+        };
+
+        // Result slots of the metadata pair loads one coroutine claimed. They live in the
+        // frame, so a completion writes the image straight into the waiting request. Each
+        // completion owns exactly one index of both vectors, which is what makes concurrent
+        // io_uring threads writing here safe.
+        struct TPairLoads {
+            std::vector<TIntegrityManager::TPairReadResult> Results;
+            std::vector<TString> Errors;
+        };
+
+        // Accepted device I/O and client replies owned by a data-path coroutine frame.
+        // Shutdown publishes its barrier only after the last frame has retired, so a frame
+        // is never cancelled while it still holds buffers the device may write into.
+        size_t DataRequestsInFlight = 0;
+        class TDataRequestGuard {
+        public:
+            explicit TDataRequestGuard(TDDiskActor& self) noexcept
+                : Self(&self)
+            {
+                ++Self->DataRequestsInFlight;
+            }
+
+            TDataRequestGuard(const TDataRequestGuard&) = delete;
+            TDataRequestGuard& operator=(const TDataRequestGuard&) = delete;
+
+            ~TDataRequestGuard() {
+                Release();
+            }
+
+            // Normal completion releases explicitly, before checking the stop barrier.
+            // Forced frame destruction only decrements, without touching the actor.
+            void Release() noexcept {
+                if (auto* self = std::exchange(Self, nullptr)) {
+                    Y_ABORT_UNLESS(self->DataRequestsInFlight);
+                    --self->DataRequestsInFlight;
+                }
+            }
+
+        private:
+            TDDiskActor* Self;
+        };
+
         struct TDDiskReadResult {
             NKikimrBlobStorage::NDDisk::TReplyStatus::E Status = NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
             TString ErrorMessage;
-            NWilson::TSpan Span;
             TReadPayload Data;
             TReadChecksums Checksums;
             ui64 TotalSize = 0;
         };
-        struct TDDiskReadContext {
-            TActorId OriginalRequester;
-            TActorId InterconnectSession;
-            ui64 Cookie;
-            ui64 TabletId;
-            ui64 VChunkIndex;
-            NHPTimer::STime Start;
-        };
-        void FinishDDiskRead(const TDDiskReadContext& context, TDDiskReadResult& result);
-        bool SubmitDDiskDataRead(TEvRead::TPtr& request, TChunkIdx chunkIdx,
-            const TBlockSelector& selector, NWilson::TSpan& span, ui64 indexedReadToken,
-            TDDiskReadResult& result);
-        struct TPendingDDiskRead {
-            TDataIoPin Pin;
-            TIntegrityManager::TOperation Metadata;
-            TDDiskReadResult Result;
-            NActors::TAsyncEvent Changed;
-            bool IoPending = false;
-            bool Done = false;
-            bool Detached = false;
 
-            explicit TPendingDDiskRead(TChunkRef& chunk) : Pin(chunk) {
-            }
+        // Everything a read coroutine needs after the originating request is dropped.
+        struct TDataRead {
+            TQueryCredentials ResolvedCredentials;
+            TBlockSelector Selector;
+            TClientReplyRoute Reply;
+            NWilson::TSpan Span;
+            NHPTimer::STime StartTs = 0;
         };
-        THashMap<ui64, std::shared_ptr<TPendingDDiskRead>> PendingDDiskReads;
 
-        struct TPendingDDiskWrite {
-            ui64 Id = 0;
-            ui64 SyncId = 0;
-            ui32 SyncInput = 0;
+        // Reading metadata first costs one extra latency hop, but avoids a large useless data
+        // read when the range turns out to be a hole or its checksums cannot be read.
+        static constexpr ui32 MetadataFirstReadThreshold = 32u << 10;
+
+        // Owns the read for its whole lifetime. The caller must have pinned
+        // ChunkRefs[ResolvedCredentials.TabletId][Selector.VChunkIndex] for it.
+        void ExecuteDataRead(TDataRead read);
+        void FinishDDiskRead(TDataRead& read, TDDiskReadResult& result);
+        // Submits the client data read of one request into the batch. Returns false and fills
+        // result when the disk is already stopping or broken, in which case nothing is added.
+        bool SubmitDataRead(TIoBatch& batch, TIoCallback callback, TChunkIdx chunkIdx,
+            const TBlockSelector& selector, TDDiskReadResult& result);
+        // Submits one claimed metadata pair load into the batch. Returns false without adding
+        // anything when the disk is stopping or broken.
+        bool SubmitPairRead(TIoBatch& batch, TIoCallback callback,
+            const TIntegrityManager::TPairRead& read);
+        // Hands the loaded images to TIntegrityManager, latching Broken first when a critical
+        // load failed, and resumes eager placement afterwards. Clears the slots.
+        void CompleteMetadataReads(TPairLoads& loads);
+
+        // Everything a write coroutine needs after the originating request is dropped.
+        struct TDataWrite {
             TQueryCredentials OriginalCredentials;
             TQueryCredentials ResolvedCredentials;
             TBlockSelector Selector;
             TRope Data;
             std::vector<ui64> Checksums;
-            std::optional<TEvPrivate::TEvDDiskIoResult> Result;
+            TClientReplyRoute Reply;
+            NWilson::TSpan Span;
             NHPTimer::STime StartTs = 0;
-            TIntegrityManager::TWritePreparation Metadata;
-            std::optional<TIntegrityManager::TOperationResult> MetadataOutcome;
-            std::optional<TDataIoPin> DataPin;
-            NActors::TAsyncEvent Changed;
-            bool AllocationPinned = false;
-            bool MetadataStarted = false;
-            bool MetadataConsumed = false;
-            bool DataSubmitted = false;
-            bool DataDone = false;
-            bool MetadataDone = false;
-            bool Done = false;
+            // Nonzero for a sync destination write: answered through CompleteSyncDestination.
+            ui64 SyncId = 0;
+            ui32 SyncInput = 0;
+            // Metadata preparation adopted from the sync prefetch, if there was one.
+            std::optional<TIntegrityManager::TWritePreparation> Metadata;
         };
-        THashMap<ui64, std::shared_ptr<TPendingDDiskWrite>> PendingDDiskWrites;
-        struct TPendingWriteDataCookie {
-            ui64 Id;
-            bool Sync;
-        };
-        THashMap<ui64, TPendingWriteDataCookie> PendingWriteDataCookies;
-        std::deque<ui64> PendingWriteWork;
-        bool DrainingPendingWriteWork = false;
-        void QueuePendingWrite(ui64 id);
-        void QueuePendingWritesForChunk(ui64 tabletId, ui64 vChunkIndex);
-        void QueueAllPendingWrites();
-        void DrainPendingWriteWork();
-        void AdvancePendingWrite(ui64 id);
-        void FinishPendingWrite(ui64 id);
+
+        // Owns the write for its whole lifetime. The caller must have pinned
+        // ChunkRefs[ResolvedCredentials.TabletId][Selector.VChunkIndex] for it.
+        void ExecuteDataWrite(TDataWrite write);
+        void FinishDDiskWrite(TDataWrite& write,
+            NKikimrBlobStorage::NDDisk::TReplyStatus::E status, TString error);
         void StartSyncDestination(ui64 syncId, ui32 input, TRope data, std::vector<ui64> checksums);
-        void Handle(TEvPrivate::TEvInternalSyncWriteResult::TPtr ev);
-        class TDDiskWriteAwaiter {
-        public:
-            static constexpr bool IsActorAwareAwaiter = true;
-            explicit TDDiskWriteAwaiter(std::shared_ptr<TPendingDDiskWrite> state)
-                : State(std::move(state)), Waiter(State->Changed.Wait()) {
-            }
 
-            TDDiskWriteAwaiter(const TDDiskWriteAwaiter&) = delete;
-            TDDiskWriteAwaiter(TDDiskWriteAwaiter&&) = delete;
-
-            TDDiskWriteAwaiter& CoAwaitByValue() && noexcept {
-                return *this;
-            }
-
-            bool await_ready() const noexcept {
-                return State->Done;
-            }
-
-            void await_suspend(std::coroutine_handle<> continuation) noexcept {
-                Waiter.await_suspend(continuation);
-            }
-
-            bool await_cancel(std::coroutine_handle<> continuation) noexcept {
-                return Waiter.await_cancel(continuation);
-            }
-
-            void await_resume() const noexcept {
-            }
-        private:
-            std::shared_ptr<TPendingDDiskWrite> State;
-            decltype(State->Changed.Wait()) Waiter;
-        };
-
-        class TDDiskReadAwaiter;
-        struct TIndexedReadSlot {
-            ui32 Generation = 1;
-            ui32 NextFree = Max<ui32>();
-            TDDiskReadAwaiter* Waiter = nullptr;
-            std::optional<TDataIoPin> Pin;
-            bool Submitted = false;
-        };
-        std::vector<TIndexedReadSlot> IndexedReads;
-        ui32 FirstFreeIndexedRead = Max<ui32>();
-        size_t ActiveIndexedReads = 0;
-        ui64 ReserveIndexedRead(TDDiskReadAwaiter& waiter, TChunkRef& chunk);
-        TIndexedReadSlot* FindIndexedRead(ui64 token);
-        void ReleaseIndexedRead(ui64 token);
-        void DetachIndexedRead(ui64 token);
-        void Handle(TEvPrivate::TEvIndexedReadResult::TPtr ev);
-        // PendingWriteDataCookies routes completions to actor-owned write records.
-        void Handle(TEvPrivate::TEvDDiskIoResult::TPtr ev);
-
-        class TDDiskReadAwaiter {
-        public:
-            static constexpr bool IsActorAwareAwaiter = true;
-            TDDiskReadAwaiter(TDDiskActor& self, TEvRead::TPtr& request, TChunkRef& chunk,
-                ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span);
-            ~TDDiskReadAwaiter();
-            TDDiskReadAwaiter(const TDDiskReadAwaiter&) = delete;
-
-            TDDiskReadAwaiter& CoAwaitByValue() && noexcept {
-                return *this;
-            }
-
-            bool await_ready() const noexcept;
-            template<class TPromise>
-            void await_suspend(std::coroutine_handle<TPromise> parent) {
-                if (Mode == EMode::DataEvent) {
-                    Continuation = parent;
-                } else {
-                    Cold->Waiter.await_suspend(parent);
-                }
-            }
-
-            std::coroutine_handle<> await_cancel(std::coroutine_handle<> continuation) noexcept {
-                if (Mode == EMode::DataEvent) {
-                    if (!Token) {
-                        return {};
-                    }
-                    Self.DetachIndexedRead(std::exchange(Token, 0));
-                    Continuation = {};
-                    return continuation;
-                }
-                return Cold->Waiter.await_cancel(continuation) ? continuation : std::coroutine_handle<>{};
-            }
-
-            TDDiskReadResult await_resume();
-
-        private:
-            friend class TDDiskActor;
-            enum class EMode { Ready, DataEvent, Cold } Mode = EMode::Ready;
-            struct TColdWait {
-                std::shared_ptr<TPendingDDiskRead> Context;
-                decltype(Context->Changed.Wait()) Waiter;
-                explicit TColdWait(std::shared_ptr<TPendingDDiskRead> context)
-                    : Context(std::move(context)), Waiter(Context->Changed.Wait()) {
-                }
-            };
-            TDDiskActor& Self;
-            TDDiskReadResult Result;
-            std::optional<TIntegrityManager::TOperationResult> Metadata;
-            ui64 Token = 0;
-            std::coroutine_handle<> Continuation;
-            std::optional<TColdWait> Cold;
-        };
-        TDDiskReadAwaiter ReadDDisk(TEvRead::TPtr& request, TChunkRef& chunk,
-            ui64 tabletId, const TBlockSelector& selector, NWilson::TSpan& span);
         void ApplyDDiskReadMetadata(TDDiskReadResult& result,
             TIntegrityManager::TOperationResult&& metadata);
         void ApplyDDiskReadMetadata(TDDiskReadResult& result,
             const TIntegrityManager::TOperationResult& metadata);
         template<class TMetadata>
         void ApplyDDiskReadMetadataImpl(TDDiskReadResult& result, TMetadata&& metadata);
-        void TryFinishDDiskRead(ui64 cookie);
-        void Handle(TEvPrivate::TEvReadPartsResult::TPtr ev);
-        void FinishDDiskIoResult(TEvPrivate::TEvDDiskIoResult& msg);
         // Assigns newly free slots to pending extents, starts their formatting, and
         // releases integrity chunks that remain completely unused. Never-logged chunks return to
         // the reserve; committed ones are dropped via a snapshot. Returns only after the
@@ -1317,7 +1289,7 @@ namespace NKikimr::NDDisk {
             bool PersistentBufferSource = false;
             bool Terminal = false;
             bool DestinationStarted = false;
-            bool AllocationPinned = false;
+            bool ChunkRefPinned = false;
             bool MetadataStarted = false;
             TIntegrityManager::TWritePreparation Metadata;
         };
@@ -1384,6 +1356,9 @@ namespace NKikimr::NDDisk {
             bool hasPayload, TRope data, std::vector<ui64> checksums);
         void CancelPendingSyncSources();
         void QueueSync(ui64 id);
+        // Data writes wait on the chunk-ref events directly; the sync state machine still
+        // has to be kicked when allocation or commit progresses.
+        void QueueSyncsForChunk(ui64 tabletId, ui64 vChunkIndex);
         void DrainSyncWork();
         void AdvanceSync(ui64 id);
         void CompleteSyncDestination(ui64 syncId, ui32 input,

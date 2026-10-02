@@ -33,7 +33,7 @@ Y_UNIT_TEST_SUITE(TChunkManagerTest) {
         UNIT_ASSERT(allocation);
         UNIT_ASSERT(std::holds_alternative<TChunkManager::TChunkForPersistentBuffer>(allocation->first));
         UNIT_ASSERT_VALUES_EQUAL(allocation->second, 103);
-        UNIT_ASSERT(!manager.HasAllocations());
+        UNIT_ASSERT(!manager.HasPendingAllocations());
         UNIT_ASSERT_VALUES_EQUAL(manager.GetReservedChunkCount(), 0);
 
         manager.ReturnChunk(104);
@@ -90,7 +90,7 @@ Y_UNIT_TEST_SUITE(TChunkManagerTest) {
             UNIT_ASSERT(std::holds_alternative<TChunkManager::TChunkForPersistentBuffer>(allocation->first));
             UNIT_ASSERT_VALUES_EQUAL(allocation->second, chunkIdx);
         }
-        UNIT_ASSERT(!manager.HasAllocations());
+        UNIT_ASSERT(!manager.HasPendingAllocations());
         UNIT_ASSERT_VALUES_EQUAL(manager.CountPendingPersistentBufferAllocations(), 0);
     }
 
@@ -122,7 +122,7 @@ Y_UNIT_TEST_SUITE(TChunkManagerTest) {
         UNIT_ASSERT(allocation);
         UNIT_ASSERT(std::holds_alternative<TChunkManager::TChunkForData>(allocation->first));
         UNIT_ASSERT_VALUES_EQUAL(allocation->second, 101);
-        UNIT_ASSERT(!manager.HasAllocations());
+        UNIT_ASSERT(!manager.HasPendingAllocations());
         UNIT_ASSERT_VALUES_EQUAL(manager.GetReservedChunkCount(), 0);
     }
 }

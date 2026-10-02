@@ -130,8 +130,7 @@ public:
         if (Released.erase(ev.Get())) {
             return true;
         }
-        if (type == NDDisk::TDDiskActor::TEvPrivate::TEvDDiskIoResult::EventType
-                || type == NDDisk::TDDiskActor::TEvPrivate::TEvIndexedReadResult::EventType) {
+        if (type == NDDisk::TDDiskActor::TEvPrivate::TEvIoBatchDone::EventType) {
             ++IoCompletions;
         }
         if (type == GateType && (type != NPDisk::TEvLogResult::EventType
