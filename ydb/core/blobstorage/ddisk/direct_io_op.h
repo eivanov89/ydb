@@ -4,7 +4,6 @@
 
 #include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_data.h>
 
-#include <util/generic/function_ref.h>
 #include <util/generic/overloaded.h>
 #include <ydb/core/util/stlog.h>
 
@@ -116,9 +115,8 @@ private:
 // TDDiskActor::TDDiskIoOp
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Data-path operation of one read, write, or metadata pair load. Completion invokes
-// the callback of the coroutine frame which owns the request: that frame keeps the
-// result slot alive until its I/O batch releases, so no result event is needed.
+// Data-path operation of one read, write, or metadata pair load. The shared callback
+// owns its result slots even when forced teardown destroys the requesting frame.
 class TDDiskActor::TDDiskIoOp final : public TDDiskActor::TDirectIoOpBase {
 public:
     explicit TDDiskIoOp(TDDiskActor& actor)
@@ -135,11 +133,15 @@ public:
     void Reinit(const IEventHandle* ev = nullptr) {
         TDirectIoOpBase::Reinit(ev);
         Callback.reset();
+        PairIndex.reset();
         Critical = false;
     }
 
-    void SetCallback(TIoCallback callback) {
-        Callback.emplace(callback);
+    void SetCallback(std::shared_ptr<TBatchedIOAwaiter> callback,
+            std::optional<size_t> pairIndex = std::nullopt)
+    {
+        Callback = std::move(callback);
+        PairIndex = pairIndex;
     }
 
     // Metadata pair loads share the integrity retry and fail-stop policy.
@@ -152,7 +154,8 @@ public:
     }
 
 private:
-    std::optional<TIoCallback> Callback;
+    std::shared_ptr<TBatchedIOAwaiter> Callback;
+    std::optional<size_t> PairIndex;
     bool Critical = false;
 };
 

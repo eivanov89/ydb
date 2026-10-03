@@ -311,11 +311,10 @@ void TDDiskActor::TDDiskIoOp::Reply(NActors::TActorSystem* actorSystem, TReplySt
         Y_ABORT("Unknown OperationType");
     }
 
-    // The requesting frame may retire as soon as the callback releases its batch;
-    // nothing below this call may touch frame-owned state.
+    // This operation owns the callback until recycling, independently of the frame.
     Y_UNUSED(actorSystem);
     Y_ABORT_UNLESS(Callback);
-    (*Callback)(std::move(completion));
+    Callback->OnComplete(std::move(completion), PairIndex);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -399,6 +398,7 @@ void TDDiskActor::TDDiskIoOp::SelfRecycle() noexcept {
 
 void TDDiskActor::TDDiskIoOp::ClearForRecycle() noexcept {
     Callback.reset();
+    PairIndex.reset();
     Critical = false;
     TDirectIoOpBase::ClearForRecycle();
 }

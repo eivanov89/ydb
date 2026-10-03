@@ -46,17 +46,22 @@ and returns results in input order. Device waits use unique completion cookies
 independent of client cookies. A scoped `TDataIoPin` holds a chunk through
 accepted data I/O, and a `TDataRequestGuard` counts the frame in
 `DataRequestsInFlight`.
-`TIoBatch` joins the device operations of one frame. Its atomic pending count
+`TBatchedIOAwaiter` joins the device operations of one frame. It owns the
+callback result slots and completion route in heap storage shared through
+`std::shared_ptr` by the frame and every outstanding `TDDiskIoOp`, including
+across retries. Its atomic pending count
 starts at one submission guard; each submission adds one, and each `TDDiskIoOp`
 callback fills its own result slot and decrements the count. The unique
 transition to zero publishes one `TEvIoBatchDone` through `TActorSystem` to the
 frame's private wait cookie. Awaiting the batch releases the guard: a batch that
 already finished resumes the frame inline and sends no event, otherwise the
 cookie is registered in the same turn. Resuming rearms the counter for the next
-batch. The waiter has no cancellation hook, so an accepted batch cannot unwind
-early. Callbacks are non-owning references to lambdas in the frame and may run
-in any order, including before submission returns; integrity loads mark their
-operation critical.
+batch. The frame-local waiter has no cancellation hook, so an accepted batch
+cannot unwind early during cooperative shutdown. Class callbacks write
+disjoint result slots and may run in any order, including before submission
+returns; integrity loads mark their operation critical. Forced frame destruction
+unregisters the waiter and releases the frame's shared owner; outstanding
+operations keep the callback state alive until they retire.
 For an allocated, formatted chunk, `ExecuteDataRead` keeps everything in its own
 body. An unpublished chunk replies zeroes without I/O. With checksums disabled
 it submits and awaits the data read. Otherwise `PrepareRead` either answers from
@@ -127,7 +132,9 @@ destinations finish before their parent aggregate retires.
 Batch and integrity pair-write completions are handled during Stopping too;
 reservation release and Gone require `DataRequestsInFlight` to be zero and the
 pair-write cookie registry to be empty as well as callback drain. Forced
-destruction drains callbacks before releasing remaining registry pins.
+destruction destroys coroutine frames before the actor destructor drains
+callbacks. Outstanding operations retain their shared `TBatchedIOAwaiter`
+through this drain, which precedes release of remaining registry pins.
 
 Shutdown tests must distinguish the indefinite normal actor drain from the
 60-second `io_stalled` diagnostic and the 10-second forced-destructor deadline.

@@ -23,7 +23,7 @@ public:
             << " checksums=" << sizeof(TReadChecksums)
             << " result=" << sizeof(TDDiskActor::TDDiskReadResult)
             << " completion=" << sizeof(TDDiskActor::TIoCompletion)
-            << " batch=" << sizeof(TDDiskActor::TIoBatch) << Endl;
+            << " batch=" << sizeof(TDDiskActor::TBatchedIOAwaiter) << Endl;
     }
 
     static ui64 ChecksumMismatches(const TDDiskActor& actor) {
@@ -89,12 +89,14 @@ public:
     }
 
 #if defined(__linux__)
-    // Observable outcome of one TIoBatch, as the data path uses it.
+    // Observable outcome of one TBatchedIOAwaiter, as the data path uses it.
     struct TBatchProbe {
         // Set once the frame has resumed from the batch wait.
         bool Resumed = false;
         // Set when the frame left its cancellation scope and retired.
         bool Finished = false;
+        // Observes callback ownership without prolonging its lifetime.
+        std::weak_ptr<void> Callback;
         std::vector<NKikimrBlobStorage::NDDisk::TReplyStatus::E> Statuses;
         std::vector<TReadPayload> Data;
     };
@@ -111,29 +113,22 @@ public:
         actor.LaunchIntegrity([&actor, count, &probe, &scope, cancelBeforeWait]()
                 -> NActors::async<void> {
             co_await scope.Wrap([&]() -> NActors::async<void> {
-                TDDiskActor::TIoBatch batch(actor);
-                auto makeCallback = [&](size_t index) {
-                    return [&probe, &batch, index](
-                            TDDiskActor::TIoCompletion&& completion) noexcept {
-                        probe.Statuses[index] = completion.Status;
-                        probe.Data[index] = std::move(completion.Data);
-                        batch.Done();
-                    };
-                };
-                std::vector<decltype(makeCallback(0))> callbacks;
-                callbacks.reserve(count);
-                for (size_t i = 0; i < count; ++i) {
-                    callbacks.push_back(makeCallback(i));
-                }
+                auto batch = std::make_shared<TDDiskActor::TBatchedIOAwaiter>(actor);
+                probe.Callback = batch;
+                batch->PairResults.resize(count);
                 for (size_t i = 0; i < count; ++i) {
                     const TIntegrityManager::TPairRead read{i + 1, 100,
                         ui32(i * IntegrityUnitSize), IntegrityUnitSize};
-                    actor.SubmitPairRead(batch, callbacks[i], read);
+                    actor.SubmitPairRead(batch, i, read);
                 }
                 if (cancelBeforeWait) {
                     scope.Cancel();
                 }
-                co_await batch.Wait();
+                co_await batch->Wait();
+                for (size_t i = 0; i < count; ++i) {
+                    probe.Statuses[i] = batch->PairResults[i].Status;
+                    probe.Data[i] = std::move(batch->PairResults[i].Data);
+                }
                 probe.Resumed = true;
             });
             probe.Finished = true;

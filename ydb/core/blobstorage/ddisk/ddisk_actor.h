@@ -39,7 +39,6 @@
 #include <queue>
 #include <variant>
 
-#include <util/generic/function_ref.h>
 #include <util/generic/hash_set.h>
 
 #include <library/cpp/containers/absl/flat_hash_map.h>
@@ -379,9 +378,9 @@ namespace NKikimr::NDDisk {
                 ~TEvRetryIO();
             };
 
-            // Resumes the data-path coroutine which owns a TIoBatch once the last
+            // Resumes the data-path coroutine awaiting a TBatchedIOAwaiter once the last
             // operation of that batch has completed. Carries no payload: every
-            // completion already stored its result into the waiting coroutine frame.
+            // completion already stored its result into the shared callback object.
             struct TEvIoBatchDone : TEventLocal<TEvIoBatchDone, EvIoBatchDone> {};
 
             struct TEvIntegrityIoResult : TEventLocal<TEvIntegrityIoResult, EvIntegrityIoResult> {
@@ -790,9 +789,9 @@ namespace NKikimr::NDDisk {
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Data-path coroutine primitives
         //
-        // Client reads and writes are flat root coroutines. Their frames own every buffer,
-        // pin, reply route and metadata result for the whole request, so no completion has
-        // to be mirrored into an actor-local map and no completion event carries a payload.
+        // Client reads and writes are flat root coroutines. Their frames own the pins and
+        // reply routes, and share callback results with outstanding operations, so forced
+        // frame destruction cannot invalidate an I/O completion's destination.
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         // Completion of one data-path device operation, delivered on the I/O thread.
@@ -804,39 +803,51 @@ namespace NKikimr::NDDisk {
             TReadPayload Data;
         };
 
-        // Non-owning reference to a lambda living in the requesting coroutine frame.
-        using TIoCallback = TFunctionRef<void(TIoCompletion&&) noexcept>;
+        struct TDDiskReadResult {
+            NKikimrBlobStorage::NDDisk::TReplyStatus::E Status = NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
+            TString ErrorMessage;
+            TReadPayload Data;
+            TReadChecksums Checksums;
+            ui64 TotalSize = 0;
+        };
 
-        // Groups the device operations a data-path coroutine submits before it suspends.
+        // Shared class callback for the operations a data-path coroutine submits before
+        // suspending. The frame and every outstanding operation own it, including all result
+        // slots, so callbacks remain valid after forced destruction of the frame.
         //
         // Pending carries one extra reference - the submission guard - for the whole
         // submission phase, so a completion landing on the I/O thread while the frame is
         // still submitting cannot fire the resume event before anybody waits for it.
-        // Wait() releases that guard. Callbacks run on the I/O thread and must call Done()
-        // as their last statement: the frame, and this batch with it, may retire the moment
-        // the last reference goes away.
-        class TIoBatch {
-        public:
-            explicit TIoBatch(TDDiskActor& self);
+        // Wait() releases that guard; the last callback publishes one resume event.
+        class TBatchedIOAwaiter {
+            using TEventWaiter = decltype(NActors::ActorWaitForEvent<TEvPrivate::TEvIoBatchDone>(0));
 
-            TIoBatch(const TIoBatch&) = delete;
-            TIoBatch& operator=(const TIoBatch&) = delete;
+        public:
+            explicit TBatchedIOAwaiter(TDDiskActor& self);
+
+            TBatchedIOAwaiter(const TBatchedIOAwaiter&) = delete;
+            TBatchedIOAwaiter& operator=(const TBatchedIOAwaiter&) = delete;
+
+            TDDiskReadResult DataResult;
+            // Sized on the actor thread before submission; each callback owns one slot.
+            std::vector<TIoCompletion> PairResults;
 
             // Actor thread, once per submission, before submitting.
             void Add() noexcept {
                 Pending.fetch_add(1, std::memory_order_relaxed);
             }
 
-            // Any thread, exactly once per added operation.
-            void Done() noexcept;
+            // Any thread, exactly once per added operation. No index denotes client data.
+            void OnComplete(TIoCompletion&& completion, std::optional<size_t> pairIndex) noexcept;
 
             class TWaiter {
             public:
                 static constexpr bool IsActorAwareAwaiter = true;
 
-                explicit TWaiter(TIoBatch& batch) noexcept
+                explicit TWaiter(TBatchedIOAwaiter& batch) noexcept
                     : Batch(batch)
-                {}
+                    , EventWaiter(batch.Cookie) {
+                }
 
                 bool await_ready() noexcept {
                     return Batch.Release();
@@ -844,7 +855,7 @@ namespace NKikimr::NDDisk {
 
                 template<class TPromise>
                 void await_suspend(std::coroutine_handle<TPromise> parent) {
-                    Batch.Suspend(parent);
+                    EventWaiter.await_suspend(parent);
                 }
 
                 void await_resume() noexcept {
@@ -852,7 +863,10 @@ namespace NKikimr::NDDisk {
                 }
 
             private:
-                TIoBatch& Batch;
+                TBatchedIOAwaiter& Batch;
+                // Registration belongs to the frame and detaches during forced teardown.
+                // The shared callback must never unregister a waiter from an I/O thread.
+                TEventWaiter EventWaiter;
             };
 
             // Releases the submission guard and waits for every operation of the batch.
@@ -863,25 +877,17 @@ namespace NKikimr::NDDisk {
             }
 
         private:
+            void Done() noexcept;
             bool Release() noexcept;
-
-            template<class TPromise>
-            void Suspend(std::coroutine_handle<TPromise> parent) {
-                EventWaiter.emplace(Cookie);
-                EventWaiter->await_suspend(parent);
-            }
 
             void Rearm() noexcept {
                 Pending.store(1, std::memory_order_relaxed);
             }
 
-            using TEventWaiter = decltype(NActors::ActorWaitForEvent<TEvPrivate::TEvIoBatchDone>(0));
-
             NActors::TActorSystem* const ActorSystem;
             const TActorId DDiskId;
             const ui64 Cookie;
             std::atomic<ui32> Pending{1};
-            std::optional<TEventWaiter> EventWaiter;
         };
 
         // Hides the cancellation hooks of an awaiter so that a frame holding accepted
@@ -925,18 +931,9 @@ namespace NKikimr::NDDisk {
             ui64 Cookie = 0;
         };
 
-        // Result slots of the metadata pair loads one coroutine claimed. They live in the
-        // frame, so a completion writes the image straight into the waiting request. Each
-        // completion owns exactly one index of both vectors, which is what makes concurrent
-        // io_uring threads writing here safe.
-        struct TPairLoads {
-            std::vector<TIntegrityManager::TPairReadResult> Results;
-            std::vector<TString> Errors;
-        };
-
         // Accepted device I/O and client replies owned by a data-path coroutine frame.
-        // Shutdown publishes its barrier only after the last frame has retired, so a frame
-        // is never cancelled while it still holds buffers the device may write into.
+        // Normal shutdown publishes its barrier only after the last frame has retired.
+        // Forced teardown can destroy frames first; shared callbacks retain their results.
         size_t DataRequestsInFlight = 0;
         class TDataRequestGuard {
         public:
@@ -966,14 +963,6 @@ namespace NKikimr::NDDisk {
             TDDiskActor* Self;
         };
 
-        struct TDDiskReadResult {
-            NKikimrBlobStorage::NDDisk::TReplyStatus::E Status = NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
-            TString ErrorMessage;
-            TReadPayload Data;
-            TReadChecksums Checksums;
-            ui64 TotalSize = 0;
-        };
-
         // Everything a read coroutine needs after the originating request is dropped.
         struct TDataRead {
             TQueryCredentials ResolvedCredentials;
@@ -992,16 +981,17 @@ namespace NKikimr::NDDisk {
         void ExecuteDataRead(TDataRead read);
         void FinishDDiskRead(TDataRead& read, TDDiskReadResult& result);
         // Submits the client data read of one request into the batch. Returns false and fills
-        // result when the disk is already stopping or broken, in which case nothing is added.
-        bool SubmitDataRead(TIoBatch& batch, TIoCallback callback, TChunkIdx chunkIdx,
-            const TBlockSelector& selector, TDDiskReadResult& result);
+        // DataResult when the disk is already stopping or broken, without adding an operation.
+        bool SubmitDataRead(const std::shared_ptr<TBatchedIOAwaiter>& batch, TChunkIdx chunkIdx,
+            const TBlockSelector& selector);
         // Submits one claimed metadata pair load into the batch. Returns false without adding
-        // anything when the disk is stopping or broken.
-        bool SubmitPairRead(TIoBatch& batch, TIoCallback callback,
+        // anything when the disk is stopping. Broken operations complete inline with failure.
+        bool SubmitPairRead(const std::shared_ptr<TBatchedIOAwaiter>& batch, size_t index,
             const TIntegrityManager::TPairRead& read);
         // Hands the loaded images to TIntegrityManager, latching Broken first when a critical
         // load failed, and resumes eager placement afterwards. Clears the slots.
-        void CompleteMetadataReads(TPairLoads& loads);
+        void CompleteMetadataReads(TConstArrayRef<TIntegrityManager::TPairRead> reads,
+            std::vector<TIoCompletion>& completions);
 
         // Everything a write coroutine needs after the originating request is dropped.
         struct TDataWrite {

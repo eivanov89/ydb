@@ -23,16 +23,29 @@ namespace NKikimr::NDDisk {
     TDDiskActor::TPendingIoOp::~TPendingIoOp() = default;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    // TDDiskActor::TIoBatch
+    // TDDiskActor::TBatchedIOAwaiter
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    TDDiskActor::TIoBatch::TIoBatch(TDDiskActor& self)
+    TDDiskActor::TBatchedIOAwaiter::TBatchedIOAwaiter(TDDiskActor& self)
         : ActorSystem(TActivationContext::ActorSystem())
         , DDiskId(self.SelfId())
-        , Cookie(NActors::AllocateWaitCookie())
-    {}
+        , Cookie(NActors::AllocateWaitCookie()) {
+    }
 
-    void TDDiskActor::TIoBatch::Done() noexcept {
+    void TDDiskActor::TBatchedIOAwaiter::OnComplete(TIoCompletion&& completion,
+            std::optional<size_t> pairIndex) noexcept
+    {
+        if (pairIndex) {
+            PairResults[*pairIndex] = std::move(completion);
+        } else {
+            DataResult.Status = completion.Status;
+            DataResult.ErrorMessage = std::move(completion.ErrorMessage);
+            DataResult.Data = std::move(completion.Data);
+        }
+        Done();
+    }
+
+    void TDDiskActor::TBatchedIOAwaiter::Done() noexcept {
         if (Pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             // This runs on the io_uring thread, where the mailbox is the only way back in.
             ActorSystem->Send(new IEventHandle(DDiskId, {},
@@ -40,9 +53,9 @@ namespace NKikimr::NDDisk {
         }
     }
 
-    bool TDDiskActor::TIoBatch::Release() noexcept {
+    bool TDDiskActor::TBatchedIOAwaiter::Release() noexcept {
         // Releases the submission guard. From here a completion can only reach the frame as a
-        // mailbox event, which cannot be handled before Suspend has registered for it.
+        // mailbox event, which cannot be handled before the waiter has registered for it.
         return Pending.fetch_sub(1, std::memory_order_acq_rel) == 1;
     }
 
@@ -251,18 +264,12 @@ namespace NKikimr::NDDisk {
         Y_DEFER { --chunkRef.ChunkRefPins; };
 
         TDataRequestGuard requestGuard(*this);
-        TIoBatch batch(*this);
-        auto status = TStatus::OK;
-        TString error;
+        auto batch = std::make_shared<TBatchedIOAwaiter>(*this);
+        auto& status = batch->DataResult.Status;
+        auto& error = batch->DataResult.ErrorMessage;
         std::optional<TDataIoPin> dataPin;
         bool dataSubmitted = false;
         bool metadataConsumed = false;
-
-        auto onData = [&](TIoCompletion&& completion) noexcept {
-            status = completion.Status;
-            error = std::move(completion.ErrorMessage);
-            batch.Done();
-        };
 
         auto sessionLost = [&] {
             TQueryCredentials current;
@@ -348,17 +355,17 @@ namespace NKikimr::NDDisk {
 
             dataPin.emplace(chunkRef);
             auto writeOp = AllocateOp<TDDiskIoOp>();
-            writeOp->SetCallback(onData);
+            writeOp->SetCallback(batch);
             writeOp->PrepareWrite(std::move(write.Data),
                 DiskFormat->Offset(chunkRef.ChunkIdx, 0, write.Selector.OffsetInBytes),
                 chunkRef.ChunkIdx, write.Selector.OffsetInBytes);
             std::unique_ptr<TDirectIoOpBase> op = std::move(writeOp);
             dataSubmitted = true;
-            batch.Add();
+            batch->Add();
             DirectUringOp(op);
         } while (false);
 
-        co_await batch.Wait();
+        co_await batch->Wait();
         dataPin.reset();
 
         if (write.Metadata) {
@@ -575,45 +582,21 @@ namespace NKikimr::NDDisk {
         // forced teardown destroys the frame.
         Y_DEFER { --chunkRef.ChunkRefPins; };
 
-        TDDiskReadResult result;
+        auto batch = std::make_shared<TBatchedIOAwaiter>(*this);
+        auto& result = batch->DataResult;
         result.TotalSize = selector.Size;
 
         TDataRequestGuard requestGuard(*this);
         TDataIoPin dataPin(chunkRef);
         const TChunkIdx chunkIdx = chunkRef.ChunkIdx;
 
-        TIoBatch batch(*this);
-        auto onData = [&](TIoCompletion&& completion) noexcept {
-            result.Status = completion.Status;
-            result.ErrorMessage = std::move(completion.ErrorMessage);
-            result.Data = std::move(completion.Data);
-            batch.Done();
-        };
-
-        TPairLoads loads;
-        auto makePairCallback = [&](size_t index) {
-            // Each completion owns its own slot, which is what makes concurrent
-            // io_uring threads writing into this frame safe.
-            return [&loads, &batch, index](TIoCompletion&& completion) noexcept {
-                auto& slot = loads.Results[index];
-                slot.Result.Ok = completion.Status == TStatus::OK;
-                if (slot.Result.Ok) {
-                    slot.Result.Data = std::move(completion.Data);
-                } else {
-                    loads.Errors[index] = std::move(completion.ErrorMessage);
-                }
-                batch.Done();
-            };
-        };
-        std::vector<decltype(makePairCallback(0))> pairCallbacks;
-
         TIntegrityManager::TOperation pending;
         std::optional<TIntegrityManager::TOperationResult> warmMetadata;
 
         do {
             if (!Config.EnableChecksums) {
-                SubmitDataRead(batch, onData, chunkIdx, selector, result);
-                co_await batch.Wait();
+                SubmitDataRead(batch, chunkIdx, selector);
+                co_await batch->Wait();
                 break;
             }
 
@@ -627,8 +610,8 @@ namespace NKikimr::NDDisk {
                 break;
             }
             if (warmMetadata) {
-                SubmitDataRead(batch, onData, chunkIdx, selector, result);
-                co_await batch.Wait();
+                SubmitDataRead(batch, chunkIdx, selector);
+                co_await batch->Wait();
                 ApplyDDiskReadMetadata(result, std::move(*warmMetadata));
                 break;
             }
@@ -637,13 +620,7 @@ namespace NKikimr::NDDisk {
             // the rest of its range is joined through the shared operation.
             pending = std::move(preparation.Pending);
             *Counters.Checksums.IntegrityPairReads += preparation.Reads.size();
-            loads.Results.resize(preparation.Reads.size());
-            loads.Errors.resize(preparation.Reads.size());
-            pairCallbacks.reserve(preparation.Reads.size());
-            for (size_t i = 0; i < preparation.Reads.size(); ++i) {
-                loads.Results[i].Id = preparation.Reads[i].Id;
-                pairCallbacks.push_back(makePairCallback(i));
-            }
+            batch->PairResults.resize(preparation.Reads.size());
             // A large read pays for the extra round trip to avoid reading data it may
             // discard; a small one speculates and issues both at once. Requested blocks
             // are not written concurrently: a neighboring write may change the same pair,
@@ -653,14 +630,14 @@ namespace NKikimr::NDDisk {
                     && IntegrityManager->MakeReadPlan({tabletId, selector.VChunkIndex},
                         selector.OffsetInBytes, selector.Size).Kind
                             != TIntegrityManager::TReadPlan::AllZero) {
-                SubmitDataRead(batch, onData, chunkIdx, selector, result);
+                SubmitDataRead(batch, chunkIdx, selector);
             }
             for (size_t i = 0; i < preparation.Reads.size(); ++i) {
-                SubmitPairRead(batch, pairCallbacks[i], preparation.Reads[i]);
+                SubmitPairRead(batch, i, preparation.Reads[i]);
             }
-            co_await batch.Wait();
+            co_await batch->Wait();
 
-            CompleteMetadataReads(loads);
+            CompleteMetadataReads(preparation.Reads, batch->PairResults);
             while (!pending.IsDone()) {
                 auto waiter = pending.WaitChanged();
                 co_await NonCancellable(waiter);
@@ -673,8 +650,8 @@ namespace NKikimr::NDDisk {
                     ApplyDDiskReadMetadata(result, metadata);
                     break;
                 }
-                SubmitDataRead(batch, onData, chunkIdx, selector, result);
-                co_await batch.Wait();
+                SubmitDataRead(batch, chunkIdx, selector);
+                co_await batch->Wait();
             }
             ApplyDDiskReadMetadata(result, *pending.GetResult());
         } while (false);
@@ -686,26 +663,27 @@ namespace NKikimr::NDDisk {
         }
     }
 
-    bool TDDiskActor::SubmitDataRead(TIoBatch& batch, TIoCallback callback, TChunkIdx chunkIdx,
-            const TBlockSelector& selector, TDDiskReadResult& result)
+    bool TDDiskActor::SubmitDataRead(const std::shared_ptr<TBatchedIOAwaiter>& batch, TChunkIdx chunkIdx,
+            const TBlockSelector& selector)
     {
+        auto& result = batch->DataResult;
         if (Stopping || IsBroken()) {
             result.Status = IsBroken() ? TStatus::ERROR : TStatus::SESSION_MISMATCH;
             result.ErrorMessage = IsBroken() ? GetBrokenReason() : TString(StoppingReason);
             return false;
         }
         auto readOp = AllocateOp<TDDiskIoOp>();
-        readOp->SetCallback(callback);
+        readOp->SetCallback(batch);
         readOp->PrepareRead(selector.Size, DiskFormat->Offset(chunkIdx, 0, selector.OffsetInBytes),
             chunkIdx, selector.OffsetInBytes);
         std::unique_ptr<TDirectIoOpBase> op = std::move(readOp);
         // DirectUringOp always produces exactly one completion, inline when the disk is broken.
-        batch.Add();
+        batch->Add();
         DirectUringOp(op);
         return true;
     }
 
-    bool TDDiskActor::SubmitPairRead(TIoBatch& batch, TIoCallback callback,
+    bool TDDiskActor::SubmitPairRead(const std::shared_ptr<TBatchedIOAwaiter>& batch, size_t index,
             const TIntegrityManager::TPairRead& read)
     {
         if (Stopping) {
@@ -713,26 +691,36 @@ namespace NKikimr::NDDisk {
         }
         auto pairOp = AllocateOp<TDDiskIoOp>();
         pairOp->SetCritical();
-        pairOp->SetCallback(callback);
+        pairOp->SetCallback(batch, index);
         pairOp->PrepareRead(read.Size, DiskFormat->Offset(read.ChunkIdx, 0, read.OffsetInBytes),
             read.ChunkIdx, read.OffsetInBytes);
         std::unique_ptr<TDirectIoOpBase> op = std::move(pairOp);
-        batch.Add();
+        batch->Add();
         DirectUringOp(op);
         return true;
     }
 
-    void TDDiskActor::CompleteMetadataReads(TPairLoads& loads) {
-        if (loads.Results.empty()) {
+    void TDDiskActor::CompleteMetadataReads(TConstArrayRef<TIntegrityManager::TPairRead> reads,
+            std::vector<TIoCompletion>& completions)
+    {
+        Y_ABORT_UNLESS(reads.size() == completions.size());
+        if (reads.empty()) {
             return;
         }
+        std::vector<TIntegrityManager::TPairReadResult> results(reads.size());
         bool failed = false;
         TString error;
-        for (size_t i = 0; i < loads.Results.size(); ++i) {
-            if (!loads.Results[i].Result.Ok) {
+        for (size_t i = 0; i < reads.size(); ++i) {
+            auto& result = results[i];
+            auto& completion = completions[i];
+            result.Id = reads[i].Id;
+            result.Result.Ok = completion.Status == TStatus::OK;
+            if (result.Result.Ok) {
+                result.Result.Data = std::move(completion.Data);
+            } else {
                 failed = true;
                 if (!error) {
-                    error = std::move(loads.Errors[i]);
+                    error = std::move(completion.ErrorMessage);
                 }
             }
         }
@@ -741,9 +729,8 @@ namespace NKikimr::NDDisk {
         if (failed && !Stopping) {
             EnterBroken(std::move(error));
         }
-        IntegrityManager->CompletePairReads(loads.Results);
-        loads.Results.clear();
-        loads.Errors.clear();
+        IntegrityManager->CompletePairReads(results);
+        completions.clear();
         if (!Stopping && !IsBroken()) {
             RunIntegrityReclamation();
         }

@@ -9016,6 +9016,60 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
         }
     }
 
+    Y_UNIT_TEST(ControlledForcedCleanupRetainsBatchUntilLastCallback) {
+        bool destroyed = false;
+        TControlledDDisk f(true, true, false, &destroyed);
+        f.Initialize();
+        NDDisk::TDDiskActorTestPeer::TBatchProbe probe;
+        NActors::TAsyncCancellationScope scope;
+        f.Inspect([&](auto& actor) {
+            NDDisk::TDDiskActorTestPeer::SubmitPairReadBatch(actor, 2, probe, scope);
+            return true;
+        });
+        f.Until([&] {
+            return f.Io.size() == 2;
+        });
+        UNIT_ASSERT_VALUES_EQUAL(probe.Callback.use_count(), 3);
+        UNIT_ASSERT(!probe.Resumed);
+        UNIT_ASSERT(!probe.Finished);
+
+        TManualEvent entered, retired;
+        UNIT_ASSERT(f.Ctx.Runtime.WrapInActorContext(f.Parent, [&](IActor* actor) {
+            NDDisk::TDDiskActorTestPeer::SetDestructionClock(
+                *static_cast<NDDisk::TDDiskActor*>(actor), [] {
+                    return TMonotonic::Zero();
+                }, [&] {
+                    entered.Signal();
+                    retired.WaitI();
+                });
+        }));
+        std::array<long, 3> owners{};
+        std::thread completion([&] {
+            entered.WaitI();
+            // Runtime cleanup has destroyed the frame and its waiter before entering
+            // the actor destructor. Only the two outstanding operations retain the batch.
+            owners[0] = probe.Callback.use_count();
+            f.Router->CompleteSuccessfully(f.Io[0].Op);
+            owners[1] = probe.Callback.use_count();
+            f.Router->CompleteSuccessfully(f.Io[1].Op);
+            owners[2] = probe.Callback.use_count();
+            retired.Signal();
+        });
+        f.Ctx.Runtime.Stop();
+        completion.join();
+        f.Io.clear();
+
+        // Check ownership after joining so a failed check cannot strand the drain.
+        UNIT_ASSERT_VALUES_EQUAL(owners[0], 2);
+        UNIT_ASSERT_VALUES_EQUAL(owners[1], 1);
+        UNIT_ASSERT_VALUES_EQUAL(owners[2], 0);
+        UNIT_ASSERT(probe.Callback.expired());
+        UNIT_ASSERT(!probe.Resumed);
+        UNIT_ASSERT(!probe.Finished);
+        UNIT_ASSERT_VALUES_EQUAL(f.Router->Outstanding.load(), 0);
+        UNIT_ASSERT(destroyed);
+    }
+
     Y_UNIT_TEST(ControlledConcurrentWriteCannotPublishStopBarrierBeforeFallbackSyncCancellation) {
         TControlledDDisk f(false);
         f.Initialize();

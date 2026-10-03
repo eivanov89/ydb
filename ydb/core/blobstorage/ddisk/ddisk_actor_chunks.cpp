@@ -30,8 +30,8 @@ namespace NKikimr::NDDisk {
         HandleChunkReserved();
     }
 
-    // Root coroutine: owns the images of the loads it submits until they are handed back
-    // to TIntegrityManager. These loads serve writers and joined readers, not one request.
+    // Root coroutine: shares ownership of the loaded images with its callback until they
+    // are handed back to TIntegrityManager. These loads serve writers and joined readers.
     void TDDiskActor::SubmitIntegrityPairReads(std::vector<TIntegrityManager::TPairRead> reads) {
         if (reads.empty()) {
             co_return;
@@ -46,39 +46,16 @@ namespace NKikimr::NDDisk {
         }
 
         TDataRequestGuard requestGuard(*this);
-        TIoBatch batch(*this);
-        TPairLoads loads;
-        loads.Results.resize(reads.size());
-        loads.Errors.resize(reads.size());
-
-        auto makeCallback = [&](size_t index) {
-            // Each completion owns its own slot, which is what makes concurrent
-            // io_uring threads writing into this frame safe.
-            return [&loads, &batch, index](TIoCompletion&& completion) noexcept {
-                auto& slot = loads.Results[index];
-                slot.Result.Ok = completion.Status == NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
-                if (slot.Result.Ok) {
-                    slot.Result.Data = std::move(completion.Data);
-                } else {
-                    loads.Errors[index] = std::move(completion.ErrorMessage);
-                }
-                batch.Done();
-            };
-        };
-        std::vector<decltype(makeCallback(0))> callbacks;
-        callbacks.reserve(reads.size());
-        for (size_t i = 0; i < reads.size(); ++i) {
-            loads.Results[i].Id = reads[i].Id;
-            callbacks.push_back(makeCallback(i));
-        }
+        auto batch = std::make_shared<TBatchedIOAwaiter>(*this);
+        batch->PairResults.resize(reads.size());
 
         *Counters.Checksums.IntegrityPairReads += reads.size();
         for (size_t i = 0; i < reads.size(); ++i) {
-            SubmitPairRead(batch, callbacks[i], reads[i]);
+            SubmitPairRead(batch, i, reads[i]);
         }
-        co_await batch.Wait();
+        co_await batch->Wait();
 
-        CompleteMetadataReads(loads);
+        CompleteMetadataReads(reads, batch->PairResults);
         requestGuard.Release();
         if (Stopping && !GetDirectIoInflight()) {
             FinishStopping();
