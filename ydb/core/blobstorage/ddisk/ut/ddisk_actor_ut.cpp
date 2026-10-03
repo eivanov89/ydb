@@ -7662,7 +7662,7 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
         }
     }
 
-    Y_UNIT_TEST(MetadataBatchImmediateAndConcurrentCallbacks) {
+    Y_UNIT_TEST(MetadataBatchImmediateAndDeferredCallbacks) {
         for (bool immediate : {false, true}) {
             TControlledDDisk f(true);
             f.Initialize();
@@ -7683,18 +7683,12 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
                 f.Until([&] {
                     return f.Io.size() == count;
                 });
-                // Keep one callback pending while the rest complete on foreign
-                // threads, then prove that the resume waits for the last slot.
-                std::vector<std::thread> callbacks;
+                // Complete pooled operations from one producer, as the router does.
+                // Keep one callback pending to check that the batch still waits for it.
                 for (size_t i = count; i-- > 1;) {
                     auto* op = f.Io[i].Op;
-                    callbacks.emplace_back([&, op, i] {
-                        memset(const_cast<void*>(op->GetIovBase()), 'a' + i, op->GetTotalSize());
-                        f.Router->CompleteSuccessfully(op);
-                    });
-                }
-                for (auto& callback : callbacks) {
-                    callback.join();
+                    memset(const_cast<void*>(op->GetIovBase()), 'a' + i, op->GetTotalSize());
+                    f.Router->CompleteSuccessfully(op);
                 }
                 f.Pump();
                 UNIT_ASSERT(!probe.Resumed);
@@ -7720,6 +7714,65 @@ Y_UNIT_TEST_SUITE(TDDiskActorTest) {
             f.Router->CompleteInline = false;
             f.Shutdown();
         }
+    }
+
+    Y_UNIT_TEST(MetadataBatchConcurrentCallbacks) {
+        TControlledDDisk f(true);
+        f.Initialize();
+        constexpr size_t count = 16;
+        const auto admissions = f.Router->ReadAdmissions;
+        NDDisk::TDDiskActorTestPeer::TBatchProbe probe;
+        f.HoldBatchCompletions = true;
+        auto complete = f.Inspect([&](auto& actor) {
+            return NDDisk::TDDiskActorTestPeer::WaitForPairBatchCallbacks(actor, count, probe);
+        });
+
+        TManualEvent start;
+        std::vector<std::thread> callbacks;
+        for (size_t i = count; i-- > 1;) {
+            callbacks.emplace_back([complete, &start, i] {
+                auto data = TRcBuf::UninitializedPageAligned(BlockSize);
+                memset(data.GetDataMut(), 'a' + i, data.size());
+                start.WaitI();
+                complete(i, std::move(data));
+            });
+        }
+        start.Signal();
+        for (auto& callback : callbacks) {
+            callback.join();
+        }
+        f.Pump();
+        UNIT_ASSERT(f.BatchCompletions.empty());
+        UNIT_ASSERT(!probe.Resumed);
+        UNIT_ASSERT(!probe.Finished);
+
+        auto data = TRcBuf::UninitializedPageAligned(BlockSize);
+        memset(data.GetDataMut(), 'a', data.size());
+        complete(0, std::move(data));
+        f.Until([&] {
+            return f.BatchCompletions.size() == 1;
+        });
+        UNIT_ASSERT(!probe.Resumed);
+        f.HoldBatchCompletions = false;
+        f.Ctx.Runtime.Send(std::move(f.BatchCompletions.front()), NodeId);
+        f.BatchCompletions.clear();
+        f.Until([&] {
+            return probe.Finished;
+        });
+
+        UNIT_ASSERT(probe.Resumed);
+        UNIT_ASSERT_VALUES_EQUAL(f.Router->ReadAdmissions, admissions);
+        UNIT_ASSERT_VALUES_EQUAL(probe.Statuses.size(), count);
+        UNIT_ASSERT_VALUES_EQUAL(probe.Data.size(), count);
+        for (size_t i = 0; i < count; ++i) {
+            UNIT_ASSERT(probe.Statuses[i] == TReplyStatus::OK);
+            UNIT_ASSERT_VALUES_EQUAL(probe.Data[i].size(), BlockSize);
+            UNIT_ASSERT(probe.Data[i].IsNative());
+            TString actual(BlockSize, '\0');
+            probe.Data[i].CopyTo(actual.Detach(), actual.size());
+            UNIT_ASSERT_VALUES_EQUAL(actual, MakeData('a' + i, BlockSize));
+        }
+        f.Shutdown();
     }
 
     Y_UNIT_TEST(MetadataBatchFailsEveryRejectedOperation) {

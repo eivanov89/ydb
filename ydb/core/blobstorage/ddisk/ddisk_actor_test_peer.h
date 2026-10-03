@@ -135,6 +135,32 @@ public:
         });
     }
 
+    // Exercise concurrent batch callbacks without recycling operations through the
+    // single-producer DDisk I/O pool. The returned callback owns the batch.
+    static auto WaitForPairBatchCallbacks(TDDiskActor& actor, size_t count, TBatchProbe& probe) {
+        auto batch = std::make_shared<TDDiskActor::TBatchedIOAwaiter>(actor);
+        probe.Callback = batch;
+        batch->PairResults.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            batch->Add();
+        }
+        actor.LaunchIntegrity([batch, &probe]() -> NActors::async<void> {
+            co_await batch->Wait();
+            for (auto& result : batch->PairResults) {
+                probe.Statuses.push_back(result.Status);
+                probe.Data.push_back(std::move(result.Data));
+            }
+            probe.Resumed = true;
+            probe.Finished = true;
+        });
+        return [batch = std::move(batch)](size_t index, TRcBuf data) {
+            TDDiskActor::TIoCompletion completion;
+            completion.Status = NKikimrBlobStorage::NDDisk::TReplyStatus::OK;
+            completion.Data = TReadPayload(std::move(data));
+            batch->OnComplete(std::move(completion), index);
+        };
+    }
+
     // Metadata pair loads are submitted as critical I/O so they share the integrity retry
     // and fail-stop policy; client data I/O is not.
     static bool IsCriticalIo(const NPDisk::TUringOperationBase& op) {
