@@ -7,13 +7,12 @@ import tempfile
 import time
 import unittest
 
-from harness import E2ECase, MockCluster
+from harness import E2ECase, MockCluster, MOCK_BINARY
 from ydb.apps.bridge_skipper.ydbd_mock.lib import supervisor
 from ydb.apps.bridge_skipper.ydbd_mock.lib.topology import Topology
 
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
-MOCK_BINARY = os.path.join(REPO, "ydb", "apps", "bridge_skipper", "ydbd_mock", "ydbd_mock")
 
 
 def read_json(path):

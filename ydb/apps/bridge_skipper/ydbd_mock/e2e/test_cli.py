@@ -4,7 +4,6 @@ Needs the ydb CLI at ~/ydb/bin/ydb (or YDBD_MOCK_REAL_YDB). The CLI only ever ta
 mock: the shim refuses every other endpoint.
 """
 import subprocess
-import sys
 import unittest
 
 import yaml
@@ -272,7 +271,7 @@ def _run_shim(*argv: str, env: dict) -> Result:
     import time
     shim = os.path.join(harness.SCRIPTS, "ydb_shim.py")
     started = time.monotonic()
-    proc = subprocess.run([sys.executable, shim] + list(argv), env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run([harness.shim_python(), shim] + list(argv), env=env, capture_output=True, text=True, timeout=60)
     return Result(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
 
 

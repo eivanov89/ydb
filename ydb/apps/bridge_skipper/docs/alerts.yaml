@@ -1,0 +1,67 @@
+# Optional example only. Calibrate windows/thresholds and the job label locally.
+# Local/mock measurements do not qualify production Auto or physical storage.
+groups:
+  - name: bridge_skipper_example
+    rules:
+      - alert: SkipperMetricsUnavailable
+        expr: up{job="bridge_skipper"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Skipper metrics endpoint is unreachable"
+      - alert: SkipperControllerStalled
+        expr: skipper_controller_stalled > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP is responsive but controller progress has stalled"
+      - alert: SkipperStorageFailure
+        expr: increase(storage_errors_total[5m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Skipper persistence failed; preserve the state directory"
+      - alert: SkipperCheckpointSkipped
+        expr: increase(durable_checkpoints_skipped_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable state exceeds the checkpoint limit; restart replays the full log tail"
+      - alert: SkipperUnresolvedDispatch
+        expr: skipper_unresolved_operation > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mutation dispatch outcome is uncertain; never automate resend"
+      - alert: SkipperAuthorityUnavailable
+        expr: skipper_authority_ready == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Local durable authority or controller visibility is unavailable"
+      - alert: SkipperPendingLifecycleError
+        expr: skipper_pending_lifecycle_errors > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Accepted Add/Remove has a continuing background error"
+      - alert: SkipperRepeatedFreshnessMisses
+        expr: increase(skipper_handoff_freshness_misses_total[10m]) >= 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repeated handoff freshness misses require timing-budget investigation"
+      - alert: SkipperRoundCoverageLost
+        expr: (skipper_round_fresh_nodes == 0) and (skipper_round_sampled_nodes > 0)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No fresh diagnostic contributors in the last closed round"

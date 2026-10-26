@@ -18,5 +18,6 @@ RECURSE(
 )
 
 RECURSE_FOR_TESTS(
+    e2e
     tests
 )

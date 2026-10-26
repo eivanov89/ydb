@@ -1,0 +1,51 @@
+schema_version: 1
+cluster_id: production-bridge-01
+controller:
+  authority_backend: local
+ydb_endpoints:
+  - grpcs://ydb-a.example:2135
+  - grpcs://ydb-b.example:2135
+evidence:
+  # Parser selection only: every production Auto profile is unqualified.
+  profile: global_bsc_v1
+ydb_auth:
+  ca_file: /Berkanavt/skipper/ca.pem
+  client_cert_file: /Berkanavt/skipper/client.pem
+  client_key_file: /Berkanavt/skipper/client.key
+  token_file: null
+  allow_plaintext_token: false
+http:
+  # Every client reaching this port is authorized for every route and mutation.
+  listen: 127.0.0.1:8080
+polling:
+  round_interval_seconds: 15
+  round_deadline_seconds: 12
+  bracket_admin_timeout_seconds: 1
+  health_operation_timeout_seconds: 8
+  health_client_timeout_seconds: 9
+  admin_interval_seconds: 1
+  global_admin_concurrency: 16
+  config_interval_seconds: 30
+  read_rpc_timeout_seconds: 10
+  observation_ttl_seconds: 20
+  admission_budget_seconds: 5
+  dispatch_margin_seconds: 2
+  scheduler_tolerance_seconds: 5
+  confirmation_start_gap_seconds: 20
+  sample_nodes_per_pile: 3
+  per_pile_health_concurrency: 3
+operations:
+  mutation_client_timeout_seconds: 120
+  membership_client_timeout_seconds: 600
+  attention_after_seconds:
+    failover: 300
+    switchover: 300
+    takedown: 300
+    primary_maintenance: 600
+    rejoin: null
+    convert: 3600
+    add_pile: 3600
+    remove_pile: 3600
+logging:
+  level: info
+  display_ring_lines: 1000

@@ -24,14 +24,39 @@ REPO = os.path.abspath(os.path.join(MOCK_DIR, "..", "..", "..", ".."))
 WORK = os.environ.get("YDBD_MOCK_WORK") or os.path.join(os.path.expanduser("~"), "ydbd_mock_work")
 
 REAL_YDB = os.environ.get("YDBD_MOCK_REAL_YDB") or os.path.expanduser("~/ydb/bin/ydb")
+MOCK_BINARY = os.path.join(MOCK_DIR, "ydbd_mock")
+if getattr(sys, "is_standalone_binary", False):
+    import yatest.common
+    REPO = yatest.common.source_path()
+    MOCK_DIR = os.path.join(REPO, "ydb/apps/bridge_skipper/ydbd_mock")
+    SCRIPTS = os.path.join(MOCK_DIR, "scripts")
+    WORK = yatest.common.get_param("ydbd_mock_work", WORK)
+    REAL_YDB = yatest.common.get_param("ydbd_mock_real_ydb", REAL_YDB)
+    # Import checking has no resolved dependency binaries. Runtime command
+    # execution below requires one explicitly instead of mutating env at import.
+    MOCK_BINARY = yatest.common.binary_path("ydb/apps/bridge_skipper/ydbd_mock/ydbd_mock") or MOCK_BINARY
 
 
 def real_cli_available() -> bool:
-    return os.path.isfile(REAL_YDB) and os.access(REAL_YDB, os.X_OK)
+    return (os.path.isfile(REAL_YDB) and os.access(REAL_YDB, os.X_OK)
+            and os.path.isfile(shim_python()) and os.access(shim_python(), os.X_OK))
 
 
 def demo_python() -> str:
     return os.path.join(WORK, "venv", "bin", "python")
+
+
+def shim_python() -> str:
+    return demo_python() if getattr(sys, "is_standalone_binary", False) else sys.executable
+
+
+def mock_prefix() -> typing.List[str]:
+    if not getattr(sys, "is_standalone_binary", False):
+        return supervisor.argv_prefix()
+    binary = yatest.common.binary_path("ydb/apps/bridge_skipper/ydbd_mock/ydbd_mock")
+    if not binary or not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        raise RuntimeError("repository test requires the built ydbd_mock dependency")
+    return [binary]
 
 
 def fast_timings(**over) -> Timings:
@@ -91,19 +116,22 @@ class MockCluster:
         env = dict(os.environ)
         env["YDBD_MOCK_RUN_DIR"] = self.run_dir
         env["YDBD_MOCK_REAL_YDB"] = REAL_YDB
+        env["YDBD_MOCK_WORK"] = WORK
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if getattr(sys, "is_standalone_binary", False):
+            env["YDBD_MOCK_EXE"] = mock_prefix()[0]
         env.setdefault("PYTHONPATH", os.pathsep.join([REPO, os.path.join(WORK, "gen")]))
         return env
 
     def ctl(self, *args: str, timeout: float = 60.0) -> Result:
-        argv = supervisor.argv_prefix() + ["cluster", "--run-dir", self.run_dir] + list(args)
+        argv = mock_prefix() + ["cluster", "--run-dir", self.run_dir] + list(args)
         return _run(argv, self.env(), timeout)
 
     def cli(self, *args: str, endpoint: typing.Optional[str] = None, timeout: float = 60.0,
             stdin: typing.Optional[str] = None) -> Result:
         """The guarded ydb CLI. `endpoint` defaults to the first node of pile1."""
         endpoint = endpoint or "grpc://%s:2135" % self.topology.pile(0).nodes[0].label
-        argv = [sys.executable, os.path.join(SCRIPTS, "ydb_shim.py"), "-e", endpoint] + list(args)
+        argv = [shim_python(), os.path.join(SCRIPTS, "ydb_shim.py"), "-e", endpoint] + list(args)
         return _run(argv, self.env(), timeout, stdin)
 
     def bridge(self, *args: str, pile: str = "pile1", assume_yes: bool = True, timeout: float = 60.0,

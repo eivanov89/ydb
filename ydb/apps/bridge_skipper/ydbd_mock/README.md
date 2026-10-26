@@ -21,6 +21,47 @@ The mock supports inactive piles, persistent named registry slots, deployed-conf
 
 ## Quick start
 
+### Skipper with local mocks
+
+With `ydb/apps/bridge_skipper` and `ydb/apps/bridge_skipper/ydbd_mock` built,
+run this from the repository root:
+
+```bash
+ydb/apps/bridge_skipper/ydbd_mock/scripts/skipper.sh
+```
+
+This starts two mock piles with three nodes each, the mock supervisor HTTP API,
+and the new Skipper. It chooses free loopback ports, generates the configuration
+from the mock manifest, and prints clickable HTTP links for the Skipper state API,
+cluster state/events/manifest, and each pile's state/events. POST control URLs
+are labeled separately, with a ready-to-copy `curl` command to kill/revive a
+pile. The mock controls are JSON APIs, not a browser control panel.
+
+The Skipper web UI has been removed pending a rewrite. Use the HTTP API for
+inspection and operations. Auto remains unqualified in this build.
+
+Press **Ctrl+C** to stop Skipper, its mock supervisor and all mock piles started
+by this launcher. Logs and state remain in the printed temporary directory.
+Each invocation creates a fresh isolated playground; it does not reset or
+attach to an existing mock cluster. No virtualenv or real `ydb` CLI is needed;
+the launcher uses Python 3's standard library and the built binaries.
+
+```bash
+# Optional fixed HTTP API port and three piles; mock ports remain automatic.
+ydb/apps/bridge_skipper/ydbd_mock/scripts/skipper.sh --http-port 18080 --piles pile1,pile2,pile3
+
+# Retain artifacts at a chosen new or empty directory.
+ydb/apps/bridge_skipper/ydbd_mock/scripts/skipper.sh --run-dir /tmp/my-skipper-playground
+
+ydb/apps/bridge_skipper/ydbd_mock/scripts/skipper.sh --help
+```
+
+`--supervisor-port`, `--nodes-per-pile`, `--mock-binary` and `--skipper-binary`
+are also available. `YDBD_MOCK_BASE_PYTHON` selects the Python 3 interpreter;
+`YDBD_MOCK_EXE` and `BRIDGE_SKIPPER_EXE` supply alternative built binaries.
+
+### Historical demo and standalone mocks
+
 Once, from the repo root. This creates `~/ydbd_mock_work` (virtualenv, generated protos, run directory):
 
 ```bash
