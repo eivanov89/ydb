@@ -1,14 +1,9 @@
 """One mock process: one pile. gRPC servers (one per node), control and peer HTTP, the PileInstance.
 
-`MockProcess` can run several times in one event loop (tests do that). `main()` is the
-`ydbd_mock run` command.
+`MockProcess` can run several times in one event loop (tests do that).
 """
-import argparse
 import asyncio
 import json
-import logging
-import signal
-import sys
 import typing
 
 import grpc
@@ -19,10 +14,7 @@ from ydb.apps.bridge_skipper.ydbd_mock.lib.cluster import PileInstance
 from ydb.apps.bridge_skipper.ydbd_mock.lib.events import EventLog
 from ydb.apps.bridge_skipper.ydbd_mock.lib.faults import NodeRuntime
 from ydb.apps.bridge_skipper.ydbd_mock.lib.peers import HttpTransport, Transport
-from ydb.apps.bridge_skipper.ydbd_mock.lib.replica import ReplicaError
 from ydb.apps.bridge_skipper.ydbd_mock.lib.topology import Topology, TopologyError
-
-log = logging.getLogger("ydbd_mock")
 
 
 async def _finish_on_cancel(awaitable):
@@ -277,48 +269,3 @@ def apply_overrides(topology: Topology, assignments: typing.Sequence[str]) -> No
             topology.policies.update({name: value})
         else:
             raise TopologyError("unknown section %r in --set, use timings or policies" % section)
-
-
-async def _run(args) -> int:
-    topology = Topology.load(args.topology)
-    apply_overrides(topology, args.set or [])
-    state_dir = args.state_dir
-    process = MockProcess(topology, args.pile, state_dir=state_dir, events_path=args.log_events)
-    for warning in topology.warnings:
-        log.warning(warning)
-    try:
-        await process.start()
-    except (OSError, ReplicaError) as e:
-        sys.stderr.write("ydbd_mock: %s\n" % e)
-        return 1
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-    sys.stdout.write(json.dumps(process.ready_info()) + "\n")
-    sys.stdout.flush()
-    await stop.wait()
-    await process.stop(grace=1.0)
-    return 0
-
-
-def main(argv: typing.Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(prog="ydbd_mock run", description="Run one pile instance.")
-    parser.add_argument("--topology", required=True, help="topology YAML file")
-    parser.add_argument("--pile", required=True, help="pile name this instance serves")
-    parser.add_argument("--state-dir", default=None, help="directory for replica.json (default: in memory)")
-    parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--log-events", default=None, help="also write the event log as JSON lines")
-    parser.add_argument("--set", action="append", help="override timings.NAME=VALUE or policies.NAME=VALUE")
-    args = parser.parse_args(list(argv))
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    try:
-        return asyncio.run(_run(args))
-    except (TopologyError, OSError, KeyError) as e:
-        sys.stderr.write("ydbd_mock: %s\n" % e)
-        return 2
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

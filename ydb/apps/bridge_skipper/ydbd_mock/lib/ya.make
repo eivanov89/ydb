@@ -17,7 +17,6 @@ PY_SRCS(
     peers.py
     replica.py
     services.py
-    supervisor.py
     testkit.py
     topology.py
     validator.py
