@@ -1280,6 +1280,23 @@ public:
         }
     }
 
+    enum class EWhiteboardReplyState {
+        Received, // the node answered, a disk missing from the answer is a failure
+        Unreachable, // the request was undelivered or the session was lost after all retries
+        Missing, // no answer by the deadline, nothing is known about the disks of the node
+    };
+
+    template<typename TResponseMap>
+    EWhiteboardReplyState GetWhiteboardReplyState(const TResponseMap& responses, TNodeId nodeId) const {
+        if (UnavailableStorageNodes.contains(nodeId)) {
+            return EWhiteboardReplyState::Unreachable;
+        }
+        if (auto it = responses.find(nodeId); it != responses.end() && it->second.IsOk()) {
+            return EWhiteboardReplyState::Received;
+        }
+        return EWhiteboardReplyState::Missing;
+    }
+
     [[nodiscard]] TRequestResponse<TEvNodeWardenStorageConfig> RequestStorageConfig() {
         TRequestResponse<TEvNodeWardenStorageConfig> response(Span.CreateChild(TComponentTracingLevels::TTablet::Detailed, TypeName<TEvNodeWardenQueryStorageConfig>()));
         Send(MakeBlobStorageNodeWardenID(SelfId().NodeId()), new TEvNodeWardenQueryStorageConfig(false), 0/*flags*/, 0/*cookie*/, response.Span.GetTraceId());
@@ -2761,6 +2778,11 @@ public:
                     context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Available size is less than 12%", ETags::PDiskSpace);
                 }
             }
+        } else if (GetWhiteboardReplyState(NodePDiskState, pDiskInfo.nodeid()) == EWhiteboardReplyState::Missing) {
+            // the node did not answer in time, so nothing is known about its disk
+            context.ReportStatus(Ydb::Monitoring::StatusFlag::GREY,
+                                 TStringBuilder() << "PDisk has no data",
+                                 ETags::PDiskState);
         } else {
             if (UnavailableStorageNodes.count(pDiskInfo.nodeid()) != 0) {
                 TSelfCheckContext nodeContext(&context, "STORAGE_NODE");
@@ -2788,7 +2810,8 @@ public:
         storagePDiskStatus.set_overall(context.GetOverallStatus());
     }
 
-    void FillVDiskStatusWithWhiteboard(const TString& vDiskId, const NKikimrWhiteboard::TVDiskStateInfo& vDiskInfo, Ydb::Monitoring::StorageVDiskStatus& storageVDiskStatus, TSelfCheckContext context) {
+    // returns true if nothing is known about the disk, because its node did not answer in time
+    bool FillVDiskStatusWithWhiteboard(const TString& vDiskId, const NKikimrWhiteboard::TVDiskStateInfo& vDiskInfo, Ydb::Monitoring::StorageVDiskStatus& storageVDiskStatus, TSelfCheckContext context) {
         if (context.Location.mutable_storage()->mutable_pool()->mutable_group()->mutable_vdisk()->mutable_id()->empty()) {
             context.Location.mutable_storage()->mutable_pool()->mutable_group()->mutable_vdisk()->add_id();
         }
@@ -2802,12 +2825,28 @@ public:
         }
 
         if (!vDiskInfo.HasVDiskState()) {
+            // a known PDisk state failure is evidence, it stays a failure of the VDisk
+            const bool pDiskFailed = context.FindMaxStatus({ETags::PDiskState}) == Ydb::Monitoring::StatusFlag::RED;
+            if (vDiskInfo.HasNodeId() && !pDiskFailed
+                    && GetWhiteboardReplyState(NodeVDiskState, vDiskInfo.GetNodeId()) == EWhiteboardReplyState::Missing)
+            {
+                context.ReportStatus(Ydb::Monitoring::StatusFlag::GREY,
+                                     TStringBuilder() << "VDisk has no data",
+                                     ETags::VDiskState,
+                                     {ETags::PDiskState});
+                if (context.GetOverallStatus() == Ydb::Monitoring::StatusFlag::GREEN) {
+                    // a healthy PDisk tells nothing about the VDisk itself
+                    context.SetOverallStatus(Ydb::Monitoring::StatusFlag::GREY);
+                }
+                storageVDiskStatus.set_overall(context.GetOverallStatus());
+                return true;
+            }
             context.ReportStatus(Ydb::Monitoring::StatusFlag::RED,
                                  TStringBuilder() << "VDisk is not available",
                                  ETags::VDiskState,
                                  {ETags::PDiskState});
             storageVDiskStatus.set_overall(context.GetOverallStatus());
-            return;
+            return false;
         }
 
         switch (vDiskInfo.GetVDiskState()) {
@@ -2821,7 +2860,7 @@ public:
                                      TStringBuilder() << "VDisk state is " << NKikimrWhiteboard::EVDiskState_Name(vDiskInfo.GetVDiskState()),
                                      ETags::VDiskState);
                 storageVDiskStatus.set_overall(context.GetOverallStatus());
-                return;
+                return false;
             case NKikimrWhiteboard::EVDiskState::LocalRecoveryError:
             case NKikimrWhiteboard::EVDiskState::SyncGuidRecoveryError:
             case NKikimrWhiteboard::EVDiskState::PDiskError:
@@ -2830,7 +2869,7 @@ public:
                                      ETags::VDiskState,
                                      {ETags::PDiskState});
                 storageVDiskStatus.set_overall(context.GetOverallStatus());
-                return;
+                return false;
         }
 
         if (!vDiskInfo.GetReplicated()) {
@@ -2840,13 +2879,17 @@ public:
             }
             context.ReportStatus(Ydb::Monitoring::StatusFlag::BLUE, "Replication in progress", ETags::VDiskState);
             storageVDiskStatus.set_overall(context.GetOverallStatus());
-            return;
+            return false;
         }
 
         if (vDiskInfo.HasDiskSpace()) {
             switch(vDiskInfo.GetDiskSpace()) {
                 case NKikimrWhiteboard::EFlag::Green:
-                    if (context.IssueRecords.size() == 0) {
+                    // a PDisk without data is not a reason to call a received VDisk degraded
+                    const bool onlyUnknownPDisk = std::ranges::all_of(context.IssueRecords, [](const auto& record) {
+                        return record.IssueLog.status() == Ydb::Monitoring::StatusFlag::GREY;
+                    });
+                    if (onlyUnknownPDisk) {
                         context.ReportStatus(Ydb::Monitoring::StatusFlag::GREEN);
                     } else {
                         context.ReportStatus(context.IssueRecords.begin()->IssueLog.status(),
@@ -2871,25 +2914,66 @@ public:
         }
 
         storageVDiskStatus.set_overall(context.GetOverallStatus());
+        return false;
     }
 
     class TGroupChecker {
+        using TRealms = TStackVec<std::pair<ui32, int>>;
+
         TString ErasureSpecies;
         bool LayoutCorrect;
         int FailedDisks = 0;
         std::array<int, Ydb::Monitoring::StatusFlag::Status_ARRAYSIZE> DisksColors = {};
-        TStackVec<std::pair<ui32, int>> FailedRealms;
+        TRealms FailedRealms;
+        // disks that did not answer in time: they are not known to be failed
+        int UnknownDisks = 0;
+        TRealms UnknownRealms;
         ETags Tag;
 
-        void IncrementFor(ui32 realm) {
-            auto itRealm = FindIf(FailedRealms, [realm](const std::pair<ui32, int>& p) -> bool {
+        struct TVerdict {
+            Ydb::Monitoring::StatusFlag::Status Status = Ydb::Monitoring::StatusFlag::GREEN;
+            const char* Message = nullptr;
+        };
+
+        static void IncrementFor(TRealms& realms, ui32 realm, int count = 1) {
+            auto itRealm = FindIf(realms, [realm](const std::pair<ui32, int>& p) -> bool {
                 return p.first == realm;
             });
-            if (itRealm == FailedRealms.end()) {
-                itRealm = FailedRealms.insert(FailedRealms.end(), { realm, 1 });
+            if (itRealm == realms.end()) {
+                realms.insert(realms.end(), { realm, count });
             } else {
-                itRealm->second++;
+                itRealm->second += count;
             }
+        }
+
+        TVerdict GetVerdict(int failedDisks, const TRealms& failedRealms) const {
+            const auto degraded = [&]() -> TVerdict {
+                return {DisksColors[Ydb::Monitoring::StatusFlag::BLUE] == failedDisks
+                    ? Ydb::Monitoring::StatusFlag::BLUE
+                    : Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded"};
+            };
+            if (ErasureSpecies == NONE) {
+                if (failedDisks > 0) {
+                    return {Ydb::Monitoring::StatusFlag::RED, "Group failed"};
+                }
+            } else if (ErasureSpecies == BLOCK_4_2) {
+                if (failedDisks > 2) {
+                    return {Ydb::Monitoring::StatusFlag::RED, "Group failed"};
+                } else if (failedDisks > 1) {
+                    return {Ydb::Monitoring::StatusFlag::ORANGE, "Group has no redundancy"};
+                } else if (failedDisks > 0) {
+                    return degraded();
+                }
+            } else if (ErasureSpecies == MIRROR_3_DC) {
+                if (failedRealms.size() > 2 || (failedRealms.size() == 2 && failedRealms[0].second > 1 && failedRealms[1].second > 1)) {
+                    return {Ydb::Monitoring::StatusFlag::RED, "Group failed"};
+                } else if (failedRealms.size() == 2) {
+                    return {Ydb::Monitoring::StatusFlag::ORANGE, "Group has no redundancy"};
+                } else if (failedDisks > 0) {
+                    return degraded();
+                }
+            }
+            return {};
         }
 
     public:
@@ -2906,7 +2990,7 @@ public:
                 // No yellow or orange status here - this is intentional - they are used when a disk is running out of space, but is currently available
                 case Ydb::Monitoring::StatusFlag::RED: // disk is bad, probably not available
                 case Ydb::Monitoring::StatusFlag::GREY: // the status is absent, the disk is not available
-                    IncrementFor(realm);
+                    IncrementFor(FailedRealms, realm);
                     ++FailedDisks;
                     break;
                 default:
@@ -2914,37 +2998,32 @@ public:
             }
         }
 
+        // the disk did not answer in time, so it is neither healthy nor known to be failed
+        void AddUnknownVDisk(ui32 realm) {
+            IncrementFor(UnknownRealms, realm);
+            ++UnknownDisks;
+        }
+
         void ReportStatus(TSelfCheckContext& context) const {
             context.OverallStatus = Ydb::Monitoring::StatusFlag::GREEN;
             if (!LayoutCorrect) {
                 context.ReportStatus(Ydb::Monitoring::StatusFlag::ORANGE, "Group layout is incorrect", Tag);
             }
-            if (ErasureSpecies == NONE) {
-                if (FailedDisks > 0) {
-                    context.ReportStatus(Ydb::Monitoring::StatusFlag::RED, "Group failed", Tag, {ETags::VDiskState});
+            const TVerdict known = GetVerdict(FailedDisks, FailedRealms);
+            if (known.Message) {
+                context.ReportStatus(known.Status, known.Message, Tag, {ETags::VDiskState});
+            }
+            if (UnknownDisks > 0) {
+                TRealms realms = FailedRealms;
+                for (const auto& [realm, count] : UnknownRealms) {
+                    IncrementFor(realms, realm, count);
                 }
-            } else if (ErasureSpecies == BLOCK_4_2) {
-                if (FailedDisks > 2) {
-                    context.ReportStatus(Ydb::Monitoring::StatusFlag::RED, "Group failed", Tag, {ETags::VDiskState});
-                } else if (FailedDisks > 1) {
-                    context.ReportStatus(Ydb::Monitoring::StatusFlag::ORANGE, "Group has no redundancy", Tag, {ETags::VDiskState});
-                } else if (FailedDisks > 0) {
-                    if (DisksColors[Ydb::Monitoring::StatusFlag::BLUE] == FailedDisks) {
-                        context.ReportStatus(Ydb::Monitoring::StatusFlag::BLUE, "Group degraded", Tag, {ETags::VDiskState});
-                    } else {
-                        context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", Tag, {ETags::VDiskState});
-                    }
-                }
-            } else if (ErasureSpecies == MIRROR_3_DC) {
-                if (FailedRealms.size() > 2 || (FailedRealms.size() == 2 && FailedRealms[0].second > 1 && FailedRealms[1].second > 1)) {
-                    context.ReportStatus(Ydb::Monitoring::StatusFlag::RED, "Group failed", Tag, {ETags::VDiskState});
-                } else if (FailedRealms.size() == 2) {
-                    context.ReportStatus(Ydb::Monitoring::StatusFlag::ORANGE, "Group has no redundancy", Tag, {ETags::VDiskState});
-                } else if (FailedDisks > 0) {
-                    if (DisksColors[Ydb::Monitoring::StatusFlag::BLUE] == FailedDisks) {
-                        context.ReportStatus(Ydb::Monitoring::StatusFlag::BLUE, "Group degraded", Tag, {ETags::VDiskState});
-                    } else {
-                        context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", Tag, {ETags::VDiskState});
+                // unknown disks never make the group worse, they only show what it could be
+                if (GetVerdict(FailedDisks + UnknownDisks, realms).Status > known.Status) {
+                    context.ReportStatus(Ydb::Monitoring::StatusFlag::GREY, "Group has disks with no data", Tag, {ETags::VDiskState});
+                    if (context.GetOverallStatus() == Ydb::Monitoring::StatusFlag::GREEN) {
+                        // ReportStatus(GREY) alone keeps GREEN
+                        context.OverallStatus = Ydb::Monitoring::StatusFlag::GREY;
                     }
                 }
             }
@@ -2985,8 +3064,11 @@ public:
                 context.Location.mutable_storage()->mutable_node()->clear_port();
             }
             Ydb::Monitoring::StorageVDiskStatus& vDiskStatus = *storageGroupStatus.add_vdisks();
-            FillVDiskStatusWithWhiteboard(vDiskId, itVDisk != MergedVDiskState.end() ? *itVDisk->second : NKikimrWhiteboard::TVDiskStateInfo(), vDiskStatus, {&context, "VDISK"});
-            checker.AddVDiskStatus(vDiskStatus.overall(), protoVDiskId.ring());
+            if (FillVDiskStatusWithWhiteboard(vDiskId, itVDisk != MergedVDiskState.end() ? *itVDisk->second : NKikimrWhiteboard::TVDiskStateInfo(), vDiskStatus, {&context, "VDISK"})) {
+                checker.AddUnknownVDisk(protoVDiskId.ring());
+            } else {
+                checker.AddVDiskStatus(vDiskStatus.overall(), protoVDiskId.ring());
+            }
         }
 
         context.Location.mutable_storage()->clear_node(); // group doesn't have node
