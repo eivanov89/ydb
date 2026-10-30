@@ -2884,7 +2884,7 @@ public:
 
         if (vDiskInfo.HasDiskSpace()) {
             switch(vDiskInfo.GetDiskSpace()) {
-                case NKikimrWhiteboard::EFlag::Green:
+                case NKikimrWhiteboard::EFlag::Green: {
                     // a PDisk without data is not a reason to call a received VDisk degraded
                     const bool onlyUnknownPDisk = std::ranges::all_of(context.IssueRecords, [](const auto& record) {
                         return record.IssueLog.status() == Ydb::Monitoring::StatusFlag::GREY;
@@ -2898,6 +2898,7 @@ public:
                                             {ETags::PDiskSpace});
                     }
                     break;
+                }
                 case NKikimrWhiteboard::EFlag::Red:
                     context.ReportStatus(GetFlagFromWhiteboardFlag(vDiskInfo.GetDiskSpace()),
                                          TStringBuilder() << "DiskSpace is " << NKikimrWhiteboard::EFlag_Name(vDiskInfo.GetDiskSpace()),
