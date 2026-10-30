@@ -243,6 +243,7 @@ class PileInstance:
         updates: typing.Sequence[validator.Update],
         quorum_piles: typing.Sequence[str] = (),
         accepted: typing.Optional[typing.Callable] = None,
+        expected_generation: typing.Optional[int] = None,
     ) -> Outcome:
         if self._reset_pending:
             error = MockError(model.INTERNAL_ERROR, "mock: reset is in progress")
@@ -254,6 +255,17 @@ class PileInstance:
             if not cur.bridged:
                 return MockError(model.PRECONDITION_FAILED,
                                  "Bridge cluster state is not configured or not available")
+            # Compare-and-set: before any state-dependent validation, so a stale request is told to replan.
+            if expected_generation is not None:
+                if cur.generation > expected_generation:
+                    return MockError(model.ABORTED, "Cluster state generation# %d differs from "
+                                     "expected_generation# %d, the update was not applied" % (
+                                         cur.generation, expected_generation))
+                if cur.generation < expected_generation:
+                    # this replica has not received the generation yet
+                    return MockError(model.UNAVAILABLE, "Node has cluster state generation# %d older than "
+                                     "expected_generation# %d, the update was not applied" % (
+                                         cur.generation, expected_generation))
             result = validator.validate_update(cur, updates, quorum_piles, self.names)
             return result.state if result.ok else result.error
 

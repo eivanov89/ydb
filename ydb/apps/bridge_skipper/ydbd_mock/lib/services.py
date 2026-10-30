@@ -191,8 +191,11 @@ class BridgeServicer(_Servicer, ydb_bridge_v1_pb2_grpc.BridgeServiceServicer):
     async def UpdateClusterState(self, request, context):
         updates = [(u.pile_name, u.state) for u in request.updates]
         quorum = list(request.quorum_piles)
+        expected_generation = request.expected_generation if request.HasField("expected_generation") else None
         summary = "updates=[%s] quorum=%s" % (
             ", ".join("%s=%s" % (n, model.public_name(s)) for n, s in updates), quorum)
+        if expected_generation is not None:
+            summary += " expected_generation=%d" % expected_generation
 
         async def call():
             if not self._authorized(context, mutation=True):
@@ -200,7 +203,7 @@ class BridgeServicer(_Servicer, ydb_bridge_v1_pb2_grpc.BridgeServiceServicer):
                     model.UNAUTHORIZED, "Bridge operations require administrator privileges"))
             self.rt.track_update_reply(context)
             outcome = await self.inst.admin_update(updates, quorum, accepted=lambda: self._checkpoint(
-                "UpdateClusterState", "after_acceptance", context))
+                "UpdateClusterState", "after_acceptance", context), expected_generation=expected_generation)
             if outcome.error is not None:
                 return ydb_bridge_pb2.UpdateClusterStateResponse(
                     operation=operations.error(outcome.error.status, outcome.error.message))

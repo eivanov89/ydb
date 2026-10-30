@@ -510,6 +510,49 @@ class AdminTokenTest(GrpcCase):
         self.assertEqual(op.status, model.SUCCESS)
 
 
+class ExpectedGenerationTest(GrpcCase):
+    """UpdateClusterStateRequest.expected_generation is a compare-and-set guard (rpc_bridge.cpp)."""
+
+    async def update_expecting(self, c, label, expected, *pairs):
+        req = update_request(*pairs)
+        if expected is not None:
+            req.expected_generation = expected
+        return (await c.bridge(label).UpdateClusterState(req)).operation
+
+    async def test_matching_generation_commits(self):
+        c = await self.make()
+        label = c.label("pile1")
+        op = await self.update_expecting(c, label, 1, ("pile2", DISC))
+        self.assertEqual(op.status, model.SUCCESS, operations.issue_texts(op))
+        self.assertEqual((await self.get_state(c, label)).generation, 2)
+
+    async def test_stale_generation_is_aborted_and_not_applied(self):
+        c = await self.make()
+        label = c.label("pile1")
+        self.assertEqual((await self.update(c, label, ("pile2", DISC))).status, model.SUCCESS)
+        op = await self.update_expecting(c, label, 1, ("pile2", NOTSYNC))
+        self.assertEqual(op.status, model.ABORTED, operations.issue_texts(op))
+        state = await self.get_state(c, label)
+        self.assertEqual(state.generation, 2)
+        self.assertEqual([(p.pile_name, p.state) for p in state.pile_states], [("pile1", PRIMARY), ("pile2", DISC)])
+
+    async def test_stale_generation_beats_validation(self):
+        c = await self.make()
+        label = c.label("pile1")
+        self.assertEqual((await self.update(c, label, ("pile2", DISC))).status, model.SUCCESS)
+        op = await self.update_expecting(c, label, 1, ("no_such_pile", DISC))
+        self.assertEqual(op.status, model.ABORTED, operations.issue_texts(op))
+        op = await self.update_expecting(c, label, None, ("no_such_pile", DISC))
+        self.assertEqual(op.status, model.BAD_REQUEST, operations.issue_texts(op))
+
+    async def test_generation_the_node_has_not_seen_is_unavailable(self):
+        c = await self.make()
+        label = c.label("pile1")
+        op = await self.update_expecting(c, label, 5, ("pile2", DISC))
+        self.assertEqual(op.status, model.UNAVAILABLE, operations.issue_texts(op))
+        self.assertEqual((await self.get_state(c, label)).generation, 1)
+
+
 class PersistenceTest(GrpcCase):
     async def test_revive_keeps_the_persisted_replica(self):
         with tempfile.TemporaryDirectory() as root:
