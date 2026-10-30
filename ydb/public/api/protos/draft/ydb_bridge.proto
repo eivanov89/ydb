@@ -91,6 +91,18 @@ message UpdateClusterStateRequest {
     // These piles act as "witnesses" for the operation.
     // If empty, all piles in the cluster will be used for the quorum check.
     repeated string quorum_piles = 3;
+    // Compare-and-set guard: the generation of the cluster state (GetClusterStateResult.generation) that this
+    // update is based on. When set, the update is applied only if the cluster state still has this generation
+    // when the change executes; the committed state then has generation expected_generation + 1.
+    // ABORTED: the cluster state has another generation; the update was not applied. Read the state again
+    // before deciding the next update.
+    // UNAVAILABLE with a lagging-node message: the receiving node has not yet received this generation; the
+    // update was not applied and may be sent again, preferably to another node.
+    // Other failures, such as INTERNAL_ERROR, do not tell whether the update was applied. Once a generation
+    // greater than expected_generation is observed, the update can no longer be applied.
+    // When unset, the update is applied on top of the receiving node's current cluster state.
+    // Nodes of older versions ignore this field.
+    optional uint64 expected_generation = 4;
 }
 
 message UpdateClusterStateResponse {
