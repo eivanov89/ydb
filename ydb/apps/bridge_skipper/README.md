@@ -38,8 +38,8 @@ fresh coherent state and the server's admission checks.
   independent command/emergency-stop audit histories.
 * [Configuration example](config/example.yaml) and
   [implemented mock](ydbd_mock/README.md).
-* [Implementation status](IMPLEMENTATION.md) records the coordinating validation
-  results and remaining implementation gates.
+* [Implementation guide](IMPLEMENTATION-index.md): core loop, healthcheck,
+  Bridge administration, durable operations, metrics and HTTP/acceptance tooling.
 
 The binary accepts:
 

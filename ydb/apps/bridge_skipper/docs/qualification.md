@@ -31,9 +31,11 @@ release-qualified live assessment path.
   Missing BRIDGE_GROUP is not evidence that a target failed. This path needs a
   separately qualified BSC-independent diagnostic before production Auto.
 * Public NOT_SYNCHRONIZED hides the `_1`/`_2` distinction. An internally `_2`
-  pile already participates in quorums, while ordinary BRIDGE_GROUP omits it.
-  Its loss needs explicit qualified coverage. Do not infer failure from omission
-  or reissue NOT_SYNCHRONIZED to reset a hidden stage.
+  pile already participates in quorums. This checkout's SelfCheck evaluates
+  stage-2 parts through BRIDGE_GROUP, with their logical-group contribution
+  capped at ORANGE. Skipper still lacks a qualified live assessment path for
+  these targets. Do not infer failure from omission or reissue NOT_SYNCHRONIZED
+  to reset a hidden stage.
 * No independently local NodeWarden diagnostic is exposed or collected by this
   implementation. The proposed I-02 extension is deferred and is not an
   installed prototype or measured capability. `nodewarden_local_v1` must remain
@@ -53,8 +55,10 @@ release-qualified live assessment path.
   pile's storage-group parts. Directly forcing an unsynchronized primary,
   destructive split-brain repair, disk wiping and resource provisioning are
   operator procedures outside this controller.
-* The public Bridge mutation API has no request-ID deduplication, expected
-  generation precondition, ownership lease or mutation-side fencing. One active
+* This checkout's UpdateClusterState API and SDK support the optional
+  `expected_generation` precondition, but Skipper leaves it unset. Its current
+  update path therefore has no server generation guard. The API has no
+  request-ID deduplication, ownership lease or mutation-side fencing. One active
   mutation controller and disciplined handover remain deployment assumptions.
 * Tablet drain and application recovery are separate checks. Long rejoin alone
   is not a failure, and no public synchronization percentage or reliable ETA
