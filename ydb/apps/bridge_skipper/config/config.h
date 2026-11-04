@@ -10,8 +10,6 @@
 
 namespace NBridgeSkipper {
 
-enum class EMode { Manual, Auto };
-
 struct TEndpoint {
     TString Uri;
     TString Scheme;
@@ -53,7 +51,6 @@ struct TLoggingConfig {
 
 struct TConfig {
     TString ClusterId;
-    EMode Mode = EMode::Manual;
     // Empty pile names are valid and are verified with SelfCheck like any other.
     std::map<TString, TVector<TEndpoint>> Endpoints;
     TYdbAuthConfig Auth;

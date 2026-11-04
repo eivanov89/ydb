@@ -297,6 +297,8 @@ Y_UNIT_TEST_SUITE(BridgeSkipperHealth) {
         auto evaluation = s.Evaluate();
         UNIT_ASSERT(evaluation.Participating.contains("b"));
         AssertVerdict(evaluation, "b", EPileVerdict::Failed);
+        UNIT_ASSERT(evaluation.Participation.contains("b"));
+        UNIT_ASSERT(evaluation.Participation.at("b").Value == std::optional<bool>(true));
         s.Replies.SelfChecks.front().Classification = Classify("fallback_grey");
         AssertVerdict(s.Evaluate(), "b", EPileVerdict::Lost);
         s.Replies.Connectivity.front().Report.Piles["b"].InConfigQuorum = false;
@@ -328,6 +330,24 @@ Y_UNIT_TEST_SUITE(BridgeSkipperHealth) {
             }
             UNIT_ASSERT(!s.State.CleanSince.contains("b"));
         }
+    }
+
+    Y_UNIT_TEST(BindingNegativeDoesNotProveStageOne) {
+        TScenario s;
+        s.Cluster.Piles["b"] = EPileState::NotSynchronized;
+        s.Replies.SelfChecks.front().Classification = Classify("fallback_grey");
+        s.AddConnectivity("a", true, false, false);
+        auto& report = s.Replies.Connectivity.front().Report;
+        report.BindingInProgress = true;
+        auto evaluation = s.Evaluate();
+        UNIT_ASSERT(!evaluation.Participation.at("b").Value.has_value());
+        UNIT_ASSERT(evaluation.Participating.contains("b"));
+        AssertVerdict(evaluation, "b", EPileVerdict::Unknown);
+        report.BindingInProgress = false;
+        evaluation = s.Evaluate();
+        UNIT_ASSERT(evaluation.Participation.at("b").Value == std::optional<bool>(false));
+        UNIT_ASSERT_VALUES_EQUAL(evaluation.Participation.at("b").SentAt, s.Now);
+        UNIT_ASSERT(!evaluation.Participating.contains("b"));
     }
 
     Y_UNIT_TEST(LostNeedsUnanimousOutsideReportsAndNoInsideQuorum) {
@@ -399,7 +419,7 @@ Y_UNIT_TEST_SUITE(BridgeSkipperHealth) {
         }
         TScenario boundary;
         boundary.Replies.SelfChecks.front().SentAt = boundary.Now - boundary.Params.EvidenceTtl;
-        UNIT_ASSERT(boundary.Evaluate().BscAvailable);
+        UNIT_ASSERT(!boundary.Evaluate().BscAvailable);
     }
 
     Y_UNIT_TEST(ConnectivityValidityExcludesUnverifiedAndStale) {
@@ -597,6 +617,8 @@ Y_UNIT_TEST_SUITE(BridgeSkipperHealth) {
         s.Replies.SelfChecks.front().Classification = Classify("stage2");
         auto evaluation = s.Evaluate();
         UNIT_ASSERT(evaluation.Participating.contains("b"));
+        UNIT_ASSERT(evaluation.Participation.contains("b"));
+        UNIT_ASSERT(evaluation.Participation.at("b").Value == std::optional<bool>(true));
         AssertVerdict(evaluation, "b", EPileVerdict::Failed);
         // A clean reply proves nothing about the stage.
         s.Replies.SelfChecks.front().Classification = {};
@@ -604,6 +626,8 @@ Y_UNIT_TEST_SUITE(BridgeSkipperHealth) {
         UNIT_ASSERT(evaluation.Participating.contains("b"));
         AssertVerdict(evaluation, "b", EPileVerdict::Unknown);
         UNIT_ASSERT_VALUES_EQUAL(evaluation.Piles.at("b").Reasons.front(), "participation unknown");
+        UNIT_ASSERT(evaluation.Participation.contains("b"));
+        UNIT_ASSERT(!evaluation.Participation.at("b").Value);
     }
 
     // S11 (P1): binding connectivity reports count for self quorum.

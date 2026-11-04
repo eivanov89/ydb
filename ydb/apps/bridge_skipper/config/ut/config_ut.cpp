@@ -25,7 +25,6 @@ Y_UNIT_TEST_SUITE(TSkipperConfiguration) {
     Y_UNIT_TEST(DefaultsMatchDocumentedBudgets) {
         const auto config = ParseConfig(Minimal());
         UNIT_ASSERT_VALUES_EQUAL(config.ClusterId, "test-bridge");
-        UNIT_ASSERT(config.Mode == EMode::Manual);
         UNIT_ASSERT_VALUES_EQUAL(config.Http.Listen, "127.0.0.1:8080");
         UNIT_ASSERT_VALUES_EQUAL(config.HealthEndpointsPerPile, 2);
         const auto& t = config.Timing;
@@ -48,7 +47,6 @@ Y_UNIT_TEST_SUITE(TSkipperConfiguration) {
         const auto credentials = LoadCredentials(config);
         UNIT_ASSERT(!credentials.Token);
         UNIT_ASSERT_VALUES_EQUAL(config.ClusterId, "production-bridge-01");
-        UNIT_ASSERT(config.Mode == EMode::Manual);
         UNIT_ASSERT_VALUES_EQUAL(config.Endpoints.size(), 2);
         UNIT_ASSERT_VALUES_EQUAL(config.Timing.Confirm, TDuration::Seconds(20));
     }
@@ -61,10 +59,9 @@ Y_UNIT_TEST_SUITE(TSkipperConfiguration) {
 
     Y_UNIT_TEST(PileEndpointsAndNestedOverrides) {
         const auto config = ParseConfig(
-            "cluster_id: test\nmode: auto\nendpoints: {dc-a: [grpcs://a:1, grpcs://a:2], '': [grpcs://b:1]}\n"
+            "cluster_id: test\nendpoints: {dc-a: [grpcs://a:1, grpcs://a:2], '': [grpcs://b:1]}\n"
             "auth: {ca_file: null, cert_file: cert.pem, key_file: key.pem, token_file: null}\n"
             "http: {listen: '[::1]:8081'}\nhealth_endpoints_per_pile: 3\nlogging: {level: debug}\n");
-        UNIT_ASSERT(config.Mode == EMode::Auto);
         UNIT_ASSERT_VALUES_EQUAL(config.Endpoints.at("dc-a").size(), 2);
         UNIT_ASSERT_VALUES_EQUAL(config.Endpoints.at("").front().Uri, "grpcs://b:1");
         UNIT_ASSERT_VALUES_EQUAL(*config.Auth.ClientCertFile, "cert.pem");
@@ -79,7 +76,7 @@ Y_UNIT_TEST_SUITE(TSkipperConfiguration) {
         Reject("cluster_id: cluster\n", "endpoints is required");
         Reject("cluster_id: cluster\nendpoints: {}\n", "at least one pile");
         Reject("cluster_id: cluster\nendpoints: {a: []}\n", "must not be empty");
-        Reject(Minimal("mode: other\n"), "mode must be manual or auto");
+        Reject(Minimal("mode: other\n"), "unknown key");
     }
 
     Y_UNIT_TEST(StrictYamlShapeDuplicatesAndLimits) {

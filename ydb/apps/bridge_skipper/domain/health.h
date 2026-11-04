@@ -79,6 +79,9 @@ struct THealthState {
 
 struct THealthEvaluation {
     std::map<TString, TPileVerdict> Piles;
+    // Resolved connectivity plus fresh BSC stage-2 evidence, before the
+    // conservative inclusion of unknown participants in Participating.
+    TPileParticipation Participation;
     std::set<TString> Participating;
     bool BscAvailable = false;
     // Current reports, binding included, for survivor-quorum checks and snapshot rendering.
@@ -95,13 +98,18 @@ bool IsConnectivityValid(
     TMonotonic now,
     const THealthParams& params);
 
-// The one config-quorum participation rule, shared by verdicts and mutation
-// endpoint ranking. std::nullopt: a NOT_SYNCHRONIZED pile that no valid report
-// lists.
+// Connectivity-only participation. A fresh BSC part can additionally prove
+// stage 2; consumers use the resolved evaluation below when available.
 std::optional<bool> IsParticipating(
     const TString& pile,
     EPileState state,
     const std::vector<TConnectivity>& validReports);
+
+std::optional<bool> EvaluatedParticipation(
+    const TString& pile,
+    EPileState state,
+    const std::vector<TConnectivity>& validReports,
+    const TPileParticipation& evaluated);
 
 THealthEvaluation EvaluatePiles(
     const TClusterView& view,

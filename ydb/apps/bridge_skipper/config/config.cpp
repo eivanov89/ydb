@@ -146,7 +146,7 @@ void ValidateConfig(const TConfig& config) {
             Require(scheme.empty() || scheme == endpoint.Scheme, "mixed grpc/grpcs endpoint schemes are forbidden");
             TString key = endpoint.Host;
             key.to_lower();
-            key += ":" + ToString(endpoint.Port);
+            key += ":" + ::ToString(endpoint.Port);
             Require(seen.insert(key).second, "duplicate endpoint");
             scheme = endpoint.Scheme;
         }
@@ -183,16 +183,11 @@ TConfig ParseConfig(TStringBuf yaml) {
         const auto documents = YAML::LoadAll(std::string(yaml.data(), yaml.size()));
         Require(documents.size() == 1, "config must contain exactly one YAML document");
         const auto root = documents.front();
-        Map(root, "config", {"cluster_id", "mode", "endpoints", "auth", "http", "timing", "health_endpoints_per_pile", "logging"});
+        Map(root, "config", {"cluster_id", "endpoints", "auth", "http", "timing", "health_endpoints_per_pile", "logging"});
         Require(root["cluster_id"].IsDefined(), "cluster_id is required");
         Require(root["endpoints"].IsDefined(), "endpoints is required");
         result.ClusterId = Scalar(root["cluster_id"], "cluster_id");
         Require(!result.ClusterId.empty() && result.ClusterId.find('\0') == TString::npos, "cluster_id must be nonempty and contain no NUL");
-        if (const auto node = root["mode"]) {
-            const auto mode = Scalar(node, "mode");
-            Require(mode == "manual" || mode == "auto", "mode must be manual or auto");
-            result.Mode = mode == "auto" ? EMode::Auto : EMode::Manual;
-        }
         const auto endpoints = root["endpoints"];
         Require(endpoints.IsMap(), "endpoints must be a mapping");
         for (const auto& entry : endpoints) {

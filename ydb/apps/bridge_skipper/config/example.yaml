@@ -1,5 +1,4 @@
 cluster_id: production-bridge-01
-mode: manual
 # Key each pile by the name its endpoints' SelfCheck reports, including an
 # implicit pile. Each endpoint must address exactly one YDB node, not a balancer.
 endpoints:
